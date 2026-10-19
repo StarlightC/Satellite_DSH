@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Satellite plugin">
+  <rect width="24" height="24" rx="5" fill="#101828"/>
+  <ellipse cx="12" cy="12" rx="9" ry="4.5" fill="none" stroke="#8FB8FF" stroke-width="1.4" transform="rotate(-28 12 12)"/>
+  <circle cx="12" cy="12" r="3.4" fill="#4C8DFF"/>
+  <circle cx="19.4" cy="8.2" r="1.7" fill="#8FB8FF"/>
+</svg>

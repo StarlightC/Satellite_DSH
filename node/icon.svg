@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Satellite node tool">
+  <rect width="24" height="24" rx="5" fill="#101828"/>
+  <rect x="4" y="4" width="10" height="10" rx="2.5" fill="none" stroke="#8FB8FF" stroke-width="1.5"/>
+  <path d="M14 9h3.2a2.8 2.8 0 0 1 0 5.6H14" fill="none" stroke="#4C8DFF" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M8 20.5v-4M11.5 20.5v-2.4" stroke="#4C8DFF" stroke-width="1.6" stroke-linecap="round"/>
+  <circle cx="9" cy="9" r="1.5" fill="#4C8DFF"/>
+</svg>

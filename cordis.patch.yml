@@ -1,0 +1,25 @@
+# 一个安装（bundle=Satellite），三个可分别启停的子组件行。
+#
+# 分层原则（本 patch 的架构约束）：
+# - **patch 只声明"行"**：id/name/disabled 这类装配事实。
+# - **声明式默认值归代码**：节点、角色、默认 provider/model 见 `src/node/lib/config.ts` 的
+#   `DEFAULT_CONFIG` 及其派生的 `BUILTIN_ROLE_NAMES`/`BUILTIN_ROUTES`（作为 schema 默认值）。
+# - **profile 只保存用户自己的选择**：设置页里保存的覆盖。
+# 不在这里预置 config：profile 首次安装会物化 patch 里的 config 快照，而 Loader 是整行替换、
+# 不深合并，旧快照会长期盖住代码里的新默认值（新增节点/角色后每次升级都要用户改 profile）。
+#
+# 插件本体的标题与描述来自包根的 locale/图标（`./locale/*.json`、`./icon`），
+# 因此包根不再声明行——声明行会在子组件列表里和插件卡片重复。
+#
+# - satellite-slots：插槽服务子组件，运行行的共同依赖。
+# - satellite-node：节点工具子组件（satellite_node），config 全部走代码默认值。
+# - satellite-android：Android 只读扩展子组件，默认关闭，按项目显式启用
+#   （plugin_manager set_plugin 或在本 profile 的 patch 中覆盖该行）。
+- insert:
+    - id: satellite-slots
+      name: 'satellite/slots'
+    - id: satellite-node
+      name: 'satellite/node'
+    - id: satellite-android
+      name: 'satellite/android'
+      disabled: true

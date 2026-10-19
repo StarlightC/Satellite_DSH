@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Android 组件",
+    "description": "只读 Android 扩展：在 validate 节点执行前补充有界验证上下文。"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Android",
+    "description": "Read-only Android extension: supplies the bounded validation context for Android projects before a validate node runs."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Slots",
+    "description": "Node slot service: stable node slots, three-state conditions, readiness, and same-slot dependency and conflict resolution."
+  }
+}

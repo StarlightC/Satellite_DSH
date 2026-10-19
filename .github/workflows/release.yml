@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install
+        run: npm ci
+      - name: Verify the tag matches this package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module -e "
+            import { readFileSync } from 'node:fs'
+            const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+            const tag = process.env.RELEASE_TAG
+            if ('v' + pkg.version !== tag) {
+              throw new Error('Tag ' + tag + ' does not match ' + pkg.name + '@' + pkg.version)
+            }
+          "
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Pack and verify the published contents
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          npm pack --json > pack-result.json
+          node --input-type=module -e "
+            import { readFileSync } from 'node:fs'
+            const [pack] = JSON.parse(readFileSync('pack-result.json', 'utf8'))
+            const required = ['lib', 'cordis.patch.yml', 'package.json', 'LICENSE']
+            for (const entry of required) {
+              const present = pack.files.some((file) => file.path === entry || file.path.startsWith(entry + '/'))
+              if (!present) throw new Error('Missing release entry: ' + entry)
+            }
+          "
+          mv "${name}-${version}.tgz" release.tgz
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release.tgz
+          prerelease: ${{ contains(github.ref_name, '-') }}

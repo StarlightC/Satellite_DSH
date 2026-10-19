@@ -1,0 +1,64 @@
+{
+  "name": "satellite",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Satellite runs a project's base workflow as nodes with pluggable before/after extensions. One install carries three independently toggleable rows: the slot service, the satellite_node tool, and an opt-in Android read-only extension.",
+  "license": "MIT",
+  "main": "./lib/plugin.js",
+  "exports": {
+    ".": "./lib/plugin.js",
+    "./slots": "./lib/slots/index.js",
+    "./slots/locale/*.json": "./slots/locale/*.json",
+    "./slots/icon": "./slots/icon.svg",
+    "./node": "./lib/node/index.js",
+    "./node/locale/*.json": "./node/locale/*.json",
+    "./node/icon": "./node/icon.svg",
+    "./android": "./lib/android/index.js",
+    "./android/locale/*.json": "./android/locale/*.json",
+    "./android/icon": "./android/icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md",
+    "icon.svg",
+    "locale/*.json",
+    "cordis.patch.yml",
+    "slots/icon.svg",
+    "slots/locale/*.json",
+    "node/skills",
+    "node/icon.svg",
+    "node/locale/*.json",
+    "android/skills",
+    "android/icon.svg",
+    "android/locale/*.json"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5-alpha.1",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-alpha.2 <0.3",
+    "@deepseek-ai/schemastery": "~3.18.5-alpha.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5-alpha.1",
+    "@deepseek-ai/dsh-tools": "0.2.1-alpha.2",
+    "@deepseek-ai/schemastery": "3.18.5-alpha.1",
+    "@types/node": "^24.0.0",
+    "tsdown": "0.22.2",
+    "typescript": "^5.9.0"
+  }
+}

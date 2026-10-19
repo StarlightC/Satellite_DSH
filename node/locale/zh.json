@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "节点工具",
+    "description": "satellite_node 入口：执行一个基础节点，并自动完成前后插槽边界。"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Satellite",
+    "description": "Runs a project's base workflow as nodes with pluggable before/after extensions. One install carries the slot service, the satellite_node tool, and an opt-in Android read-only extension."
+  }
+}

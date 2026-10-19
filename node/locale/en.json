@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Node Tool",
+    "description": "The satellite_node entry: runs one base node with automatic before and after slot boundaries."
+  }
+}
