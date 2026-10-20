@@ -229,6 +229,15 @@ npm test           # 先 build，再 node --test test/*.test.mjs
 
 更多细节见 [docs/DEVELOP.md](docs/DEVELOP.md)。
 
+## 自动发布
+
+源码在 `source` 分支开发；推送与包版本一致的 `v*` 标签后，GitHub Actions 自动校验、构建、
+测试并上传 GitHub Release 附件 `release.tgz`。稳定版将同一附件同步到 `main` 产物分支；
+预发布版不更新 `main`。流程不发布到 npm registry，也不在本地自动推送标签。
+
+首次启用需要配置远程仓库、将源码保存到 `source` 并设置默认分支及 Actions 写权限。
+详见 [发布流程与初始化步骤](<docs/DEVELOP.md#发布流程>)。
+
 ## 发布形态说明（相对参考项目的一处有意扩展）
 
 本包以 `DSHOAuth` 的发布模式为参考。参考项目的发布脚本断言"包内第一层只允许

@@ -45,14 +45,51 @@ npm test           # npm run build && node --test test/*.test.mjs
 
 ## 发布流程
 
-**本项目尚未启用 git**（当前不执行任何 git 操作），因此参考项目的 source/main 双分支模型、
-`.release.json`、`scripts/publish-main.mjs`、`release.yml` 等**暂缓启用**；待启用 git 后再落地。
-当前只保留不依赖 git 的部分：
+采用 DSHOAuth 的 `source` / `main` 双分支模式：
 
-- `src/` → tsdown → `lib/`，发布物为 `lib/` 加包内资源；
-- `package.json` 的 `main`/`exports`/`files`/`engines`/`license`；
-- `scripts` 里禁止 `preinstall`/`install`/`postinstall`/`prepare`/`prepack`/`prepublish`/`prepublishOnly`/`publish`；
-- `test/package.test.mjs` 作为发布质量门。
+- `source` 保存源码、测试和 GitHub Actions 配置，作为默认开发分支；
+- 推送 `v*` 标签触发 `.github/workflows/release.yml`，标签提交必须属于远程 `source`；
+- 校验标签、`package.json` 与 `package-lock.json` 版本一致（稳定版或预发布 SemVer，不含 build metadata），执行 `npm ci`、类型检查、构建和测试；
+- `npm pack` 后校验四个构建入口、图标、翻译和技能资源，发布 GitHub Release 附件 `release.tgz`，自动生成说明；不执行 npm registry 发布；
+- 稳定版通过 `scripts/publish-main.mjs` 将该附件的内容同步至 `main`，并写入 `.release.json`（版本、标签和源码提交）；首次可创建 `main`，后续只允许快进，不强推；
+- 预发布标签（如 `v0.2.0-rc.1`）仅创建 prerelease，不更新 `main` 或 latest；
+- 重跑已有 Release 时下载原附件，不覆盖已发布资产；同步支持幂等重试、拒绝同版本不同源码提交、跳过旧版本，避免产物分支降级。
+
+`main` 是安装用的产物分支，不保留源码、开发文档或 Actions。所有开发继续在 `source` 上进行。
+发布包保持无安装/打包生命周期钩子，用户安装无需隐式构建；`test/package.test.mjs` 和
+`test/publish-main.test.mjs` 覆盖发布质量门与本地 Git 同步行为。
+
+### 首次启用（维护者手动执行）
+
+当前本地仓库若仍只有源码 `main` 且未配置远程，需要先提交改动，再配置 GitHub 仓库：
+
+```bash
+# 将现有源码分支改名；不要在产物 main 上开发。
+git branch -m main source
+git remote add origin <GitHub 仓库 URL>
+git push -u origin source
+```
+
+在 GitHub 将默认分支设为 `source`，启用 Actions，并允许发布 job 的 `GITHUB_TOKEN`
+写入仓库内容。若存在 `main` 分支保护或 ruleset，必须允许此发布流程推送产物；否则 Release
+可能已创建但同步失败，调整权限后可重跑。首次同步也支持已存在的 `main`，会以快进提交将其
+替换为产物树，因此务必先将源码保存到 `source`。本地未配置远程时不能直接发布。
+
+### 发布版本
+
+在 `source` 上修改版本并提交（首次发布也可使用当前尚未发布的版本）：
+
+```bash
+npm version 0.2.0 --no-git-tag-version
+# 提交 package.json、package-lock.json 及本次发布的源码改动后：
+git push origin source
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+同一版本的标签和资产视为不可变；修复应增加版本，不移动已发布标签。Actions 完成后检查
+Release 附件和 `main` 的 `.release.json`。若 Release 成功而同步失败，重跑原 workflow 即可
+继续同步原附件，无需重新发布或强推。
 
 ### 与参考项目不同的发布白名单（有意扩展）
 
