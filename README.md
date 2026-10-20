@@ -1,253 +1,140 @@
 # Satellite
 
-Satellite 把项目的**基础流程**当作节点运行，并允许在节点前后挂接可插拔扩展。
-
-一次安装（bundle = Satellite）包含三个可分别启停的功能行；包根仅提供插件身份，不占配置行：
-
-| 行 id | 入口 | 默认 | 作用 |
-| --- | --- | --- | --- |
-| —（插件本体） | `satellite` | 启用 | 插件的身份入口：只承载插件级标题、描述与图标 |
-| `satellite-slots` | `satellite/slots` | 启用 | 插槽服务：节点插槽目录、扩展注册校验、条件三态与同槽解析 |
-| `satellite-node` | `satellite/node` | 启用 | 节点工具 `satellite_node`：一次调用内的 before/base/after 自动边界与角色委派（六个节点 `context`、`solution`、`implement`、`validate`、`review`、`signoff` 全部有 base runner） |
-| `satellite-android` | `satellite/android` | 停用（按项目启用） | Android 领域行：只读专项扩展（`context`/`solution`/`review`/`validate`/`signoff` 的按需补充）+ 五个只读方法技能；**本地执行工具默认关闭**，需显式配置 `execution` 才注册 |
-
-Android 执行工具（`satellite_android_project`、`satellite_android_build`、`satellite_android_device`、`satellite_android_emulator`、`satellite_android_journey`、`satellite_android_capture`）在领域行启用后**始终注册**；`execution` 是 **volatile** 设置，按每次调用读取，所以在设置页保存后**无需重启**。未启用或缺所需路径时，每次调用都以 `CAPABILITY_UNAVAILABLE` 失败关闭，不会产生任何副作用：
-
-配置可在设置页的 Satellite Android 一节编辑（本机路径、保存在 profile、不进仓库），也可写在行配置里：
-
-```jsonc
-// satellite-android 行配置（默认值归代码：enabled=false，其余留空即"未配置"）
-{
-  "execution": {
-    "enabled": true,
-    "androidCli": "/abs/path/to/android",          // discover-build 用；未配置则该动作明确不可用
-    "privacy": "verified-disabled",                 // 或 explicit-user-opt-in；未配置则拒绝 discover-build
-    "adbPath": "/abs/path/to/adb",                  // 设备/模拟器/旅程/采集
-    "emulatorPath": "/abs/path/to/emulator",        // 只注册模拟器工具
-    "avdmanagerPath": "/abs/path/to/avdmanager",    // 仅 create/delete 需要
-    "javaHome": "/abs/path/to/jdk",                 // 传给 Gradle 的 JAVA_HOME
-    "serverEndpoint": "tcp:5037",                   // 可省略；省略即用 adb 默认
-    "operationTimeoutMs": 600000,
-    "outputMaxBytes": 262144
-  }
-}
-```
-
-所有会碰设备的动作（`install`、`launch`、`journey`、`capture`）都必须先用 `satellite_android_device` 的 `discover` 取得观测 id，并在批准后用该 id 复核设备与加进程内互斥；不接受"只有裸 serial"的调用。
-
-不自动发现 SDK/JDK、不自动安装、不下载镜像。
-
-`workspace-write` 会话里 `~/.android` 与 `~/.gradle` 不可写，因此工具会把 **Android CLI 与 Gradle 的用户目录**定向到 `<会话工作区>/.satellite/{android-user-home,gradle-user-home}`（已 gitignore）。实测不这么做时 `android --version` 会直接报 `Failed to open ".../.android/cli/bundles/lock"`。执行工具的边界（已按用户选择确定）：复用 DSH 的文件/进程/批准能力，**不提供跨进程设备排他，也不承诺宿主崩溃后的清理**；模拟器 `start` 成功后会移交给当前会话作用域，在显式 `stop`、Agent 作用域退出或插件卸载时终止并等待。
-
-插槽服务是另外两行的共同依赖；停用它，节点工具与领域扩展都不会激活。
+Satellite 是 DeepSeek Harness 插件，帮助 Agent 按**调查 → 方案 → 实施 → 验证 → 审查 → 验收**推进项目任务，并可按需加入 Android 专项能力。
 
 ## 使用要求
 
-- Node `^22.19.0 || >=24.0.0`。
-- DeepSeek Harness 0.2.1 系列及兼容版本（提供 `@deepseek-ai/cordis`、`@deepseek-ai/schemastery`、`@deepseek-ai/dsh-tools`）。
+- Node.js `^22.19.0 || >=24.0.0`。
+- DeepSeek Harness 0.2.1 系列及兼容版本。
+- 已配置可用的模型服务；默认角色使用 `deepseek-official`，也可改为自己的模型。
 
 ## 安装
 
-用 Harness 的 `plugin_manager` 安装本包目录（bundle 入口由 `cordis.patch.yml` 声明），
-不要手写 profile 的 `package.json`／`cordis.patch.yml`，也不要直接运行 pnpm：
+发布后，从 GitHub Releases 下载 `release.tgz` 并解压，使用 Harness 的 `plugin_manager` 安装解压得到的包目录：
 
 ```text
-install_bundle <本包目录>
+install_bundle <解压后的 package 目录>
 ```
 
-安装本地目录是链接方式，因此**修改包内已加载过的文件后需要重启 Host** 才会载入新的模块世代。
+发布包已包含运行所需文件，无需自行构建。不要手动修改 Harness profile 的包清单或直接运行包管理器安装。
+本地目录以链接方式安装，请保留该目录；替换包文件后需要重启 Host。
 
-## 配置
+一次安装包含三个可分别启停的组件：
 
-分层原则：**声明式默认值在代码里**（`src/node/lib/config.ts` 的 `DEFAULT_CONFIG`，以及由它派生、
-供 schema 默认值使用的 `BUILTIN_ROLE_NAMES`/`BUILTIN_ROUTES`），**`cordis.patch.yml` 只声明"行"**
-（`id`/`name`/`disabled` 这类装配事实），**profile 只保存用户自己的选择**（设置页里保存的覆盖）。
-代码默认在没有用户覆盖时生效；用户显式覆盖继续保留，不会被升级强制重置。设置页应只保存用户选择，
-不能把整张有效默认表保存成旧快照。已保存过的旧全量路由不会被自动猜测为默认，需用户主动恢复继承。
-
-默认值：`provider: spawn`；节点 `context→investigation`、`solution→solution-design`、
-`implement→implementation`、`validate→validation`、`review→change-review`、`signoff→acceptance`；
-各角色的默认模型：
-
-| 角色 | 默认 provider | 默认 model |
+| 组件 | 默认状态 | 用途 |
 | --- | --- | --- |
-| `investigation` | `deepseek-official` | `deepseek-v4-pro` |
-| `solution-design` | `deepseek-official` | `deepseek-v4-pro` |
-| `implementation` | `deepseek-official` | `deepseek-v4-pro` |
-| `validation` | `deepseek-official` | `deepseek-flash` |
-| `change-review` | `deepseek-official` | `deepseek-v4-pro` |
-| `acceptance` | `deepseek-official` | `deepseek-v4-pro` |
-| `android-context` | `deepseek-official` | `deepseek-v4-pro` |
+| Satellite Slots | 启用 | 为节点和扩展提供共同服务，使用其他组件时请保持启用 |
+| Satellite Node | 启用 | 提供流程节点、复用查询和项目技能脚本工具 |
+| Satellite Android | 停用 | Android 专项调查、方案、验证、审查、验收，以及可选的本地执行工具 |
 
-只有在要**覆盖**默认值时才写行配置（设置页保存的覆盖是同一份语义）：
+## 使用流程
 
-```yaml
-provider: spawn
-nodes:
-  context:
-    role: investigation
-roles:
-  investigation:
-    objective: '自定义目标'
-routes:
-  - role: investigation
-    provider: <provider-id>
-    model: <model-id>
-```
+向 Agent 描述任务，并要求使用 Satellite 节点推进，例如：
 
-**模型选项的单一覆盖入口**：内置角色的用户模型覆盖只写 `routes`（包括
-`reasoningEffort`、`maxTokens`）。内置 `roles.<role>.agentOptions` 是代码默认来源；
-声明层给出与代码默认不同的对象将明确报配置错误，不再随 `routes` 缺省/空数组/稀疏数组而
-忽隐忽现。迁移时将完整模型选项移到同角色的 route，并删除旧 `agentOptions`；不会自动修改 profile。
-与当前代码默认完全相同的历史快照可被接受，但不会被本插件自动更新，建议移除冗余快照。
-自定义角色仍可声明 `agentOptions` 默认；没有可见 route 的默认值不会由UI猜测。
+> 使用 Satellite 先调查登录流程的问题，再提出方案；等我确认后实施，并完成验证和审查。
 
-工具过滤与文件沙箱承担不同责任：拒绝 `edit`/`write` 不能阻止 `bash` 写入。
-`roles.<role>.sandbox` 表达角色所需模式，但不得放宽父会话有效权限。`investigation`、
-`solution-design`、`change-review`、`acceptance`、`android-context` 默认只读；
-`validation` 与 `implementation` 请求工作区写入能力。父会话只读时，后两者也不能升级权限。
+节点工具为 `satellite_node`：
 
-整改后的执行要求：按明确子会话身份匹配，在原生初始化后、模型开始前施加并读回模式；
-缺服务、写入或读回失败、无法保证等效约束的后端均拒绝受限执行，不以目标值冒充实际值。
-文件沙箱仅约束其覆盖的操作；不代表网络/设备副作用授权，也不等于只能修改本次任务批准的文件。
-真实 Host 时序与各后端强制行为需分别验收，不能只看替身测试。
+| 节点 | 用途 | 默认权限需求 |
+| --- | --- | --- |
+| `context` | 有界调查，整理事实、可复用内容与缺口 | 只读 |
+| `solution` | 提出方案，列出需要用户决定的事项 | 只读 |
+| `implement` | 按已确认的范围实施 | 工作区写入 |
+| `validate` | 执行适用检查，报告证据与未测项 | 工作区写入 |
+| `review` | 独立审查当前改动 | 只读 |
+| `signoff` | 根据已有证据给出验收结论 | 只读 |
 
-节点 `context` 是流程第一步的**有界调查**：角色 `investigation` 先定范围与停止条件，再定向
-读取，产出事实与状态所有者、可复用候选、影响与缺口；它与 `review` 共用同一条只读过滤
-`deny: ['satellite_node', 'edit', 'write']` 与 `sandbox: 'read-only'`，因此能读事实来源但
-**不能改文件**（含 `bash`）。
+每次调用运行一个节点及其适用的前后扩展，不会自动串行执行全部六个节点。验证可能生成构建或测试产物，但不负责修复源码；验收不会自动修改代码，运行完成也不等于业务验收通过。
 
-节点 `solution` 是流程第二步的**方案与决策**：角色 `solution-design` 把 `context` 给出的有界
-事实转成可评审的选项，并逐条列出"需要谁做什么决定"；它与 `context`/`review` 共用同一条只读
-过滤 `deny: ['satellite_node', 'edit', 'write']` 与 `sandbox: 'read-only'`，因此"不实施"是能力
-边界——它能读事实来源，但**不能在"给方案"的同一步开始改文件**，`bash` 也写不进去。方案到此
-为止：只有用户能做的决定停下来等，不由实施或换更贵的模型代答。
+### 等待确认与恢复
 
-节点 `implement` 是有界实施：角色 `implementation` 允许必要写工具，但仍禁止递归调用
-`satellite_node`，请求 `workspace-write` 且受父权限上限约束。一次一个单元、不扩大目标、不提交
-不发布属于任务方法要求，由审查核对；不能把工作区内的所有可写位置等同于本次批准的修改范围。
-
-**旧配置迁移**：`roles.<role>.cwd` 曾被误描述为写权限收窄。实际 `request.cwd` 只改变当前目录，
-DSH 的不可变权限根继承父会话。为避免旧配置被静默放宽，配置该字段将明确拒绝启动；删除该字段后
-沿用父工作区权限与当前执行目录。暂不提供子目录写隔离或对应设置页。
-
-节点 `validate` 使用专用 `satellite-validation` 方法，仅执行适用检查并报告证据与未测项；
-可产生测试/构建产物，但不承担源代码修复，也不要求执行子 Agent 再调用节点工具组织整个流程。
-
-节点 `review` 是当前差异的独立审查：角色 `change-review` 的工具过滤为
-`deny: ['satellite_node', 'edit', 'write']` 与 `sandbox: 'read-only'`，因此它有读 diff 与源码的能力，
-在已验证的只读策略下，受沙箱覆盖的文件写入被拒绝。审查应直接检查实际源码与消费者，
-不能只读实施总结；使用不同模型本身不证明审查独立性。
-
-节点 `signoff` 是流程末步的**验收**：角色 `acceptance` 只按已有证据逐条声明接受与否、
-证据位置与仍未验证的剩余限制；它与 `context`/`solution`/`review` 共用同一条只读过滤
-`deny: ['satellite_node', 'edit', 'write']` 与 `sandbox: 'read-only'`，因此"不自动修复"是能力
-边界——验收不会顺手改完再声明通过。"完成运行是运行时事实，不是业务验收"：缺证据一律列为未验证，
-需要用户承担的接受交回用户，不提交、不发布。
-
-`routes` 是 **volatile** 设置（可在设置页修改；不写就是代码默认，用户保存的覆盖存 profile），
-插件在每次节点调用时读取，改模型不需要重启。
-
-`builtinExtensions.acceptanceDecision`（默认 `true`）控制 core 自带的 after 扩展
-`core.acceptance-decision.<node>`：`facts` 使用**扁平键**，点号是键名的一部分，不解析嵌套对象。
-例如以下 `satellite_node` 参数要求基础节点完成后等待一次处理决定：
+如需节点完成后等待处理决定，可传入扁平事实键 `acceptance.required`：
 
 ```json
 {"node":"validate","task":"运行本次有界验证","facts":{"acceptance.required":true}}
 ```
 
-该扩展在 `<node>.after` 返回 `needs_decision` 并暂停；用返回的 token 作为 `resume`
-再次调用同一节点，并传 `decision` 即可继续，base 不会重跑。例如（替换 token 占位值）：
+返回 `needs_decision` 时，用返回的 token 恢复同一节点，已完成的基础步骤不会重跑：
 
 ```json
 {"node":"validate","task":"运行本次有界验证","resume":"<返回的 token>","decision":"accept"}
 ```
 
-不传该事实、传非布尔 `true` 值或嵌套写法 `{"facts":{"acceptance":{"required":true}}}`
-均不会触发该扩展的暂停。关闭该扩展时也不会暂停；事实与 `decision` 都不是宿主授权凭证。
-恢复完成后，`extensions` 仍保留先前尝试的原始状态与正文；已完成节点的文本输出会将其中的
-`needs_decision` 标为历史暂停记录，不表示当前仍在等待决定。
+该行为由 `builtinExtensions.acceptanceDecision` 控制，默认开启。普通决定不能替代宿主的权限批准。
 
-## 可选复用目录与项目技能解析器
+## 配置模型
 
-节点组件同时提供 `satellite_reuse_query` 和 `satellite_skill_script_run`；Android 组件启用时提供
-`satellite_reuse_maintain`。它们是现有组件的内部能力，不需要另装组件。缺少运行依赖只使对应操作
-不可用，不使纯文本技能失效。以下为当前实现契约；真实宿主验收状态需另行核对。
+默认验证角色使用 `deepseek-flash`，其他内置角色使用 `deepseek-v4-pro`，均通过 `deepseek-official`。
+可在设置页修改角色模型，保存后下次调用生效，无需重启。
 
-### 复用目录
+如使用行配置，通过 `routes` 覆盖模型，例如：
 
-- 查询只返回有界候选及来源、新鲜度，不自动初始化。缺失或不可用时回到普通搜索；使用候选前读原源码。
-- 维护使用明确的文件集合，支持 `initialize`、`rebuild`、`update`，经宿主批准后原子写入。
-  单次最多 100 个相对文件路径；`update` 只处理该集合（已删除文件也在该集合声明）。
-- 项目根绑定调用会话的不可变工作区，不接受模型指定身份。当前适配仅接受可证明的 Host 共享文件映射；
-  不能确认的远程执行世界明确不可用。
-- 生成文件为工作区根的 `.satellite-reuse-index.json`，用户覆盖为 `.satellite-reuse-overrides.json`；
-  维护工具永不写用户覆盖。生成、Agent 调整、用户覆盖按顺序生效；用户可将候选标为 `excluded`。
-- 覆盖范围始终是 `explicit-files`，不代表整个项目已扫描。通用查询不能核对领域识别器版本时，
-  `recognitionStatus` 为 `unverified`，与源文件内容是否变化分别报告。
-- Android 提取只生成 Kotlin/Java/Compose 的启发式候选，不是语义索引。旧索引不自动导入；
-  损坏基线只有明确 `rebuild`、展示原版本和摘要并获批准后才可替换，合法但项目身份不匹配的索引拒绝覆盖。
-
-### 项目技能解析器
-
-`skill`、`script`、`parameters` 分别指定已加载项目技能、声明脚本 ID 与严格命名参数；不能提交任意
-shell 命令、环境、工作目录或权限声明。必须使用机器声明与显式 `stdin-v1` 协议；旧的纯文本脚本引用
-不自动兼容。主脚本内容与调用在批准前后核对，以只读文件沙箱、限时、限输出和原生取消机制执行。
-首版限定 POSIX 与原生解释器发现。文件只读不等于网络、设备或动态依赖隔离。
-
-具体声明、参数顺序、环境及迁移限制按需读取
-[项目解析器协议](<node/skills/satellite-investigation/references/project-parsers.md>)。
-子会话无法获得批准时应将准确请求交回父协调者，由父在自己的宿主批准边界调用；不得转述批准或用普通 shell 绕过。
-
-## 验证边界
-
-本地测试覆盖失败关闭、乱序会话、父权限收紧、扩展恢复、事实门禁及结果交接；
-替身通过不等于真实 Host 已验收。部署更新后仍需有界验证：
-
-- 父会话只读时请求实施，子会话仍只读，不能借角色模式获得写权限。
-- 前置调查的独特证据必须实际出现在基础节点输入与父结果中；暂停恢复不再次执行已完成扩展。
-- 设置页成功写入后读回相同覆盖；冲突/拒绝保存保留草稿；恢复默认后不产生整表快照。
-- 只测试授权范围；拒绝后不绕过、不自行升级权限，恢复测试改变的配置与探针文件。
-
-无原生等效约束的外部委派后端、PTC呈现及不同平台沙箱需各自验证，本包不会以单路径探针宣称全部覆盖。
-
-## 开发
-
-源码是 TypeScript，放在 `src/`；用 **tsdown** 构建到 `lib/`；发布物是 `lib/` 加包内资源。
-
-```bash
-npm_config_cache=<工作区>/.npm-cache npm install
-npm run build      # tsdown → lib/
-npm run typecheck  # tsc -p tsconfig.json
-npm test           # 先 build，再 node --test test/*.test.mjs
+```yaml
+routes:
+  - role: investigation
+    provider: <provider-id>
+    model: <model-id>
+  - role: validation
+    provider: <provider-id>
+    model: <model-id>
 ```
 
-`npm test` 先构建，再运行测试。入口、装配与既有用例覆盖构建产物；新增索引/脚本模块另有直接加载 TypeScript 的隔离反例测试，不能用它们代替真实宿主验收。
+六个节点对应的角色依次为 `investigation`、`solution-design`、`implementation`、`validation`、`change-review`、`acceptance`；Android 调查角色为 `android-context`。
+`reasoningEffort`、`maxTokens` 等模型选项也写在对应 route 中。不需要自定义的项目保持默认即可，升级不会强制清除用户覆盖。
 
-`locale/`、`icon.svg`、`node/skills/`、`android/skills/` 等资源**不参与构建**，保持在包内原位，
-由 `exports` 与 `files` 指向；技能加载器从包根推导资源目录（见 `src/lib/skills.ts`）。
+旧配置若含内置 `roles.<role>.agentOptions` 模型覆盖，请迁移到 `routes`；若含 `roles.<role>.cwd`，请删除，该字段不再支持。
 
-更多细节见 [docs/DEVELOP.md](docs/DEVELOP.md)。
+## Android（可选）
 
-## 自动发布
+在设置页启用 Satellite Android，即可使用按需的只读专项扩展。设备、构建等执行能力默认关闭，需要在 Satellite Android 设置中显式开启并配置本机路径：
 
-源码在 `source` 分支开发；推送与包版本一致的 `v*` 标签后，GitHub Actions 自动校验、构建、
-测试并上传 GitHub Release 附件 `release.tgz`。稳定版将同一附件同步到 `main` 产物分支；
-预发布版不更新 `main`。流程不发布到 npm registry，也不在本地自动推送标签。
+```json
+{
+  "execution": {
+    "enabled": true,
+    "androidCli": "/abs/path/to/android",
+    "privacy": "verified-disabled",
+    "adbPath": "/abs/path/to/adb",
+    "emulatorPath": "/abs/path/to/emulator",
+    "avdmanagerPath": "/abs/path/to/avdmanager",
+    "javaHome": "/abs/path/to/jdk"
+  }
+}
+```
 
-首次启用需要配置远程仓库、将源码保存到 `source` 并设置默认分支及 Actions 写权限。
-详见 [发布流程与初始化步骤](<docs/DEVELOP.md#发布流程>)。
+- `androidCli` 用于动态发现构建信息；`privacy` 仅在已核实关闭相关遥测时设为 `verified-disabled`，明确同意时可设为 `explicit-user-opt-in`。未选择时不执行动态发现。
+- `adbPath` 用于设备操作；`emulatorPath` 用于模拟器操作；`avdmanagerPath` 仅创建、删除 AVD 时需要；`javaHome` 用于 Gradle。
+- 工具不会自动寻找 SDK/JDK、安装依赖或下载镜像。缺少某项配置时，对应操作会报告不可用。
+- 设置保存后无需重启。执行工具在组件启用后可见，但只有满足配置与权限要求时才能执行。
 
-## 发布形态说明（相对参考项目的一处有意扩展）
+| 工具 | 用途 |
+| --- | --- |
+| `satellite_android_project` | 检查项目、发现构建信息 |
+| `satellite_android_build` | 执行指定构建 |
+| `satellite_android_device` | 发现设备、安装和启动应用、检查前台状态 |
+| `satellite_android_emulator` | 管理模拟器 |
+| `satellite_android_journey` | 执行有界操作与断言 |
+| `satellite_android_capture` | 采集日志、内存、录屏或性能数据 |
 
-本包以 `DSHOAuth` 的发布模式为参考。参考项目的发布脚本断言"包内第一层只允许
-`lib/`、`package.json`、`README.md`、`cordis.patch.yml`、`LICENSE`"。
+设备操作应先发现目标并取得观测 id；安装、启动、旅程和采集会使用该 id 复核设备，不接受仅凭 serial 执行。
+工具复用 Harness 的批准机制，遇到拒绝或权限不足时不会绕过。
 
-Satellite 是**带资源的包**：`locale/*.json`、`icon.svg`、`node/skills/`、`android/skills/`
-必须随包分发，否则子组件没有标题/描述/图标，节点工具也读不到方法技能。
-因此本包**扩展了该发布白名单**：除 `lib/` 与 manifest 外，允许上述资源目录。
-`test/package.test.mjs` 是这条约定的质量门（钩子禁令、入口文件真实存在、`files` 含 `lib` 与资源、无 `dependencies`、peer/dev 版本集合一致）。
+Android CLI 与 Gradle 的用户目录定向到会话工作区内的 `.satellite/`，可能产生缓存和构建文件。
+启动的模拟器由当前会话管理，可显式停止；会话作用域退出或插件卸载时也会清理，但不保证 Host 崩溃后的清理，也不提供跨进程设备独占。
+
+## 其他工具
+
+- **复用查询**（`satellite_reuse_query`）：查找已有代码候选并报告来源与新鲜度；没有索引时回到普通搜索，不会自动建立索引。使用候选前仍需核对源码。
+- **复用维护**（`satellite_reuse_maintain`，需启用 Android 组件）：经批准为明确的文件集合初始化、更新或重建索引，不代表已扫描整个项目；不会覆盖用户自己的排除设置。
+- **项目技能脚本**（`satellite_skill_script_run`）：仅运行已加载项目技能中明确声明的脚本，需批准，受只读文件沙箱、时间与输出限额约束；当前仅支持 POSIX 环境，不能用于提交任意 shell 命令。
+
+## 权限与限制
+
+- 角色权限不能超过父会话权限；父会话只读时，实施和验证节点也无法获得写权限。
+- 文件沙箱不等于网络或设备授权；可写工作区也不代表可以修改任务范围外的文件。
+- 无法保证所需权限约束或缺少必要宿主能力时，相关操作会拒绝执行。
+- 远程执行环境及不同后端的能力可能不同；本地测试通过不代表所有宿主和平台均已验证。请以实际返回的证据、未测项及限制为准。
 
 ## 许可
 
-MIT。
+MIT，见 [LICENSE](<LICENSE>)。
