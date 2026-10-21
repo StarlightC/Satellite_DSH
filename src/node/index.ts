@@ -13,6 +13,7 @@ import z from '@deepseek-ai/schemastery'
 import { resourceDirFrom } from '../lib/skills.js'
 import { BUILTIN_ROLE_NAMES, BUILTIN_ROUTES } from './lib/config.js'
 import { createNodeRuntime } from './lib/wiring.js'
+import { SatelliteRoles } from './lib/role-service.js'
 import type { NodeRuntimeContext } from './lib/wiring.js'
 import { registerReuseQuery } from './lib/reuse-tools.js'
 import type { ReuseToolContext } from './lib/reuse-tools.js'
@@ -59,7 +60,7 @@ export const Config = z.object({
 })
 
 export function apply(ctx: Context, config: unknown): void {
-  createNodeRuntime({
+  const runtime = createNodeRuntime({
     // DSH 的原生服务（tools/skills/subagents/llm/...）由各自的原生包声明合并到 Context；
     // 这里按本模块真正读取的能力收窄一次，避免在本包复刻整套 Context 类型。
     ctx: ctx as unknown as NodeRuntimeContext,
@@ -68,6 +69,9 @@ export function apply(ctx: Context, config: unknown): void {
     // 资源（locale/icon/skills）不参与构建，构建后入口在 lib/node/，资源仍在包根的 node/。
     resourceDir: resourceDirFrom(import.meta.url, 'node'),
   })
+  // A read-only native Remote service, owned by this node row's lifecycle.
+  // Ordinary roles/nodes remain deployment configuration, not editable volatile settings.
+  ctx.plugin(SatelliteRoles, { describe: () => runtime.describeRoles() })
   // Register optional operations only after the node configuration has been validated.
   registerReuseQuery(ctx as unknown as ReuseToolContext)
   ctx.effect(() => registerSkillScriptTool(ctx as unknown as SkillScriptContext, defineTool))

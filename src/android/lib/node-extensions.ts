@@ -14,8 +14,9 @@
  */
 
 import type { Match, Readiness, SlotExtension, SlotFacts } from '../../lib/contracts.js'
+import { PROJECT_KIND, PROJECT_KIND_FACT, ROLE } from './extension.js'
 
-export const ROLE = 'android-context'
+export { ROLE } from './extension.js'
 
 /** 结构校验失败的错误码前缀：调用方按统一词表报告，不解析正文。 */
 export const ARGUMENT_INVALID = 'ARGUMENT_INVALID'
@@ -240,12 +241,18 @@ function createMethodExtension<T>(spec: MethodSpec<T>): SlotExtension {
     id: spec.id,
     slot: spec.slot,
     slotVersion: 1,
+    role: {
+      name: ROLE,
+      skill: spec.skill,
+      objective: spec.objective,
+      condition: `${spec.requiredFact} === true 且 ${PROJECT_KIND_FACT} === '${PROJECT_KIND}'${spec.sourceFacts.length > 0 ? `，已提供 ${spec.sourceFacts.join('、')}；执行前校验输入结构` : ''}；缺少必需字段时等待补充；需角色 ${ROLE} 与技能 ${spec.skill} 可用。`,
+    },
     match(facts: SlotFacts): Match {
       // 先看自己的显式要求：未声明就不进入普通任务，避免每次调用都跑全套专项。
       if (facts.values[spec.requiredFact] !== true) return { kind: 'no' }
-      const projectKind = facts.values['projectKind']
-      if (projectKind === undefined) return { kind: 'unknown', missing: ['projectKind'] }
-      if (projectKind !== 'android') return { kind: 'no' }
+      const projectKind = facts.values[PROJECT_KIND_FACT]
+      if (projectKind === undefined) return { kind: 'unknown', missing: [PROJECT_KIND_FACT] }
+      if (projectKind !== PROJECT_KIND) return { kind: 'no' }
       const missing = spec.sourceFacts.filter((name) => facts.values[name] === undefined)
       if (missing.length > 0) return { kind: 'unknown', missing }
       return { kind: 'yes' }

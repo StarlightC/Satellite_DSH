@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
+import { Context } from '@deepseek-ai/cordis'
 import { registerReuseQuery, registerReuseMaintenance } from '../lib/node/lib/reuse-tools.js'
 import { extractAndroidReuseSource, ANDROID_REUSE_SOURCE_REVISION } from '../lib/android/lib/reuse-source.js'
 import { apply as applyAndroid, inject as applyAndroidInject } from '../lib/android/index.js'
@@ -171,10 +172,25 @@ test('core apply validates builtin role options before registering any operation
   assert.equal(f.disposers.length, 0)
 })
 
-test('core real apply mounts node, generic query and script entry without Android recognizer', () => {
+test('core real apply mounts node, read-only role service, generic query and script entry without Android recognizer', async () => {
   const f = setup()
-  applyNode({ ...f.ctx, satelliteSlots: { defineNode: () => () => {}, register: () => () => {} } }, {})
-  assert.deepEqual([...f.tools.keys()].sort(), ['satellite_node', 'satellite_reuse_query', 'satellite_skill_script_run'])
+  const owner = new Context()
+  const fibers = []
+  applyNode({
+    ...f.ctx,
+    plugin(plugin, options) { const fiber = owner.plugin(plugin, options); fibers.push(fiber); return fiber },
+    satelliteSlots: { defineNode: () => () => {}, register: () => () => {}, snapshot: () => [] },
+  }, {})
+  await Promise.all(fibers)
+  try {
+    assert.deepEqual([...f.tools.keys()].sort(), ['satellite_node', 'satellite_reuse_query', 'satellite_skill_script_run'])
+    const catalog = owner.get('satelliteRoles').describe()
+    assert.equal(catalog.version, 1)
+    assert.equal(catalog.roles.find((role) => role.role === 'android-context').bindings.length, 0)
+  } finally {
+    await Promise.all(fibers.map((fiber) => fiber.dispose()))
+  }
+  assert.equal(owner.get('satelliteRoles'), undefined)
 })
 
 test('Android real apply declares tools and registers maintenance (not the query tool)', () => {

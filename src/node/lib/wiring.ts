@@ -25,6 +25,8 @@ import type { NormalizedConfig, RoleConfig, SandboxDecision, SandboxMode } from 
 import { createAcceptanceDecisionExtension } from './extensions.js'
 import { preflightRoute } from './routes.js'
 import type { LlmLike, RouteCapabilities, SelectionState } from './routes.js'
+import { buildRoleCatalog } from './role-catalog.js'
+import type { RoleCatalog } from './role-catalog.js'
 import { createCallStore, runNode } from './nodes.js'
 import type { CallStore, ExtensionResult, NodeCallRecord, NodeRunResult } from './nodes.js'
 import { OUTPUT_SCHEMA, PARAMETERS_SCHEMA } from './tool-schema.js'
@@ -341,6 +343,8 @@ export interface NodeRuntime {
   readonly tool: SatelliteNodeTool
   readonly nodeIds: readonly string[]
   readonly registeredSkills: ReadonlySet<string>
+  /** Effective configuration and currently registered bindings; no execution or model call. */
+  describeRoles(): RoleCatalog
   checkRoleAndSkill(
     roleName: string,
     skillName?: string,
@@ -798,5 +802,8 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
 
   ctx.effect(() => ctx.tools.register(tool))
 
-  return { tool, nodeIds, registeredSkills, checkRoleAndSkill }
+  return {
+    tool, nodeIds, registeredSkills, checkRoleAndSkill,
+    describeRoles: () => buildRoleCatalog(resolved, slots.snapshot()),
+  }
 }

@@ -1,6 +1,6 @@
 {
   "name": "satellite",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Satellite runs a project's base workflow as nodes with pluggable before/after extensions. One install carries three independently toggleable rows: the slot service, the satellite_node tool, and an opt-in Android read-only extension.",
   "license": "MIT",
@@ -51,11 +51,13 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.5-alpha.1",
     "@deepseek-ai/dsh-tools": ">=0.2.1-alpha.2 <0.3",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.1-alpha.2 <0.3",
     "@deepseek-ai/schemastery": "~3.18.5-alpha.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5-alpha.1",
     "@deepseek-ai/dsh-tools": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-alpha.2",
     "@deepseek-ai/schemastery": "3.18.5-alpha.1",
     "@types/node": "^24.0.0",
     "tsdown": "0.22.2",

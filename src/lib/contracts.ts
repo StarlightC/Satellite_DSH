@@ -39,6 +39,14 @@ export interface SlotFacts {
   readonly values: Readonly<Record<string, unknown>>
 }
 
+/** 角色目录说明；只投影已注册挂载，不参与 match/ready 或权限判定。 */
+export interface SlotRoleMetadata {
+  readonly name: string
+  readonly skill: string
+  readonly objective: string
+  readonly condition: string
+}
+
 /**
  * 扩展定义。`run` 的实现可以是同步或异步（调用方一律 await），
  * 其 execution 参数由调用方（节点工具）在调用时注入，因此这里是 `unknown`。
@@ -49,6 +57,8 @@ export interface SlotExtension {
   /** 公共插槽名（不是组件名） */
   readonly slot: string
   readonly slotVersion: number
+  /** 可选的角色职责与触发说明，应与真实执行共用声明来源。 */
+  readonly role?: SlotRoleMetadata
   /** 需要已核对的既有事实 */
   readonly requires?: readonly string[]
   /** 声明输出；不因声明就成为事实 */
@@ -195,8 +205,20 @@ export function validateExtension(extension: SlotExtension, catalog: NodeCatalog
     throw new TypeError(`extension ${id}: exclusiveGroup must be a string`)
   }
 
+  if (extension.role !== undefined) {
+    if (!extension.role || typeof extension.role !== 'object' || Array.isArray(extension.role)) {
+      throw new TypeError(`extension ${id}: role must be an object`)
+    }
+    for (const field of ['name', 'skill', 'objective', 'condition'] as const) {
+      if (typeof extension.role[field] !== 'string' || extension.role[field].trim().length === 0) {
+        throw new TypeError(`extension ${id}: role.${field} must be a non-empty string`)
+      }
+    }
+  }
+
   return Object.freeze({
     ...extension,
+    ...(extension.role ? { role: Object.freeze({ ...extension.role }) } : {}),
     requires: Object.freeze([...(extension.requires ?? [])]),
     provides: Object.freeze([...(extension.provides ?? [])]),
   })

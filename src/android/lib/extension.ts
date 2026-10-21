@@ -15,6 +15,8 @@ export const CONTEXT_FACT = 'validation.context'
 export const ROLE = 'android-context'
 export const SKILL = 'android-validation-context'
 export const OBJECTIVE = '确认当前模块、变体和相关测试入口；不启动设备或运行测试。'
+export const PROJECT_KIND_FACT = 'projectKind'
+export const PROJECT_KIND = 'android'
 
 /** 调用作用域提供的能力检查接口（由节点工具注入）。 */
 interface CapabilityScope {
@@ -31,12 +33,18 @@ export function createAndroidValidationContext(): SlotExtension {
     id: EXTENSION_ID,
     slot: SLOT,
     slotVersion: SLOT_VERSION,
+    role: {
+      name: ROLE,
+      skill: SKILL,
+      objective: OBJECTIVE,
+      condition: `${PROJECT_KIND_FACT} === '${PROJECT_KIND}' 且 ${CONTEXT_FACT} 未提供；缺少 ${PROJECT_KIND_FACT} 时等待补充；需角色 ${ROLE} 与技能 ${SKILL} 可用。`,
+    },
     // Raw evidence travels in the node's extension results, not as a fabricated provides fact.
     match(facts: SlotFacts): Match {
-      const projectKind = facts.values['projectKind']
+      const projectKind = facts.values[PROJECT_KIND_FACT]
       // 缺事实与不适用必须区分：目录名不能当作平台证据。
-      if (projectKind === undefined) return { kind: 'unknown', missing: ['projectKind'] }
-      if (projectKind !== 'android') return { kind: 'no' }
+      if (projectKind === undefined) return { kind: 'unknown', missing: [PROJECT_KIND_FACT] }
+      if (projectKind !== PROJECT_KIND) return { kind: 'no' }
       if (facts.values[CONTEXT_FACT] !== undefined) return { kind: 'no' }
       return { kind: 'yes' }
     },

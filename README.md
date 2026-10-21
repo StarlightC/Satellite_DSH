@@ -10,6 +10,20 @@ Satellite 是 DeepSeek Harness 插件，帮助 Agent 按**调查 → 方案 → 
 
 ## 安装
 
+### 从 GitHub 安装（推荐）
+
+在 Harness 的 `plugin_manager` 中使用完整安装目标（显式指定包名和发布分支）：
+
+```json
+{"action":"install_bundle","target":"satellite@github:StarlightC/Satellite_DSH#main"}
+```
+
+仓库默认分支 `source` 用于开发，不包含 `lib/` 编译产物；`main` 由稳定版本发布流程同步，包含可直接安装的成品。不要使用不带 `#main` 的仓库地址，也不要安装源码 tag。显式写出 `satellite@` 可避免安装器无法识别目标包而返回 `ambiguous-install`。
+
+如果之前安装了源码分支，直接使用上述目标重新安装即可。若 Harness 返回 `restart-required`，请重启 Harness（仅刷新页面不够）。
+
+### 从 Release 文件安装
+
 发布后，从 GitHub Releases 下载 `release.tgz` 并解压，使用 Harness 的 `plugin_manager` 安装解压得到的包目录：
 
 ```text
@@ -83,6 +97,16 @@ routes:
 `reasoningEffort`、`maxTokens` 等模型选项也写在对应 route 中。不需要自定义的项目保持默认即可，升级不会强制清除用户覆盖。
 
 旧配置若含内置 `roles.<role>.agentOptions` 模型覆盖，请迁移到 `routes`；若含 `roles.<role>.cwd`，请删除，该字段不再支持。
+
+### 插件角色说明
+
+配套 UI 只配置已定义角色的模型，不提供“新增角色”。节点行通过原生只读 Remote `satelliteRoles.describe()` 提供版本化角色目录：友好名称、有效职责、方法技能、配置的文件沙箱，以及当前节点/已注册扩展的执行位置和触发说明。目录来自实际装配配置与扩展快照，不调用模型或执行扩展；部署自定义角色可用 `roles.<role>.label` 补充显示名称。
+
+打开页面或刷新角色说明时重新读取目录。停用 Android 扩展后，角色定义仍在，但目录不再列出已撤销的绑定。说明只表示配置和挂载，不代表当前任务匹配、技能就绪或已获权限；实际权限仍受父会话限制。
+
+只有 `routes`、没有角色定义的旧条目不会创建角色，UI 标记为未关联并原样保留，直到用户明确清理。角色目录不可用或版本/结构不兼容时，UI 明确提示并停止修改，不能把读取失败当成角色已删除。模型保存仍仅修改 `routes`，不写入角色说明、角色定义或节点绑定。
+
+此只读通道使用宿主原生 Typert Remote 的无参 `src-json` 结果描述符（已按 `0.2.1-alpha.2` 契约实现），UI 校验结果结构；不增加 HTTP 服务或手写传输。旧版主插件没有目录接口时需同步升级两包。这里展示的是重新读取时的快照，不是扩展启停的实时推送。
 
 ## Android（可选）
 

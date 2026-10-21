@@ -38,6 +38,8 @@ export default defineConfig([
   // 节点工具入口
   entry('satellite/node', 'lib/node', 'src/node/index.ts', 'index.js'),
   entry('satellite/node/lib/config', 'lib/node/lib', 'src/node/lib/config.ts', 'config.js'),
+  entry('satellite/node/lib/role-catalog', 'lib/node/lib', 'src/node/lib/role-catalog.ts', 'role-catalog.js'),
+  entry('satellite/node/lib/role-service', 'lib/node/lib', 'src/node/lib/role-service.ts', 'role-service.js'),
   entry('satellite/node/lib/extensions', 'lib/node/lib', 'src/node/lib/extensions.ts', 'extensions.js'),
   entry('satellite/node/lib/nodes', 'lib/node/lib', 'src/node/lib/nodes.ts', 'nodes.js'),
   entry('satellite/node/lib/routes', 'lib/node/lib', 'src/node/lib/routes.ts', 'routes.js'),

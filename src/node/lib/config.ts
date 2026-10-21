@@ -72,6 +72,7 @@ export function effectiveSandboxMode(role: RoleConfig | undefined): SandboxDecis
 }
 
 export interface RoleConfig {
+  readonly label?: string
   readonly skill?: string
   readonly objective?: string
   readonly persona?: string
@@ -157,6 +158,7 @@ export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
   roles: Object.freeze({
     // 流程第一步（`context` 节点）：只读的有界调查，调查同样不许写。
     investigation: Object.freeze({
+      label: '有界调查',
       skill: 'satellite-investigation',
       objective: '先写下本次调查的范围与停止条件，再定向读取决定性的来源；产出事实与状态所有者、可复用候选、对直接影响面的影响与仍未解缺口；只读，不改文件。',
       persona: '区分读到的事实与自己的推断，事实附上确切位置；缺口如实保留为缺口，不用猜测补齐。',
@@ -167,6 +169,7 @@ export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
     // 带连字符的键在对象字面量里必须加引号：不加引号会被当成减法表达式（本项目已踩过）。
     // 流程第二步（`solution` 节点）：把有界事实转成可评审的选项，到此为止，不实施。
     'solution-design': Object.freeze({
+      label: '方案设计',
       skill: 'satellite-solution',
       objective: '把有界事实转成可评审的选项，逐条列出需要谁做什么决定；不实施、不扩大目标，提交方案后停下等待决定。',
       persona: '区分事实与推断，选项所依据的事实附上确切位置；判断不了的选项如实说明，不编造信心。',
@@ -178,6 +181,7 @@ export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
     // 它拿 `workspace-write` 沙箱 + `IMPLEMENT_TOOL_FILTER`（不拒绝 edit/write），
     // 不支持以工作目录收窄写边界；旧 cwd 配置失败关闭。
     implementation: Object.freeze({
+      label: '代码实施',
       skill: 'satellite-implementation',
       objective: '只改已同意的基线，一次一个单元：动手前用一小段写明改什么、范围与不在范围内、验证方式，以及仍缺的决定（缺决定就停在这里）；改动取满足单元的最小面，复用既有约定，不顺手重构、不扩大目标、不提交不发布；完成后跑该范围需要的编译/类型检查并如实报告（完整验证归 validate）。',
       persona: '区分"已同意的基线"与自己的发挥：没有同意的改动停手，把决定交回而不是替用户决定；失败证据一并保留，不把部分检查说成验证；环境或权限阻塞如实报告为阻塞。',
@@ -186,6 +190,7 @@ export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
       agentOptions: Object.freeze({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }),
     }),
     validation: Object.freeze({
+      label: '项目验证',
       skill: 'satellite-validation',
       objective: '执行项目实际适用的验证命令；返回真实执行结果、证据位置与未测范围。',
       persona: '只报告实际执行过的验证与真实结果；不把未运行的检查说成通过。',
@@ -196,6 +201,7 @@ export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
     }),
     // 带连字符的键在对象字面量里必须加引号：不加引号会被当成减法表达式（本项目已踩过）。
     'change-review': Object.freeze({
+      label: '独立审查',
       skill: 'satellite-change-review',
       objective: '锁定当前差异与其消费者，独立审查实际改动与相关源码，给出结论与限制；不修改任何文件，不自动修复，不提交。',
       persona: '只依据实际差异与相关源码下结论；区分已证实的问题与未验证的怀疑，读不到的内容明确报告为未验证。',
@@ -206,6 +212,7 @@ export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
     }),
     // 流程末步（`signoff` 节点）：只按证据声明接受与否与剩余限制，不提交、不发布、不自动修复。
     acceptance: Object.freeze({
+      label: '证据验收',
       skill: 'satellite-acceptance',
       objective: '按实际证据逐条声明接受与否，给出证据位置与仍未验证的剩余限制；不提交、不发布、不自动修复，需要用户决定的接受交回用户。',
       persona: '只按证据下结论；缺失证据列为未验证而不是默认通过，完成运行本身不当作业务验收。',
@@ -214,6 +221,7 @@ export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
       agentOptions: Object.freeze({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }),
     }),
     'android-context': Object.freeze({
+      label: 'Android 专项调查',
       skill: 'android-validation-context',
       objective: '确认当前模块、变体和相关测试入口；不启动设备或运行测试。',
       toolFilter: EXECUTOR_TOOL_FILTER,

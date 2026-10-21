@@ -225,6 +225,27 @@ function mountAndroid({ registry, skillNames }) {
   for (const name of ANDROID_SKILL_NAMES) skillNames.add(name)
 }
 
+test('角色说明复用装配配置并实时读取扩展，不启动角色或改变路由', () => {
+  const config = Config({
+    nodes: { validate: { role: 'custom-check' } },
+    roles: { 'custom-check': { label: '项目检查', objective: '检查项目约定', sandbox: 'read-only' } },
+    routes: [{ role: 'obsolete', provider: 'missing', model: 'untouched', maxTokens: 10 }],
+  })
+  const { runtime, registry, calls } = setup({ config })
+  const first = runtime.describeRoles()
+  assert.equal(first.roles.find((role) => role.role === 'validation').bindings.length, 0)
+  const custom = first.roles.find((role) => role.role === 'custom-check')
+  assert.equal(custom.label, '项目检查')
+  assert.equal(custom.bindings[0].node, 'validate')
+  assert.equal(first.roles.some((role) => role.role === 'obsolete'), false)
+  const remove = registry.register(createAndroidValidationContext())
+  assert.equal(runtime.describeRoles().roles.find((role) => role.role === 'android-context').bindings.length, 1)
+  remove()
+  assert.equal(runtime.describeRoles().roles.find((role) => role.role === 'android-context').bindings.length, 0)
+  assert.deepEqual(config.routes.get(), [{ role: 'obsolete', provider: 'missing', model: 'untouched', maxTokens: 10 }])
+  assert.equal(calls.activations.length, 0)
+})
+
 test('装配：声明节点、注册工具，且只注册本包自带的技能', () => {
   const { calls, runtime } = setup()
   assert.deepEqual(calls.nodes, ['context', 'solution', 'implement', 'validate', 'review', 'signoff'])
