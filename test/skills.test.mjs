@@ -150,14 +150,16 @@ test('没有 frontmatter 的文件解析为空元数据、正文为全文', () =
 // 技能目录下的 references/ 只有被 SKILL.md 用相对链接指到才可发现。
 // 两个方向都查：链接必须真实存在，已存在的按需参考也必须被链接（否则是死文件）。
 test('按需参考与 SKILL.md 相对链接双向一致', () => {
-  const names = readdirSync(`${NODE_DIR}/skills`, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-  assert.ok(names.includes('satellite-base-flow'))
+  // Production path: a loaded core/domain skill points the Agent to a deferred
+  // reference. Check actual loadable resources, not policy keywords as behaviour.
+  const entries = [NODE_DIR, ANDROID_DIR].flatMap((directory) =>
+    readdirSync(`${directory}/skills`, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({ directory, name: entry.name })))
+  assert.ok(entries.some(({ name }) => name === 'satellite-base-flow'))
 
-  let linked = 0
-  for (const name of names) {
-    const skill = loadSkill(NODE_DIR, name)
+  for (const { directory, name } of entries) {
+    const skill = loadSkill(directory, name)
     const content = readFileSync(skill.path, 'utf8')
     const links = [...content.matchAll(/\]\((references\/[^)\s]+)\)/g)].map((match) => match[1])
     assert.deepEqual(
@@ -167,7 +169,6 @@ test('按需参考与 SKILL.md 相对链接双向一致', () => {
     )
     for (const link of links) {
       assert.ok(existsSync(`${skill.resourceBase.path}/${link}`), `${name}: 链接缺少文件 ${link}`)
-      linked += 1
     }
 
     const references = `${skill.resourceBase.path}/references`
@@ -179,6 +180,4 @@ test('按需参考与 SKILL.md 相对链接双向一致', () => {
       )
     }
   }
-  // 这个断言不是装饰：本单元确实新增了按需参考，链接断掉就等于文件不存在。
-  assert.ok(linked >= 7, `按需参考链接数量异常：${linked}`)
 })

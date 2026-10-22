@@ -93,8 +93,40 @@ export interface RoleConfig {
 export const UNSUPPORTED_ROLE_CWD =
   '不支持 role.cwd 收窄写范围：原生 request.cwd 只改变工作目录，不改变继承的沙箱根；请移除旧配置并重新确认父会话授权范围'
 
+export const NODE_TIERS = ['light', 'standard', 'senior'] as const
+export type NodeTier = typeof NODE_TIERS[number]
+
 export interface NodeEntry {
   readonly role: string
+  /** 显式档位的完整映射；不与默认图深合并。省略 tier 始终使用 role。 */
+  readonly tierRoles?: Readonly<Partial<Record<NodeTier, string>>>
+}
+
+export interface NodeRoleSelection {
+  readonly role: string
+  readonly tier?: NodeTier
+}
+
+/** Only declared node mappings select roles; caller facts never grant a role. */
+export function selectNodeRole(
+  entry: NodeEntry,
+  roles: Readonly<Record<string, RoleConfig>>,
+  tier: unknown,
+  previous?: NodeRoleSelection,
+): NodeRoleSelection {
+  if (tier !== undefined && !NODE_TIERS.includes(tier as NodeTier)) {
+    throw new Error('tier 必须为 light、standard 或 senior（不是执行风险等级）')
+  }
+  if (previous) {
+    if (tier !== undefined && tier !== previous.tier) {
+      throw new Error('resume 不能改变已选 tier；省略 tier 可继续原调用，升降档请新建节点调用')
+    }
+    return previous
+  }
+  const role = tier === undefined ? entry.role : entry.tierRoles?.[tier as NodeTier]
+  if (!role) throw new Error(`节点未配置 ${String(tier)} 档角色；请配置映射、转专项或请求用户决定`)
+  if (!Object.hasOwn(roles, role)) throw new Error(`未配置角色：${role}`)
+  return Object.freeze({ role, ...(tier === undefined ? {} : { tier: tier as NodeTier }) })
 }
 
 /** 核心自带扩展的开关：逐字段合并，缺省走默认值。 */
@@ -134,7 +166,7 @@ export const IMPLEMENT_TOOL_FILTER: Readonly<{ deny: readonly string[] }> = Obje
   deny: ['satellite_node'],
 })
 
-export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
+const BASE_CONFIG: NormalizedConfig = Object.freeze({
   provider: 'spawn',
   // 只登记本包自带的技能；领域技能由对应组件自己注册，core 不读别的组件的文件。
   skills: Object.freeze([
@@ -234,6 +266,46 @@ export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
   }),
 })
 
+/** Tier variants reuse the corresponding method and safety defaults, not a new model ladder. */
+export const DEFAULT_CONFIG: NormalizedConfig = Object.freeze({
+  ...BASE_CONFIG,
+  nodes: Object.freeze({
+    ...BASE_CONFIG.nodes,
+    implement: Object.freeze({ role: 'implementation', tierRoles: Object.freeze({
+      light: 'implementation-light', standard: 'implementation', senior: 'implementation-senior',
+    }) }),
+    review: Object.freeze({ role: 'change-review', tierRoles: Object.freeze({
+      light: 'change-review-light', standard: 'change-review',
+    }) }),
+    validate: Object.freeze({ role: 'validation', tierRoles: Object.freeze({
+      light: 'validation-light', standard: 'validation',
+    }) }),
+  }),
+  roles: Object.freeze({
+    ...BASE_CONFIG.roles,
+    'implementation-light': Object.freeze({
+      ...BASE_CONFIG.roles.implementation,
+      label: '局部低风险实施',
+      objective: `${BASE_CONFIG.roles.implementation!.objective} 仅承担边界清楚、局部低风险且易回退的单元；超出该范围或出现未解风险时停止并交回，不降低任务整体审查要求。`,
+    }),
+    'implementation-senior': Object.freeze({
+      ...BASE_CONFIG.roles.implementation,
+      label: '复杂边界实施',
+      objective: `${BASE_CONFIG.roles.implementation!.objective} 处理无法安全拆成独立轻量单元的耦合边界；先核对已有失败历史与当前改动，不通过重派清零同档预算、不重复被证据否定的方法；仍无法解决时交回专项或用户，不无限重试。`,
+    }),
+    'change-review-light': Object.freeze({
+      ...BASE_CONFIG.roles['change-review'],
+      label: '局部低风险审查',
+      objective: `${BASE_CONFIG.roles['change-review']!.objective} 只审查局部低风险、直接消费者明确的改动；证据超出局部范围或返工后仍未解决时交回常规审查或专项，不把局部结论当整体通过。`,
+    }),
+    'validation-light': Object.freeze({
+      ...BASE_CONFIG.roles.validation,
+      label: '局部验证',
+      objective: `${BASE_CONFIG.roles.validation!.objective} 仅执行范围明确的局部检查，明确标注局部证据与未测范围；重复同因失败或需要更广验证时交回，不以局部通过替代整体验证。`,
+    }),
+  }),
+})
+
 /**
  * 由代码计算的角色清单，供 schema 默认值使用（`src/node/index.ts` 的 `declaredRoles`）。
  * 顺序与 `DEFAULT_CONFIG.roles` 的声明顺序一致。
@@ -272,7 +344,26 @@ export function normalizeConfig(config?: unknown): NormalizedConfig {
   const incoming = asRecord(config)
   const nodes: Record<string, NodeEntry> = { ...DEFAULT_CONFIG.nodes }
   for (const [nodeId, entry] of Object.entries(asRecord(incoming.nodes))) {
-    nodes[nodeId] = { ...(DEFAULT_CONFIG.nodes[nodeId] ?? {}), ...asRecord(entry) } as NodeEntry
+    const override = asRecord(entry)
+    const merged = { ...(DEFAULT_CONFIG.nodes[nodeId] ?? {}), ...override } as NodeEntry
+    // An explicit role override owns routing; never retain hidden builtin tier bindings.
+    const { tierRoles: _tiers, ...withoutTiers } = merged
+    if (Object.hasOwn(override, 'tierRoles')) {
+      const value = override.tierRoles
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`nodes.${nodeId}.tierRoles 必须是档位到角色的映射`)
+      }
+      const tierRoles: Partial<Record<NodeTier, string>> = {}
+      for (const [tier, role] of Object.entries(value)) {
+        if (!NODE_TIERS.includes(tier as NodeTier) || typeof role !== 'string' || !role.trim()) {
+          throw new Error(`nodes.${nodeId}.tierRoles.${tier} 必须使用合法档位和非空角色名`)
+        }
+        tierRoles[tier as NodeTier] = role
+      }
+      nodes[nodeId] = { ...withoutTiers, tierRoles: Object.freeze(tierRoles) }
+    } else {
+      nodes[nodeId] = Object.hasOwn(override, 'role') ? withoutTiers : merged
+    }
   }
   // 逐字段合并：行配置只写 objective 时，默认的 persona/toolFilter/sandbox 都要保留
   // （把 `sandbox` 改成整体替换会让只读角色静默变宽）。

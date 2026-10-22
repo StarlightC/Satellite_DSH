@@ -10,6 +10,7 @@ import { isDeepStrictEqual } from 'node:util'
 
 import type { ExtensionEvidence, SlotExtension, SlotFacts } from '../../lib/contracts.js'
 import type { BlockedExtension, Conflict, Resolution } from '../../lib/registry.js'
+import type { NodeRoleSelection } from './config.js'
 
 /** 原始扩展结果，不充当角色报告或程序事实。 */
 export interface ExtensionResult {
@@ -38,6 +39,8 @@ export interface NodeCallRecord {
   baseStarted: boolean
   baseFinished: boolean
   baseResult: unknown
+  /** One base-role selection for this call, including before/after resumes. */
+  selection?: NodeRoleSelection
   baseStatus?: 'completed' | 'failed' | 'cancelled' | 'aborted'
   afterDone: boolean
   claimed: boolean
@@ -126,10 +129,18 @@ export interface SlotResolver {
   snapshot(): readonly SlotExtension[]
 }
 
+/** Confirmed base activation with its explicit requested route, not child model readback or business acceptance. */
+export interface BaseExecution {
+  readonly role: string
+  readonly provider?: string
+  readonly model?: string
+}
+
 export interface BaseOutcome {
   readonly status: 'completed' | 'failed'
   readonly result?: unknown
   readonly error?: string
+  readonly execution?: BaseExecution
 }
 
 /**
@@ -147,6 +158,7 @@ export interface NodeRunResult {
   readonly blocked?: readonly BlockedExtension[]
   readonly ran?: readonly string[]
   readonly base?: unknown
+  readonly selection?: NodeRoleSelection
   readonly beforeRan?: readonly string[]
   readonly afterRan?: readonly string[]
   readonly facts?: SlotFacts
@@ -170,6 +182,7 @@ export interface RunNodeParams {
   readonly facts?: SlotFacts
   readonly view?: unknown
   readonly signal?: AbortSignal
+  readonly selectRole?: (previous?: NodeRoleSelection) => NodeRoleSelection
   readonly runBase: (call: NodeCallRecord) => Promise<BaseOutcome>
   readonly runExtension: (extension: SlotExtension, context: unknown) => Promise<ExtensionOutcome>
   readonly cleanup?: () => Promise<void>
@@ -331,6 +344,7 @@ export async function runNode(params: RunNodeParams): Promise<NodeRunResult> {
   record.definitions ??= slots.snapshot().filter((entry) => entry.slot === `${nodeId}.before` || entry.slot === `${nodeId}.after`)
   const evidence = () => ({
     ...(record.baseFinished ? { base: record.baseResult } : {}),
+    ...(record.selection ? { selection: record.selection } : {}),
     facts: record.facts,
     extensions: [...record.extensions],
     beforeRan: [...new Set(record.extensions.filter((item) => item.slot === `${nodeId}.before`).map((item) => item.id))],
@@ -362,6 +376,15 @@ export async function runNode(params: RunNodeParams): Promise<NodeRunResult> {
   }
   try {
     if (signal?.aborted) return await cancel()
+    try {
+      if (params.selectRole) record.selection = params.selectRole(record.selection)
+    } catch (error) {
+      if (!begin.resumed) store.finish(record.token)
+      return {
+        kind: 'blocked', ...(begin.resumed ? { token: record.token } : {}), ...evidence(),
+        reason: error instanceof Error ? error.message : String(error),
+      }
+    }
     for (const [name, value] of Object.entries(params.facts?.values ?? {})) {
       const reserved = name === 'base.completed' || name === 'base.failed'
       const overwritten = record.verifiedFactNames.has(name) && !isDeepStrictEqual(record.facts?.values[name], value)

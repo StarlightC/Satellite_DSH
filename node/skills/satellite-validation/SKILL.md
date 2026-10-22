@@ -30,6 +30,15 @@ run that failed, was blocked, or was only partial, read
 [the evidence record reference](references/evidence-record.md).
 
 Report failures without fixing them or weakening assertions. Distinguish code
-failures from environment/permission blocks, and list checks not run. Hand back
-what was verified, what failed, and what remains unverified; the parent decides
-rework, further checks and acceptance.
+failures from environment/permission blocks, and list checks not run. Light
+validation is local partial evidence: do not silently replace required integration,
+device, security or visual checks with it.
+
+On repeated same-cause failures or unresolved rework at Standard, or an unclear
+failure after one bounded retry, report the prior evidence and recommend Senior or
+the relevant specialist to the parent. Do not self-delegate or rerun deterministic
+failures without a changed hypothesis. At most one clearly transient environment
+retry is appropriate; never retry a denied approval as a workaround. An unavailable
+higher/specialist assignment is a capability gap, not permission to claim success.
+Hand back what was verified, what failed, and what remains unverified; the parent
+decides reassignment, further checks and acceptance.

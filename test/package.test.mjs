@@ -135,15 +135,19 @@ test('默认值来自代码：BUILTIN_ROLE_NAMES/BUILTIN_ROUTES 与 DEFAULT_CONF
   const declared = [...BUILTIN_ROLE_NAMES]
   assert.ok(declared.length > 0, '代码必须提供非空的内置角色清单')
   assert.deepEqual(declared, Object.keys(DEFAULT_CONFIG.roles), '角色清单必须与 DEFAULT_CONFIG.roles 的键（声明顺序）一致')
-  // 按实际集合断言：七个角色 —— 有界调查、方案设计、实施、审查、验证、验收与 Android 上下文各一。
+  // Public package defaults include the three tiered nodes' actual role variants.
   assert.deepEqual([...declared].sort(), [
     'acceptance',
     'android-context',
     'change-review',
+    'change-review-light',
     'implementation',
+    'implementation-light',
+    'implementation-senior',
     'investigation',
     'solution-design',
     'validation',
+    'validation-light',
   ])
   const rolesWithOptions = Object.entries(DEFAULT_CONFIG.roles)
     .filter(([, role]) => role.agentOptions)

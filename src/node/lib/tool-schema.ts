@@ -8,6 +8,7 @@
  */
 
 import type { ParameterPropertySpec, ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import { NODE_TIERS } from './config.js'
 
 const ANNOTATION_KEYS = ['description', 'title', 'default', 'examples']
 const SCALAR_TYPES = ['string', 'number', 'integer', 'boolean', 'null']
@@ -109,6 +110,10 @@ export const PARAMETERS_SCHEMA = Object.freeze({
   node: { type: 'string', required: true, description: '要运行的基础节点标识' },
   task: { type: 'string', required: true, description: '本次节点的有界任务，包含范围与停止条件' },
   unit: { type: 'string', description: '实施单元标识；同一节点的不同单元互不串用记录' },
+  tier: {
+    type: 'string', enum: NODE_TIERS,
+    description: '节点角色档（非执行风险）；省略用节点默认，显式档须有映射。resume 省略继承原选择，升降档须新建调用。',
+  },
   facts: {
     type: 'json',
     description:
@@ -155,6 +160,23 @@ export const OUTPUT_SCHEMA = Object.freeze({
       type: 'array',
       items: { type: 'string' },
       description: '已在创建边界核验的角色沙箱模式；不能验证权限时拒绝启动',
+    },
+    selection: {
+      type: 'object', additionalProperties: false,
+      description: '本次调用冻结的基础角色选择；不代表已执行。',
+      properties: {
+        role: { type: 'string', required: true },
+        tier: { type: 'string', enum: NODE_TIERS },
+      },
+    },
+    execution: {
+      type: 'object', additionalProperties: false,
+      description: '已确认启动的基础角色及其显式请求路由（非子会话模型读回）；恢复时保留原记录，不代表重新启动或业务通过。',
+      properties: {
+        role: { type: 'string', required: true },
+        provider: { type: 'string' },
+        model: { type: 'string' },
+      },
     },
     result: { type: 'string', description: '基础节点的实际结果摘要' },
   },

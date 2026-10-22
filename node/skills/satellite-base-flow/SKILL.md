@@ -39,6 +39,15 @@ suggestion / unverified), when a component looks unavailable, or when configurin
 component whose shape changed. Read it for those decisions only; do not restate its
 tables in the task packet.
 
+## Difficulty and reassignment
+
+Before choosing implementation, review, or validation roles, or when new evidence
+changes risk or a blocker repeats, read
+[the difficulty and escalation method](references/difficulty-and-escalation.md).
+Keep whole-task execution difficulty separate from the node's optional `tier`;
+carry the reasons and failed-attempt history in the existing bounded task packet.
+This is an Agent judgment/reporting method, not an automatic scoring or retry engine.
+
 ## Rules that do not change per project
 
 1. Bounded investigation first: name the scope, the questions, and the stop

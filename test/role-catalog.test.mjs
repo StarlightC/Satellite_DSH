@@ -35,7 +35,7 @@ test('目录来自有效角色覆盖，输出 JSON 数据而非路由或执行�
   assert.deepEqual(validation, {
     role: 'validation', label: '部署验证', description: '只测部署声明范围',
     skill: 'deployed-validation', sandbox: 'read-only',
-    bindings: [{ node: 'validate', phase: 'base', skill: 'deployed-validation', objective: '只测部署声明范围', condition: '调用 validate 节点时执行基础阶段。' }],
+    bindings: [{ node: 'validate', phase: 'base', skill: 'deployed-validation', objective: '只测部署声明范围', condition: '调用 validate 节点且省略 tier 或 tier=standard时执行基础阶段。' }],
   })
   assert.equal(roleByName(catalog, 'removed-role'), undefined)
   for (const entry of catalog.roles) {
@@ -173,4 +173,36 @@ test('Android 元数据技能/目标与 ready、run 真正调用保持一致', (
     assert.equal(called.task.skill, extension.role.skill)
     assert.ok(called.task.objective.startsWith(extension.role.objective))
   }
+})
+
+// Entry: UI reads the catalog for the exact default node mappings used by dispatch.
+test('目录按实际 tierRoles 合并同角色条件，保持 version 1 与角色唯一', () => {
+  const config = normalizeConfig()
+  const catalog = buildRoleCatalog(config, [])
+  assert.equal(catalog.version, 1)
+  assert.equal(new Set(catalog.roles.map((r) => r.role)).size, catalog.roles.length)
+  for (const [node, entry] of Object.entries(config.nodes)) {
+    const defaultBinding = roleByName(catalog, entry.role).bindings.find((b) => b.node === node)
+    assert.match(defaultBinding.condition, /省略 tier/)
+    for (const [tier, name] of Object.entries(entry.tierRoles ?? {})) {
+      const binding = roleByName(catalog, name).bindings.find((b) => b.node === node)
+      assert.ok(binding.condition.includes(`tier=${tier}`))
+      if (name !== entry.role) assert.doesNotMatch(binding.condition, /省略 tier/)
+    }
+  }
+  assert.equal(roleByName(catalog, 'implementation').bindings.filter((b) => b.node === 'implement').length, 1)
+})
+
+// Entry: user replaces a builtin node binding and explicitly adds a specialist tier map.
+test('自定义档位目录不保留内置挂载，也不把无映射 Senior 伪装成存在', () => {
+  const config = normalizeConfig({
+    nodes: { review: { role: 'local', tierRoles: { senior: 'specialist' } } },
+    roles: { local: { objective: 'local' }, specialist: { objective: 'specialist' } },
+  })
+  const catalog = buildRoleCatalog(config, [])
+  assert.deepEqual(roleByName(catalog, 'change-review-light').bindings, [])
+  assert.deepEqual(roleByName(catalog, 'change-review').bindings, [])
+  assert.match(roleByName(catalog, 'local').bindings[0].condition, /省略 tier/)
+  assert.match(roleByName(catalog, 'specialist').bindings[0].condition, /tier=senior/)
+  assert.equal(catalog.roles.flatMap((r) => r.bindings).some((b) => b.node === 'validate' && /tier=senior/.test(b.condition)), false)
 })

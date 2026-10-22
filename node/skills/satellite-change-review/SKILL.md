@@ -28,6 +28,20 @@ When the change spans several kinds of surface — code, configuration or schema
 skills and public assets, tests — or when it is unclear what a surface has to prove,
 read [the review scopes reference](references/review-scopes.md).
 
+## Repeated findings and tier limits
+
+Compare inherited findings with current evidence, not just the latest report. A
+Light review needs Standard reassessment after the first unresolved rework cycle,
+repeated missing-context/changes requests, or a second failure on the same objective.
+Standard review needs Senior or a relevant specialist when rework remains repeatedly
+unresolved, or an unclear failure remains after one bounded retry. Senior review
+gets at most one unresolved bounded rework cycle before specialist/user direction.
+
+Report the recurring finding, prior evidence, what remains uncertain and the
+smallest needed assignment. Do not self-delegate, fix source, or keep retrying the
+same review under a new name. Missing specialist capability is a gap, not a pass;
+external access or permission failures are not a reason to buy a stronger model.
+
 ## Output
 
 A conclusion with evidence locations, the limits of the review, and the items

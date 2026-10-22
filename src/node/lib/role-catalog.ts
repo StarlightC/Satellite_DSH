@@ -37,15 +37,21 @@ export function buildRoleCatalog(
 ): RoleCatalog {
   const bindings = new Map<string, RoleBinding[]>(Object.keys(config.roles).map((role) => [role, []]))
   for (const [node, entry] of Object.entries(config.nodes)) {
-    const role = config.roles[entry.role]
-    if (!role) continue
-    bindings.get(entry.role)?.push({
-      node,
-      phase: 'base',
-      ...(role.skill !== undefined ? { skill: role.skill } : {}),
-      ...(role.objective !== undefined ? { objective: role.objective } : {}),
-      condition: `调用 ${node} 节点时执行基础阶段。`,
-    })
+    const conditions = new Map<string, string[]>([[entry.role, ['省略 tier']]])
+    for (const [tier, role] of Object.entries(entry.tierRoles ?? {})) {
+      conditions.set(role, [...(conditions.get(role) ?? []), `tier=${tier}`])
+    }
+    for (const [name, choices] of conditions) {
+      if (!Object.hasOwn(config.roles, name)) continue
+      const role = config.roles[name]!
+      bindings.get(name)?.push({
+        node,
+        phase: 'base',
+        ...(role.skill !== undefined ? { skill: role.skill } : {}),
+        ...(role.objective !== undefined ? { objective: role.objective } : {}),
+        condition: `调用 ${node} 节点且${choices.join(' 或 ')}时执行基础阶段。`,
+      })
+    }
   }
   for (const extension of extensions) {
     const metadata = extension.role

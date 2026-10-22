@@ -76,6 +76,46 @@ install_bundle <解压后的 package 目录>
 
 该行为由 `builtinExtensions.acceptanceDecision` 控制，默认开启。普通决定不能替代宿主的权限批准。
 
+## 难度评级与升降级
+
+这套机制分为**任务执行难度**（light / standard / critical）和**节点角色等级**（light / standard / senior）。主 Agent 按事实初评、在新证据或重复失败后复评；Critical 不自动选 Senior，安全拆分后的轻量单元也不能取消整体风险检查。
+
+评级、失败预算与降级理由是技能指导下的判断和报告，不是自动评分器、持久计数器或任务调度服务。主 Agent 应读取基础流程技能链接的[评级与升降级方法](<node/skills/satellite-base-flow/references/difficulty-and-escalation.md>)，再分别选择实施、审查和验证角色。Android 的[平台风险补充](<android/skills/android-change-review/references/task-risk.md>)保留在领域技能中。
+
+### 选择节点角色等级
+
+`satellite_node` 新增可选 `tier`，例如：
+
+```json
+{"node":"implement","unit":"local-resource-fix","tier":"light","task":"修复已确认的局部资源引用；仅改指定单元并执行必要编译检查。"}
+```
+
+| 节点 | light | standard | senior |
+| --- | --- | --- | --- |
+| implement | `implementation-light` | `implementation` | `implementation-senior` |
+| review | `change-review-light` | `change-review` | 默认未配置，返回缺口 |
+| validate | `validation-light` | `validation` | 默认未配置，返回缺口 |
+
+- **不传 `tier` 保持原有角色选择**。`context`、`solution`、`signoff` 默认不提供等级映射。
+- 显式等级必须存在于该节点的 `nodes.<node>.tierRoles`，且目标角色真实存在；缺失时不会静默退回默认角色。`critical` 不是合法的角色等级。
+- 等级映射只选择基础节点角色，不跳过前后扩展，不改变扩展自己的角色，也不改变父会话权限。
+- `selection` 表示本次选定的角色与等级；`execution` 表示已通过创建边界的基础角色及向后端请求的显式模型路由，不是从子会话读回的模型实测值。前置暂停或创建前拒绝可以只有选择、没有执行；启动也不等于业务完成或验收通过。
+- 同一暂停调用冻结等级和角色。`resume` 时可省略 `tier` 以继承原选择，不能改变它；需要升级或降级时发起新的有界节点调用。after 恢复复用原基础结果，不把新的模型设置当作上次已执行的模型。
+
+部署可通过 `nodes.<node>.tierRoles` 显式配置允许的角色映射，支持这三个等级名；提供的映射整体替换该节点默认映射，空对象可禁用显式等级。已有 `nodes.<node>.role` 覆盖会移除隐含的内置等级映射，避免绕过自定义角色；需要等级时须同时显式配置映射。角色定义、方法与文件沙箱仍归 `roles`，模型覆盖仍只走 `routes`。
+
+新增角色沿用对应类别的现有默认模型，不因为 Senior 名称另选更贵模型。各角色的 `routes` 独立：新增角色不会自动继承旧角色的用户模型覆盖，请核对所用档位的实际模型。模型相同不意味着职责相同，模型不同也不等于获得专项能力。
+
+### 失败与复评边界
+
+- 实施预算为同一单元、当前等级最多三次有证据的失败尝试，可发生在一次子调用内；重派、改名或刷新上下文不能清零。耗尽后按 Light → Standard → Senior/专项 → 专项或用户方向处理。
+- 审查、验证使用各自的返工升级规则，不能机械套成三次。未配置更高角色或缺少专项方法时，报告缺口而不是重复同配置假装升级。
+- 计数依据完整修改假设和验收失败证据，不是工具报错次数、节点 `kind` 或 Agent `stopReason`；权限、设备、依赖等外部阻塞单独报告。
+- 新证据可支持更轻的角色。不得为赶时间、工具不足或规避未解决问题而降级；若会减少已约定的审查/验收义务、改变批准范围或模型使用约定，先请用户确认。
+- 历史依赖现有会话记录和节点摘要；恢复后证据不足时明确报告，不声称自动恢复预算或未完成节点。原有 `resume` 令牌仍仅服务当前运行时调用，不承诺跨 Host 重启恢复。
+
+程序测试验证角色选择、路由和恢复等可达调用路径，不能证明模型正确理解每次失败假设。语义行为的人工验收案例见开发仓库中的 `test/tier-scenarios.md`，不作为已执行的自动测试。
+
 ## 配置模型
 
 默认验证角色使用 `deepseek-flash`，其他内置角色使用 `deepseek-v4-pro`，均通过 `deepseek-official`。

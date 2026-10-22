@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
+import { defineTool, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { DEFAULT_CONFIG } from '../lib/node/lib/config.js'
 
 import { createAndroidValidationContext } from '../lib/android/lib/extension.js'
 import { ANDROID_SKILL_NAMES, createAndroidNodeExtensions } from '../lib/android/lib/node-extensions.js'
@@ -32,6 +34,7 @@ function setup({
   withSkills = true,
   withSubagents = true,
   reply = '子 Agent 的正文结果',
+  resultError,
   llm,
   selection,
   withRuntime = true,
@@ -52,6 +55,7 @@ function setup({
   workspace = '/fake/project',
   // F1 回归：允许测试替换 skills.snapshot 的实现。
   skillsSnapshot,
+  defineToolImpl = fakeDefineTool,
 } = {}) {
   const catalog = createNodeCatalog()
   const registry = createSlotRegistry(catalog)
@@ -144,7 +148,11 @@ function setup({
             }
             return {
               childId: spec.childId,
-              result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: reply }] }),
+              get result() {
+                return resultError
+                  ? Promise.reject(resultError)
+                  : Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: reply }] })
+              },
               dispose: async () => {},
             }
           },
@@ -181,7 +189,7 @@ function setup({
   }
 
   const runtime = withRuntime
-    ? createNodeRuntime({ ctx, config, defineTool: fakeDefineTool, resourceDir: RESOURCE_DIR })
+    ? createNodeRuntime({ ctx, config, defineTool: defineToolImpl, resourceDir: RESOURCE_DIR })
     : undefined
   // 晚于本插件注册的监听器：用来验证"我们之后还有写入者"时仍然失败关闭。
   for (const listener of afterListeners) sessionListeners.push(listener)
@@ -1344,4 +1352,193 @@ test('扩展声明的方法技能类型非法时显式失败，不静默退回�
   assert.equal(value.kind, 'suspended')
   assert.match(value.extensions.at(-1).error, /非空字符串/)
   assert.equal(calls.activations.length, 1, '只应跑基础节点')
+})
+
+// Entry: existing caller omits tier, including a deployed node.role override.
+test('省略 tier 保持节点默认，自定义 role 不暗中继承内置档位', async () => {
+  const original = setup()
+  const old = await original.runtime.tool.options.execute({ node: 'implement', task: '旧调用' }, fakeExec())
+  assert.deepEqual(old.selection, { role: 'implementation' })
+  assert.equal(old.execution.role, 'implementation')
+  const f = setup({ config: {
+    nodes: { implement: { role: 'local-implementation' } },
+    roles: { 'local-implementation': { ...DEFAULT_CONFIG.roles.implementation, objective: 'LOCAL-ROLE' } },
+  } })
+  const oldCustom = await f.runtime.tool.options.execute({ node: 'implement', task: '旧自定义调用' }, fakeExec())
+  assert.deepEqual(oldCustom.selection, { role: 'local-implementation' })
+  assert.match(f.calls.activations[0].request.prompt[0].text, /LOCAL-ROLE/)
+  const blocked = await f.runtime.tool.options.execute({ node: 'implement', task: '显式档位', tier: 'light' }, fakeExec())
+  assert.equal(blocked.kind, 'blocked')
+  assert.equal(f.calls.activations.length, 1)
+})
+
+// Entry: public node calls select each builtin supported mapping, using real defineTool.
+test('三个节点的实际档位经公开 schema 到 startActivation 使用正确方法与路由', async () => {
+  const cases = [
+    ['implement', 'light', 'implementation-light'],
+    ['implement', 'standard', 'implementation'],
+    ['implement', 'senior', 'implementation-senior'],
+    ['review', 'light', 'change-review-light'],
+    ['review', 'standard', 'change-review'],
+    ['validate', 'light', 'validation-light'],
+    ['validate', 'standard', 'validation'],
+  ]
+  for (const [node, tier, role] of cases) {
+    const checked = []
+    const f = setup({
+      defineToolImpl: defineTool,
+      config: { roles: { [role]: { objective: `SELECTED:${role}` } } },
+      llm: { resolveCallConfig(options) { checked.push(options) } },
+    })
+    const value = await f.runtime.tool.execute({ node, task: '一个已确认的有界单元', tier }, fakeExec())
+    assert.equal(value.kind, 'completed')
+    assert.equal(f.calls.activations.length, 1)
+    const actual = f.calls.activations[0].request
+    assert.deepEqual(value.selection, { role, tier })
+    const packet = JSON.parse(actual.prompt[0].text.split('\n').find((line) => line.startsWith('{"selection":')))
+    assert.deepEqual(packet.selection, value.selection, 'child receives the frozen assigned tier as task data')
+    assert.deepEqual(value.execution, { role, ...DEFAULT_CONFIG.roles[role].agentOptions })
+    assert.deepEqual(actual.agentOptions, DEFAULT_CONFIG.roles[role].agentOptions)
+    assert.equal(checked.length, 1)
+    assert.deepEqual(checked[0], actual.agentOptions, 'native preflight checks the selected request route')
+    // Production output validation uses this validator; this does not run the complete registry pipeline.
+    assert.deepEqual(validateJsonSchemaValue(f.runtime.tool.output.schema, value), [])
+    assert.match(actual.prompt[0].text, new RegExp(`SELECTED:${role}`))
+    assert.ok(actual.prompt[0].text.includes(DEFAULT_CONFIG.roles[role].skill))
+    assert.deepEqual(actual.toolFilter, DEFAULT_CONFIG.roles[role].toolFilter)
+    assert.equal(f.calls.executed[0].mode, DEFAULT_CONFIG.roles[role].sandbox)
+  }
+})
+
+// Entry: a model emits invalid tier, or requests a valid but unconfigured grade.
+test('真实 defineTool 拒绝非法 tier，缺映射或未知角色在任何子调用前阻塞', async () => {
+  const f = setup({ defineToolImpl: defineTool })
+  assert.deepEqual(f.runtime.tool.parameters.properties.tier.enum, ['light', 'standard', 'senior'])
+  for (const tier of ['critical', '', null, 1]) {
+    await assert.rejects(f.runtime.tool.execute({ node: 'implement', task: '坏参数', tier }, fakeExec()), /tier/)
+  }
+  for (const node of ['review', 'validate', 'context']) {
+    const value = await f.runtime.tool.execute({ node, task: '缺失映射', tier: 'senior' }, fakeExec())
+    assert.equal(value.kind, 'blocked')
+    assert.match(value.reason, /未配置.*档角色/)
+    assert.equal(value.execution, undefined)
+  }
+  assert.equal(f.calls.activations.length, 0)
+  const missing = setup({ config: { nodes: { implement: { tierRoles: { senior: 'missing-role' } } } } })
+  const value = await missing.runtime.tool.options.execute({ node: 'implement', task: '未知角色', tier: 'senior' }, fakeExec())
+  assert.equal(value.kind, 'blocked')
+  assert.match(value.reason, /未配置角色/)
+  assert.equal(missing.calls.activations.length, 0)
+})
+
+// Entry: deployment maps Senior to a read-only specialist with stricter tools than its custom default role.
+test('显式 tierRoles 可绑定自定义角色，不开放调用方任意 role 注入', async () => {
+  const f = setup({ config: {
+    nodes: { review: { role: 'local-review', tierRoles: { senior: 'specialist' } } },
+    roles: {
+      'local-review': { ...DEFAULT_CONFIG.roles['change-review'], sandbox: 'workspace-write' },
+      specialist: {
+        ...DEFAULT_CONFIG.roles['change-review'], objective: 'SPECIALIST-METHOD', sandbox: 'read-only',
+        toolFilter: { deny: ['satellite_node', 'edit', 'write', 'bash'] },
+      },
+    },
+  } })
+  const value = await f.runtime.tool.options.execute({
+    node: 'review', task: '专项', tier: 'senior', facts: { role: 'implementation' },
+  }, fakeExec())
+  assert.equal(value.execution.role, 'specialist')
+  assert.match(f.calls.activations[0].request.prompt[0].text, /SPECIALIST-METHOD/)
+  assert.deepEqual(f.calls.activations[0].request.toolFilter.deny, ['satellite_node', 'edit', 'write', 'bash'])
+  assert.equal(f.calls.executed[0].mode, 'read-only')
+})
+
+// Entry: before extension pauses; caller retries with a different tier or identity, then resumes.
+test('before 恢复冻结选择并保留身份绑定，省略 tier 继承且未启动时不报执行', async () => {
+  const f = setup()
+  f.registry.register({
+    id: 'test.tier-before', slot: 'implement.before', slotVersion: 1,
+    match: () => MATCH_YES, ready: () => READY,
+    run: ({ facts }) => ({ status: facts.values.ready ? 'completed' : 'needs_decision' }),
+  })
+  const args = { node: 'implement', task: '冻结单元', unit: 'unit-tier' }
+  const first = await f.runtime.tool.options.execute({ ...args, tier: 'light' }, fakeExec())
+  assert.equal(first.kind, 'suspended')
+  assert.deepEqual(first.selection, { role: 'implementation-light', tier: 'light' })
+  assert.equal(first.execution, undefined)
+  assert.match(f.runtime.tool.options.output.render({}, first)[0].text, /尚无已确认启动记录/)
+  const changed = await f.runtime.tool.options.execute({ ...args, resume: first.token, tier: 'senior' }, fakeExec())
+  assert.equal(changed.kind, 'blocked')
+  assert.match(changed.reason, /不能改变.*省略 tier 可继续原调用/)
+  assert.ok(f.runtime.tool.options.output.render({}, changed)[0].text.includes(`resume=${first.token}`))
+  const wrongCaller = await f.runtime.tool.options.execute({ ...args, resume: first.token }, fakeExec('other-caller'))
+  assert.equal(wrongCaller.kind, 'blocked')
+  const wrongUnit = await f.runtime.tool.options.execute({ ...args, unit: 'other-unit', resume: first.token }, fakeExec())
+  assert.equal(wrongUnit.kind, 'blocked')
+  assert.equal(f.calls.activations.length, 0)
+  // A caller may omit the frozen tier while still waiting for evidence, then repeat it explicitly.
+  const stillWaiting = await f.runtime.tool.options.execute({ ...args, resume: first.token }, fakeExec())
+  assert.equal(stillWaiting.kind, 'suspended')
+  assert.deepEqual(stillWaiting.selection, first.selection)
+  const resumed = await f.runtime.tool.options.execute({ ...args, resume: first.token, tier: 'light', facts: { ready: true } }, fakeExec())
+  assert.equal(resumed.kind, 'completed')
+  assert.deepEqual(resumed.selection, first.selection)
+  assert.equal(resumed.execution.role, 'implementation-light')
+  assert.equal(f.calls.activations.length, 1)
+  const packet = JSON.parse(f.calls.activations[0].request.prompt[0].text.split('\n').find((line) => line.startsWith('{"selection":')))
+  assert.deepEqual(packet.selection, first.selection, 'resume sends the original selection, not the changed request')
+})
+
+// Entry: after pauses, live route changes, then the same completed base is resumed.
+test('after 恢复不重跑 base 且报告原请求路由，新调用才使用活路由', async () => {
+  let model = 'deepseek-v4-pro'
+  const f = setup({ config: { routes: { get: () => [{ role: 'implementation-light', provider: 'deepseek-official', model }] } } })
+  const args = { node: 'implement', task: '完成后待决定', unit: 'after-unit' }
+  const first = await f.runtime.tool.options.execute({ ...args, tier: 'light', facts: { 'acceptance.required': true } }, fakeExec())
+  assert.equal(first.kind, 'suspended')
+  assert.equal(first.stage, 'after')
+  assert.equal(first.execution.model, 'deepseek-v4-pro')
+  model = 'deepseek-flash'
+  const changed = await f.runtime.tool.options.execute({ ...args, resume: first.token, tier: 'senior', decision: 'accept' }, fakeExec())
+  assert.equal(changed.kind, 'blocked')
+  assert.deepEqual(changed.execution, first.execution)
+  const resumed = await f.runtime.tool.options.execute({ ...args, resume: first.token, decision: 'accept' }, fakeExec())
+  assert.equal(resumed.kind, 'completed')
+  assert.deepEqual(resumed.execution, first.execution)
+  assert.equal(f.calls.activations.length, 1)
+  const rendered = f.runtime.tool.options.output.render({}, resumed)[0].text
+  assert.match(rendered, /请求路由 deepseek-official\/deepseek-v4-pro/)
+  assert.doesNotMatch(rendered, /请求路由 deepseek-official\/deepseek-flash/)
+  const next = await f.runtime.tool.options.execute({ ...args, tier: 'light' }, fakeExec())
+  assert.equal(next.execution.model, 'deepseek-flash')
+  assert.equal(f.calls.activations.length, 2)
+})
+
+// Entry: a new role is denied by native model policy, or inherits a read-only parent.
+test('新角色仍经原生 preflight 与父权限收窄，拒绝路由不能伪称已启动', async () => {
+  const denied = setup({ selection: { current: () => ({ enabled: true, allowedModels: [] }) } })
+  const failed = await denied.runtime.tool.options.execute({ node: 'implement', task: '受限模型', tier: 'senior' }, fakeExec())
+  assert.equal(failed.selection.role, 'implementation-senior')
+  assert.equal(failed.execution, undefined)
+  assert.equal(denied.calls.activations.length, 0)
+  assert.match(failed.result, /不在宿主允许/)
+  assert.match(denied.runtime.tool.options.output.render({}, failed)[0].text, /尚无已确认启动记录/)
+  const readonly = setup({ reply: '仍有验收阻塞，未完成' })
+  const result = await readonly.runtime.tool.options.execute({ node: 'implement', task: '只读父任务', tier: 'senior' }, fakeExec('parent-ro', 'read-only'))
+  assert.equal(readonly.calls.executed[0].mode, 'read-only')
+  assert.equal(result.execution.role, 'implementation-senior')
+  assert.match(result.result, /仍有验收阻塞/)
+  // Runtime completion preserves the raw report; it does not count failures or grant acceptance.
+  assert.equal(result.kind, 'completed')
+})
+
+// Entry: the base activation passed creation checks but its managed result rejects afterward.
+test('基础启动后 result 拒绝仍保留已启动角色和请求路由证据', async () => {
+  const f = setup({ resultError: new Error('managed result unavailable'), defineToolImpl: defineTool })
+  const value = await f.runtime.tool.execute({ node: 'implement', task: '结果通道失败', tier: 'light' }, fakeExec())
+  assert.equal(f.calls.activations.length, 1)
+  assert.equal(value.kind, 'failed')
+  assert.match(value.result, /managed result unavailable/)
+  assert.deepEqual(value.execution, { role: 'implementation-light', ...DEFAULT_CONFIG.roles['implementation-light'].agentOptions })
+  assert.deepEqual(validateJsonSchemaValue(f.runtime.tool.output.schema, value), [])
+  assert.match(f.runtime.tool.output.render({}, value)[0].text, /已启动基础角色：implementation-light.*请求路由/)
 })

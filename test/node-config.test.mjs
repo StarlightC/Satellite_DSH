@@ -362,3 +362,39 @@ test('自定义角色仍可使用声明层默认，用户覆盖统一 routes 且
   assert.deepEqual(effectiveAgentOptions({ role: normalized.roles.validation, roleName: 'validation', routes: config.routes.get() }), custom)
   assert.deepEqual(effectiveAgentOptions({ role: normalized.roles['custom-role'], roleName: 'custom-role', routes: config.routes.get() }), custom)
 })
+
+// Entry: user changes node.role or supplies a partial explicit tier map in deployment Config.
+test('tierRoles 整图替换，显式 role 覆盖即使同名也不继承隐式档位', () => {
+  assert.equal(normalizeConfig().nodes.implement.tierRoles.senior, 'implementation-senior')
+  const custom = normalizeConfig({ nodes: { implement: { role: 'custom' }, review: { role: 'change-review' } } })
+  assert.equal(custom.nodes.implement.tierRoles, undefined)
+  assert.equal(custom.nodes.review.tierRoles, undefined)
+  const mapped = normalizeConfig({ nodes: { implement: { role: 'custom', tierRoles: { light: 'small' } }, validate: { tierRoles: {} } } })
+  assert.deepEqual(mapped.nodes.implement.tierRoles, { light: 'small' })
+  assert.deepEqual(mapped.nodes.validate.tierRoles, {})
+})
+
+// Entry: malformed user-provided tierRoles reaches normalizeConfig through the existing open nodes field.
+test('拒绝非法 tierRoles 形状、未知档位与空角色', () => {
+  for (const tierRoles of [null, [], 'light', { critical: 'implementation' }, { light: '' }, { senior: '  ' }, { standard: 4 }]) {
+    assert.throws(() => normalizeConfig(Config({ nodes: { implement: { tierRoles } } })), /tierRoles/)
+  }
+})
+
+// Entry: plugin upgrade adds defaults while a profile stores only one existing role override.
+test('新增角色默认路由唯一且 sparse overrides 不冻结或丢失新增默认', () => {
+  const config = Config({ routes: [{ role: 'implementation', provider: 'deepseek-official', model: 'deepseek-flash' }] })
+  const normalized = normalizeConfig(config)
+  assert.equal(new Set(BUILTIN_ROUTES.map((r) => r.role)).size, BUILTIN_ROUTES.length)
+  for (const [variant, original] of [
+    ['implementation-light', 'implementation'], ['implementation-senior', 'implementation'],
+    ['change-review-light', 'change-review'], ['validation-light', 'validation'],
+  ]) {
+    assert.deepEqual(effectiveAgentOptions({ role: normalized.roles[variant], roleName: variant, routes: config.routes.get() }), DEFAULT_CONFIG.roles[original].agentOptions)
+    assert.equal(normalized.roles[variant].skill, normalized.roles[original].skill)
+    assert.deepEqual(normalized.roles[variant].toolFilter, normalized.roles[original].toolFilter)
+    assert.equal(normalized.roles[variant].sandbox, normalized.roles[original].sandbox)
+  }
+  assert.equal(config.routes.get().length, 1)
+  assert.equal(effectiveAgentOptions({ role: normalized.roles.implementation, roleName: 'implementation', routes: config.routes.get() }).model, 'deepseek-flash')
+})
