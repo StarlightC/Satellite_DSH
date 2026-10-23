@@ -51,6 +51,26 @@ If the tool or baseline is unavailable, hand the exact changed paths and mainten
 gap back to the parent; do not claim the index was updated. This method alone does
 not imply that the optional maintenance tool is mounted or has run.
 
+## Bounded correction and tier handoff
+
+At the assigned tier, stop after three failed implementation attempts on the same
+unit (including internal corrections and earlier failures at this same tier), or
+earlier when no evidence-backed correction is worth trying. A higher tier has its
+own bounded budget; earlier tiers' failures remain evidence, not spent attempts
+against the new tier. One attempt is a coherent hypothesis
+or change shown by evidence not to meet its target; several diagnostics from one
+check count once. This is a reasoning/reporting budget, not a tool-call counter.
+Do not run extra checks to count attempts or take over full validation.
+
+Report each failed hypothesis and its evidence, the failed count/limit, remaining
+blocker, partial edits and the smallest useful handoff. If history or evidence is
+missing, state that gap instead of inventing a count or claiming a fresh budget.
+New child calls or cosmetic subdivisions do not reset the same unit's history.
+Recommend Standard from Light, Senior or a relevant specialist from Standard, and
+specialist/user direction from exhausted Senior. The parent chooses reassignment;
+do not delegate upward yourself. A stronger role does not authorize a wider scope.
+Keep external environment/permission blockers separate from implementation failures.
+
 ## After editing
 
 Run the necessary compile, type, or lint check for the area you touched, and report

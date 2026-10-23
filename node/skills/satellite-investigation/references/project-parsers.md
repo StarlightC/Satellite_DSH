@@ -44,7 +44,11 @@ Do not assume `__file__`, `import.meta.url`, or path-relative imports identify t
 original script. Existing path-entry scripts need explicit adaptation; there is
 no implicit compatibility mode and no product parser supplied by Satellite.
 
-This version requires a POSIX execution world and native executable discovery.
+This version implements the Apple (macOS) execution adapter only; Linux and Windows
+are explicit unsupported placeholders. POSIX alone does not imply support. The
+caller's filesystem markers and terminal family must select a supported adapter
+before approval, and selection is checked again after approval. This is a
+compatibility probe, not execution-world authentication or remote-backend support.
 The native service resolves `env` and the interpreter to absolute paths. The fixed
 `env -i` invocation starts the interpreter without inherited environment entries,
 including credentials; OS/runtime-generated entries may still appear. It does not

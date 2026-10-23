@@ -1,7 +1,7 @@
 ---
 name: android-change-review
 description: Review the current Android change against the declared platform check faces — API, lifecycle, resources, security, UI — and report findings with evidence and limits, without fixing anything.
-whenToUse: Use as the method for the android.platform-review slot extension after the review node's base step has produced its own report.
+whenToUse: Use for android.platform-review after the base review; also load its linked risk supplement when Android platform risks affect task planning or reassessment.
 ---
 
 # Android change review
@@ -14,6 +14,13 @@ declared, and hand back what the base review may have missed:
 - findings, each tied to a location the reviewer actually read;
 - which declared check faces were covered and which were not;
 - limits: what could not be judged, and what would close the gap.
+
+## Platform risk context
+
+When Android risks affect initial planning, reassessment or the review scope, read
+[the Android task-risk supplement](references/task-risk.md). It identifies platform
+triggers and the existing methods that can actually be used; it does not invent
+specialist roles or turn reports into machine acceptance facts.
 
 ## Method
 
