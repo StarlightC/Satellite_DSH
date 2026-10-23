@@ -1,6 +1,6 @@
 {
   "name": "satellite",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Satellite runs a project's base workflow as nodes with pluggable before/after extensions. One install carries three independently toggleable rows: the slot service, the satellite_node tool, and an opt-in Android read-only extension.",
   "license": "MIT",
