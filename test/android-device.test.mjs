@@ -13,6 +13,11 @@ import {
 } from '../lib/android/lib/execution/tools.js'
 
 const ROOT = '/project'
+// 测试 fixtures 显式构造 Apple 宿主，而不是依赖运行测试的机器平台。
+const APPLE_FILES = {
+  '/System/Library/CoreServices/SystemVersion.plist': 1,
+  '/usr/bin/sw_vers': 1,
+}
 const sha = (value) => createHash('sha256').update(String(value)).digest('hex')
 
 const DEVICES_L = [
@@ -119,7 +124,7 @@ test('批准理由说明真实影响，不隐藏 adb server 启动', () => {
 
 /* ------------------------------------------------------------------ 工具层 */
 
-function fakeFs({ files = { [`${ROOT}/app.apk`]: 128 } } = {}) {
+function fakeFs({ files = { ...APPLE_FILES, [`${ROOT}/app.apk`]: 128 } } = {}) {
   return {
     async resolve(path, options = {}) {
       const base = options.cwd ?? ROOT
@@ -128,7 +133,9 @@ function fakeFs({ files = { [`${ROOT}/app.apk`]: 128 } } = {}) {
     },
     async stat(target) {
       const size = files[target.targetKey]
-      return size === undefined ? { type: 'directory' } : { type: 'file', size }
+      if (size !== undefined) return { type: 'file', size }
+      if (target.targetKey === ROOT) return { type: 'directory' }
+      return undefined
     },
     async listDir() { return [] },
     processPath: (target) => target.targetKey,
@@ -144,7 +151,7 @@ function harness({
   const calls = { spawn: [], approvals: [] }
   const state = { devicesOut, getpropOut }
   const services = {
-    fs: fakeFs(files === undefined ? undefined : { files }),
+    fs: fakeFs({ files: { ...APPLE_FILES, [`${ROOT}/app.apk`]: 128, ...(files ?? {}) } }),
     sandboxPolicy: { resolve: () => ({ mode, workspaceRoot: ROOT, sessionId: 's1' }) },
     approval: { async request(request) { calls.approvals.push(request); return approval } },
     sandbox: { async confine(argv) { return { argv: [...argv], enforcement: 'full', denialSignatures: [] } } },

@@ -56,7 +56,9 @@ export function resourceDirFrom(importMetaUrl: string, component: string): strin
 }
 
 export function parseSkillFile(path: string): ParsedSkillFile {
-  const raw = readFileSync(path, 'utf8')
+  // 纯解析兼容：把 CRLF（以及孤立 CR）行尾归一成 LF，避免 frontmatter 分隔符
+  // `---\n` 在 Windows 行尾的 SKILL.md 上匹配失败。
+  const raw = readFileSync(path, 'utf8').replaceAll('\r\n', '\n').replaceAll('\r', '\n')
   const match = /^---\n([\s\S]*?)\n---\n?/.exec(raw)
   const meta: Record<string, string> = {}
   if (match) {

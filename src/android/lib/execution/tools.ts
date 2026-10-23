@@ -44,6 +44,8 @@ import { describeCapturePlan, parseCaptureRequest, runCapture } from './capture.
 import type { CaptureDeps } from './capture.js'
 import { JOURNEY_KEYS, describeJourneyPlan, parseJourneyRequest, runJourney } from './journey.js'
 import type { JourneyDeps } from './journey.js'
+import { detectHostPlatform, isAbsoluteHostPathSyntax } from '../../../platform/index.js'
+import type { SupportedPlatform, HostPlatform } from '../../../platform/index.js'
 
 export const JOURNEY_TOOL = 'satellite_android_journey'
 export const CAPTURE_TOOL = 'satellite_android_capture'
@@ -123,6 +125,40 @@ function isOutcome<T extends object>(value: T | OperationOutcome): value is Oper
   return typeof (value as OperationOutcome).status === 'string'
 }
 
+/** 集中式宿主平台检测：只在调用作用域取服务，AbortError 原样传播。 */
+async function resolveHostPlatform(services: Services, exec: ScopedExecution): Promise<HostPlatform | OperationOutcome> {
+  try {
+    return await detectHostPlatform({
+      fs: {
+        resolve: (path, options) => services.fs.resolve(path, options),
+        stat: (target, signal) => services.fs.stat(target, signal),
+      },
+      terminalEnvironment: (signal) => services.subprocess.terminalEnvironment(signal),
+      signal: exec.signal,
+    })
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw error
+    return blocked('platform', 'CAPABILITY_UNAVAILABLE', error instanceof Error ? error.message : String(error))
+  }
+}
+
+/** 动态执行统一门：只有具备实现的宿主继续；unsupported 在批准与 spawn 之前失败关闭。 */
+async function requireSupportedPlatform(
+  services: Services,
+  exec: ScopedExecution,
+  action: string,
+): Promise<{ ok: true; platform: SupportedPlatform } | { ok: false; outcome: OperationOutcome }> {
+  const platform = await resolveHostPlatform(services, exec)
+  if (isOutcome(platform)) return { ok: false, outcome: platform }
+  if (!platform.supported) {
+    return {
+      ok: false,
+      outcome: blocked(action, 'CAPABILITY_UNAVAILABLE', `the local Android route requires a supported host platform: ${platform.unsupportedReason}`),
+    }
+  }
+  return { ok: true, platform }
+}
+
 interface ProjectBinding {
   readonly root: string
   readonly fs: FsLike
@@ -165,7 +201,7 @@ async function bindProject(
   let rootPath = fs.processPath(sessionTarget)
   let external = false
   if (projectPath !== undefined) {
-    const absolute = projectPath.startsWith('/')
+    const absolute = isAbsoluteHostPathSyntax(projectPath)
     if (!absolute && typeof fs.processPathFromHostPath === 'function') {
       const mapped = fs.processPathFromHostPath(hostRoot)
       if (!mapped) return blocked('project', 'CAPABILITY_UNAVAILABLE', 'session root is not visible in this execution world')
@@ -239,13 +275,28 @@ function escalationGate(
 
 const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex')
 
+/** Re-read the execution world at approval boundaries, including covered discovery. */
+async function recheckPlatform(
+  services: Services, exec: ScopedExecution, action: string, expected: SupportedPlatform,
+): Promise<OperationOutcome | undefined> {
+  const current = await requireSupportedPlatform(services, exec, action)
+  if (!current.ok) return current.outcome
+  if (current.platform.id !== expected.id) {
+    return blocked(action, 'CAPABILITY_UNAVAILABLE', 'host platform changed during approval; retry required')
+  }
+  return undefined
+}
+
 /** 真实批准：只有 allowed-once 继续；其余结果如实映射到错误码。 */
 async function askApproval(
   services: Services,
   exec: ScopedExecution,
   toolName: string,
+  platform: SupportedPlatform,
   reason: string,
 ): Promise<OperationOutcome | undefined> {
+  const before = await recheckPlatform(services, exec, toolName, platform)
+  if (before) return before
   if (!exec.agent) return blocked(toolName, 'APPROVAL_UNAVAILABLE', 'tool call has no agent to route approval through')
   let granted: Awaited<ReturnType<ApprovalLike['request']>>
   try {
@@ -253,13 +304,14 @@ async function askApproval(
       agent: exec.agent,
       toolName,
       ...(exec.callId !== undefined ? { callId: exec.callId } : {}),
-      reason,
+      reason: `Host platform: ${platform.id}. ${reason}`,
       signal: exec.signal,
     })
   } catch (error) {
     return blocked(toolName, 'APPROVAL_UNAVAILABLE', error instanceof Error ? error.message : String(error))
   }
-  if (granted === 'allowed-once') return undefined
+  exec.signal.throwIfAborted()
+  if (granted === 'allowed-once') return recheckPlatform(services, exec, toolName, platform)
   if (granted === 'cancelled') return cancelled(toolName, 'not-needed')
   return blocked(toolName, granted === 'unavailable' ? 'APPROVAL_UNAVAILABLE' : 'APPROVAL_REJECTED', `approval ${granted}`)
 }
@@ -346,7 +398,7 @@ export function registerAndroidExecutionTools(
 function requireProjectPath(value: unknown, where: string): string {
   if (typeof value !== 'string' || value.length === 0) throw new ArgumentError(`${where} must be a non-empty string`)
   if (value.length > 2048) throw new ArgumentError(`${where} must be at most 2048 characters`)
-  if (value.startsWith('/')) return value
+  if (isAbsoluteHostPathSyntax(value)) return value
   return requireRelativePath(value, where)
 }
 
@@ -453,7 +505,9 @@ function createEmulatorTool(
           },
         }
 
-        const approved = await askApproval(services, exec, EMULATOR_TOOL, describeEmulatorPlan(request))
+        const hostPlatform = await requireSupportedPlatform(services, exec, 'emulator')
+        if (!hostPlatform.ok) return json(hostPlatform.outcome)
+        const approved = await askApproval(services, exec, EMULATOR_TOOL, hostPlatform.platform, describeEmulatorPlan(request))
         if (approved) return json(approved)
         const after = resolvePolicy(services.sandboxPolicy, exec.agent?.session)
         if (!after || policyKey(after) !== policyKey(binding)) {
@@ -569,10 +623,12 @@ function createDeviceTool(
         if (isOutcome(binding)) return json(binding)
         const deps = deviceDeps(services, binding, exec, config)
         if (isOutcome(deps)) return json(deps)
+        const hostPlatform = await requireSupportedPlatform(services, exec, 'device')
+        if (!hostPlatform.ok) return json(hostPlatform.outcome)
 
         if (request.action === 'discover') {
           if (request.serial === undefined) return json(blocked('device.discover', 'TARGET_REQUIRED', 'serial is required'))
-          const approved = await askApproval(services, exec, DEVICE_TOOL, describeDevicePlan(request))
+          const approved = await askApproval(services, exec, DEVICE_TOOL, hostPlatform.platform, describeDevicePlan(request))
           if (approved) return json(approved)
           const after = resolvePolicy(services.sandboxPolicy, exec.agent?.session)
           if (!after || policyKey(after) !== policyKey(binding)) {
@@ -602,7 +658,7 @@ function createDeviceTool(
         if (request.serial !== undefined && request.serial !== peeked.observation.identity.serial) {
           return json(blocked(request.action, 'TARGET_CHANGED', 'request serial does not match the observation'))
         }
-        const approved = await askApproval(services, exec, DEVICE_TOOL, describeDevicePlan(request, peeked.observation.identity))
+        const approved = await askApproval(services, exec, DEVICE_TOOL, hostPlatform.platform, describeDevicePlan(request, peeked.observation.identity))
         if (approved) return json(approved)
         const prepared = await prepareObservedTarget(deps, lock, observations, request, binding)
         if (!prepared.ok) return json(prepared.outcome)
@@ -719,13 +775,15 @@ function createProjectTool(ctx: AndroidToolContext, getConfig: () => AndroidExec
         const binding = await bindProject(services, exec, project)
         if (isOutcome(binding)) return json(binding)
         if (action === 'inspect') return json(await runStaticInspect(binding, exec))
+        const hostPlatform = await requireSupportedPlatform(services, exec, 'project.discover-build')
+        if (!hostPlatform.ok) return json(hostPlatform.outcome)
         const gated = escalationGate(binding, 'project.discover-build', {
           ...(args.sandboxPermissions !== undefined ? { sandboxPermissions: String(args.sandboxPermissions) } : {}),
           ...(args.justification !== undefined ? { justification: String(args.justification) } : {}),
         })
         if (!gated.ok) return json(gated.outcome)
         const discovered = await discoverBuildFacts(
-          { services, binding, exec, config, ...(gated.escalation ? { escalation: gated.escalation } : {}) },
+          { services, binding, exec, config, platform: hostPlatform.platform, ...(gated.escalation ? { escalation: gated.escalation } : {}) },
           new Date().toISOString(),
         )
         if (!discovered.ok) return json(discovered.outcome)
@@ -778,10 +836,12 @@ interface DiscoveryDeps {
   readonly binding: ProjectBinding
   readonly exec: ScopedExecution
   readonly config: AndroidExecutionConfig
+  /** 已检测并放行的宿主平台能力（Apple）。 */
+  readonly platform: SupportedPlatform
   /**
    * `required` 表示本次发现必须自己取得宿主批准；
    * `covered` 表示调用方（例如 build）的批准计划已经明确覆盖这次复核，
-   * 因此不再发第二次批准请求。两种模式的其他门（CLI/隐私/只读/POSIX）完全相同。
+   * 因此不再发第二次批准请求。两种模式的其他门（CLI/隐私/只读/Apple）完全相同。
    */
   readonly approvalMode?: 'required' | 'covered'
   /** 外部工程的一次性升级；缺省表示工程在会话工作区内。 */
@@ -793,7 +853,9 @@ export async function discoverBuildFacts(
   deps: DiscoveryDeps,
   observedAt: string,
 ): Promise<{ ok: true; facts: DynamicProjectFacts } | { ok: false; outcome: OperationOutcome }> {
-  const { services, binding, exec, config } = deps
+  const { services, binding, exec, config, platform } = deps
+  const platformChanged = await recheckPlatform(services, exec, 'project.discover-build', platform)
+  if (platformChanged) return { ok: false, outcome: platformChanged }
   if (!config.androidCli) {
     return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'Android CLI executable is not configured (androidCli.executable)') }
   }
@@ -812,17 +874,14 @@ export async function discoverBuildFacts(
     // 发现会写 AGP 元数据；只读会话里失败关闭，而不是半途被沙箱拒绝。
     return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'discovery writes project metadata and requires a workspace-write (or wider) session policy') }
   }
-  if ((await services.subprocess.terminalEnvironment(exec.signal)).platform !== 'posix') {
-    return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'the local Android route currently requires a POSIX execution world') }
-  }
   let cliPath: string
   try {
     cliPath = await services.subprocess.resolveExecutable(config.androidCli, undefined, exec.signal)
   } catch (error) {
     return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', error instanceof Error ? error.message : String(error)) }
   }
-  if (!cliPath.startsWith('/')) {
-    return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'Android CLI did not resolve to an absolute path') }
+  if (!platform.isAbsoluteHostPath(cliPath)) {
+    return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'Android CLI did not resolve to an absolute host path') }
   }
 
   const describeArgs = ['describe', `--project_dir=${binding.root}`]
@@ -830,7 +889,7 @@ export async function discoverBuildFacts(
     const externality = binding.external
       ? ` The project is OUTSIDE the session workspace (${binding.workspaceRoot}): this call runs UNCONFINED (danger-full-access) and Gradle may write anywhere the tooling writes. Justification: ${deps.escalation?.justification ?? '(missing)'}.`
       : ` Session sandbox: ${binding.mode} at ${binding.workspaceRoot}.`
-    const approved = await askApproval(services, exec, PROJECT_TOOL,
+    const approved = await askApproval(services, exec, PROJECT_TOOL, platform,
       `Run the configured Android CLI in ${binding.root}: "${cliPath} --version" then "${cliPath} ${describeArgs.join(' ')}". `
       + `It invokes Gradle and writes AGP metadata/caches inside the project; usage collection is ${config.privacy}.`
       + externality
@@ -846,7 +905,7 @@ export async function discoverBuildFacts(
   // Android CLI 会在 $ANDROID_USER_HOME 下解包自身安装并写缓存；默认的 ~/.android
   // 在 workspace-write 会话里不可写（实测 `Failed to open .../.android/cli/bundles/lock`）。
   // 因此把它定向到会话工作区内，既能在受限会话里工作，也不污染用户项目。
-  const androidUserHome = `${binding.workspaceRoot}/.satellite/android-user-home`
+  const androidUserHome = [binding.workspaceRoot, '.satellite', 'android-user-home'].join(platform.pathSeparator)
   const runOptions = {
     cwd: binding.root,
     mode: effectiveMode,
@@ -882,7 +941,7 @@ export async function discoverBuildFacts(
   }
   let parsed: { gradleWrapper: string; modules: DynamicProjectFacts['modules'] }
   try {
-    parsed = parseAndroidCliDescribe(describeMapped.result.stdout.text, binding.root)
+    parsed = parseAndroidCliDescribe(describeMapped.result.stdout.text, binding.root, platform)
   } catch (error) {
     // 实测：CLI 在 Gradle 失败时仍以 exit 0 结束，只在 stderr 打印 FAILURE。
     // 把有界的 stderr 末尾带上，否则使用者只看到"报告缺某一行"而不知真因。
@@ -955,6 +1014,8 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
         // 与 discover-build 使用同一个项目根解析路径，子项目观测才能被构建消费。
         const binding = await bindProject(services, exec, project)
         if (isOutcome(binding)) return json(binding)
+        const hostPlatform = await requireSupportedPlatform(services, exec, action)
+        if (!hostPlatform.ok) return json(hostPlatform.outcome)
 
         const gated = escalationGate(binding, action, {
           ...(args.sandboxPermissions !== undefined ? { sandboxPermissions: String(args.sandboxPermissions) } : {}),
@@ -990,11 +1051,11 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
         const argv = [...taskNames, ...flags]
         // Gradle 默认写 ~/.gradle；在 workspace-write 会话里同样不可写，定向到工作区。
         const env = {
-          GRADLE_USER_HOME: `${binding.workspaceRoot}/.satellite/gradle-user-home`,
+          GRADLE_USER_HOME: [binding.workspaceRoot, '.satellite', 'gradle-user-home'].join(hostPlatform.platform.pathSeparator),
           ...(config.javaHome ? { JAVA_HOME: config.javaHome } : {}),
         }
 
-        const approved = await askApproval(services, exec, BUILD_TOOL,
+        const approved = await askApproval(services, exec, BUILD_TOOL, hostPlatform.platform,
           `Run "${facts.gradleWrapper} ${argv.join(' ')}" in ${binding.root} (module ${modulePath}, variant ${variant}). `
           + `It writes build outputs and caches under the workspace and may download dependencies. Session sandbox: ${binding.mode} at ${binding.workspaceRoot}. `
           + `Device effects: none. Before the build starts, the Android CLI is run again to re-check the approved project facts.`
@@ -1010,7 +1071,7 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
 
         // 批准后重新发现：项目模型或选择变化时不执行构建。
         const reverified = await discoverBuildFacts(
-          { services, binding, exec, config, approvalMode: 'covered', ...(gated.escalation ? { escalation: gated.escalation } : {}) },
+          { services, binding, exec, config, platform: hostPlatform.platform, approvalMode: 'covered', ...(gated.escalation ? { escalation: gated.escalation } : {}) },
           new Date().toISOString(),
         )
         if (!reverified.ok) {
@@ -1173,13 +1234,15 @@ function createJourneyTool(
         const binding = await bindProject(services, exec)
         if (isOutcome(binding)) return json(binding)
         if (!config.adbPath) return json(blocked('journey', 'CAPABILITY_UNAVAILABLE', 'adb executable is not configured (adbPath)'))
+        const hostPlatform = await requireSupportedPlatform(services, exec, 'journey')
+        if (!hostPlatform.ok) return json(hostPlatform.outcome)
         // 先核对观测再请求批准：拒绝理由里不能出现未经核对的目标。
         const peeked = observations.getFor(journeyObservation as string | undefined ?? '', exec.agent?.id ?? 'unknown')
         if (!peeked.ok) return json(blocked('journey', peeked.code, peeked.message))
         if (peeked.observation.identity.serial !== request.serial) {
           return json(blocked('journey', 'TARGET_CHANGED', 'request serial does not match the observation'))
         }
-        const approved = await askApproval(services, exec, JOURNEY_TOOL,
+        const approved = await askApproval(services, exec, JOURNEY_TOOL, hostPlatform.platform,
           `${describeJourneyPlan(request)} Verified target: ${peeked.observation.identity.serial} (transport ${peeked.observation.identity.transportId}).`)
         if (approved) return json(approved)
         const after = resolvePolicy(services.sandboxPolicy, exec.agent?.session)
@@ -1239,12 +1302,14 @@ function createCaptureTool(
         const binding = await bindProject(services, exec)
         if (isOutcome(binding)) return json(binding)
         if (!config.adbPath) return json(blocked('capture', 'CAPABILITY_UNAVAILABLE', 'adb executable is not configured (adbPath)'))
+        const hostPlatform = await requireSupportedPlatform(services, exec, 'capture')
+        if (!hostPlatform.ok) return json(hostPlatform.outcome)
         const peeked = observations.getFor(captureObservation as string | undefined ?? '', exec.agent?.id ?? 'unknown')
         if (!peeked.ok) return json(blocked('capture', peeked.code, peeked.message))
         if (peeked.observation.identity.serial !== request.serial) {
           return json(blocked('capture', 'TARGET_CHANGED', 'request serial does not match the observation'))
         }
-        const approved = await askApproval(services, exec, CAPTURE_TOOL,
+        const approved = await askApproval(services, exec, CAPTURE_TOOL, hostPlatform.platform,
           `${describeCapturePlan(request)} Verified target: ${peeked.observation.identity.serial} (transport ${peeked.observation.identity.transportId}).`)
         if (approved) return json(approved)
         const after = resolvePolicy(services.sandboxPolicy, exec.agent?.session)

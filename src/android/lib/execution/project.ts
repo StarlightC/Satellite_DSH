@@ -75,11 +75,11 @@ export function parseAndroidCliVersion(output: string): string | undefined {
 export function parseAndroidCliDescribe(
   stdout: string,
   canonicalProjectRoot: string,
-  platform: 'posix' | 'windows' = 'posix',
+  paths: { gradleWrapperPath(root: string): string; isAbsoluteHostPath(path: string): boolean },
 ): { gradleWrapper: string; modules: readonly AndroidModuleFact[] } {
   const lines = stdout.replaceAll('\r\n', '\n').split('\n')
-  const separator = platform === 'windows' ? '\\' : '/'
-  const expectedWrapper = `${canonicalProjectRoot}${canonicalProjectRoot.endsWith(separator) ? '' : separator}${platform === 'windows' ? 'gradlew.bat' : 'gradlew'}`
+  const expectedWrapper = paths.gradleWrapperPath(canonicalProjectRoot)
+  if (!paths.isAbsoluteHostPath(expectedWrapper)) throw new TypeError('Gradle wrapper path must be absolute')
 
   if (!lines.includes(`Target project directory: ${canonicalProjectRoot}`)) {
     throw new TypeError('Android CLI describe target does not match the requested project root')
@@ -120,7 +120,7 @@ export function parseAndroidCliDescribe(
     if (apk !== null) {
       if (currentVariant === undefined) throw new TypeError('Android CLI reported an APK before its variant')
       const path = apk[1] as string
-      if (!path.startsWith('/') && !/^[a-zA-Z]:[\\/]/u.test(path)) {
+      if (!paths.isAbsoluteHostPath(path)) {
         throw new TypeError(`Android CLI reported a non-absolute APK path: ${path}`)
       }
       currentVariant.push({ kind: 'apk', path })
@@ -226,6 +226,7 @@ export async function inspectStaticProject(params: {
 
   for (const [kind, relative, detail] of [
     ['wrapper', 'gradlew', 'Gradle wrapper script; not executed by static inspection'],
+    ['wrapper', 'gradlew.bat', 'Windows Gradle wrapper script; not executed by static inspection'],
     ['settings', 'settings.gradle', 'Gradle settings file (Groovy)'],
     ['settings', 'settings.gradle.kts', 'Gradle settings file (Kotlin DSL)'],
     ['build-file', 'build.gradle', 'root build file (Groovy)'],

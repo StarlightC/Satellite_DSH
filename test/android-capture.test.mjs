@@ -387,3 +387,20 @@ test('perfetto 产物落在 perfetto 自己的 traces 目录（真机 /data/loca
   const recordRun = record.calls.spawn.find((entry) => entry.argv.includes('screenrecord'))
   assert.match(recordRun.argv[recordRun.argv.length - 1], /^\/data\/local\/tmp\//)
 })
+
+// Pure execution helper contract: syntax validation is not a Windows support grant.
+// The public tools separately reject unsupported hosts before these helpers run.
+test('host adb absolute-path validation accepts drive and UNC syntax, not relative paths', async () => {
+  for (const adbPath of ['C:\\sdk\\adb.exe', '\\\\server\\sdk\\adb.exe']) {
+    const h = harness({ adbPath })
+    h.services.subprocess.resolveExecutable = async (command) => command
+    const value = await runCapture(h.deps, request(), Date.now())
+    assert.equal(value.status, 'succeeded', JSON.stringify(value))
+    assert.equal(h.calls.spawn[0].argv[0], adbPath)
+  }
+  const h = harness({ adbPath: 'sdk/adb' })
+  const value = await runCapture(h.deps, request(), Date.now())
+  assert.equal(value.status, 'blocked')
+  assert.match(value.error.message, /absolute path/)
+  assert.equal(h.calls.spawn.length, 0)
+})

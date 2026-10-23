@@ -11,6 +11,11 @@ import { registerAndroidExecutionTools } from '../lib/android/lib/execution/tool
 const ROOT = '/project'
 const ADB = '/usr/bin/adb'
 const EMULATOR = '/opt/android/emulator/emulator'
+// 测试 fixtures 显式构造 Apple 宿主，而不是依赖运行测试的机器平台。
+const APPLE_FILES = {
+  '/System/Library/CoreServices/SystemVersion.plist': 1,
+  '/usr/bin/sw_vers': 1,
+}
 
 function emulatorConfig(extra = {}) {
   return resolveExecutionConfig({
@@ -126,7 +131,10 @@ function harness({ approval = 'allowed-once', bootSequence = [true], bootNever =
         const absolute = path.startsWith('/') ? path : `${base}/${path}`
         return { targetKey: absolute, displayPath: absolute }
       },
-      async stat() { return { type: 'directory' } },
+      async stat(target) {
+        if (target.targetKey in APPLE_FILES) return { type: 'file', size: 1 }
+        return target.targetKey === ROOT ? { type: 'directory' } : undefined
+      },
       async listDir() { return [] },
       processPath: (target) => target.targetKey,
       processPathFromHostPath: (hostPath) => hostPath,
@@ -189,7 +197,7 @@ function harness({ approval = 'allowed-once', bootSequence = [true], bootNever =
     callId: 'call-1',
     signal: new AbortController().signal,
   }
-  return { calls, tools, exec, disposers }
+  return { calls, tools, exec, disposers, services }
 }
 
 test('模拟器工具始终注册；未配置 emulator 路径时调用即失败关闭', async () => {
@@ -201,6 +209,20 @@ test('模拟器工具始终注册；未配置 emulator 路径时调用即失败�
   assert.match(value.error.message, /emulatorPath/)
   assert.equal(h.calls.spawn.length, 0)
   assert.equal(h.calls.approvals.length, 0)
+})
+
+test('unsupported 宿主上模拟器工具零批准零进程', async () => {
+  const h = harness()
+  h.services.fs.stat = async (target) => {
+    if (target.targetKey === ROOT) return { type: 'directory' }
+    return undefined
+  }
+  const value = await h.tools[EMULATOR_TOOL].execute({ action: 'list' }, h.exec)
+  assert.equal(value.status, 'blocked')
+  assert.equal(value.error.code, 'CAPABILITY_UNAVAILABLE')
+  assert.match(value.error.message, /no supported host marker matched/)
+  assert.equal(h.calls.approvals.length, 0)
+  assert.equal(h.calls.spawn.length, 0)
 })
 
 test('list 需要批准并返回解析后的 AVD 名称', async () => {
@@ -371,3 +393,33 @@ test('adopt 拒绝同 id 覆盖，不孤立先前的 handle（A4 回归）', () 
   resources.adopt(resource)
   assert.throws(() => resources.adopt({ ...resource, avd: 'Other' }), /already exists/)
 })
+
+for (const target of ['windows', 'linux', 'unknown']) {
+  for (const duringApproval of [false, true]) {
+    test(`owned stop ${target} ${duringApproval ? 'during' : 'before'} approval does not bypass gate or abandon unload cleanup`, async () => {
+      const h = harness()
+      const started = await h.tools[EMULATOR_TOOL].execute({ action: 'start', avd: 'Pixel_6_API_34', startupTimeoutMs: 10000 }, h.exec)
+      assert.equal(started.status, 'succeeded', JSON.stringify(started))
+      const change = () => {
+        h.services.subprocess.terminalEnvironment = async () => ({ platform: target === 'windows' ? 'windows' : 'posix' })
+        h.services.fs.stat = async ({ targetKey }) => {
+          if (targetKey === ROOT) return { type: 'directory' }
+          if (target === 'linux' && targetKey === '/etc/os-release') return { type: 'file' }
+          return undefined
+        }
+      }
+      if (duringApproval) h.services.approval.request = async (request) => { h.calls.approvals.push(request); change(); return 'allowed-once' }
+      else change()
+      h.calls.spawn.length = 0
+      h.calls.approvals.length = 0
+      const stopped = await h.tools[EMULATOR_TOOL].execute({ action: 'stop', ownedResourceId: started.ownedResourceId }, h.exec)
+      assert.equal(stopped.status, 'blocked')
+      assert.match(stopped.error.message, /supported host platform/)
+      assert.equal(h.calls.spawn.length, 0)
+      assert.equal(h.calls.approvals.length, duringApproval ? 1 : 0)
+      assert.deepEqual(h.calls.effects, [])
+      for (const dispose of h.disposers) await dispose()
+      assert.deepEqual(h.calls.effects, ['terminate', 'wait'], 'owned handle cleanup must still run on platform mismatch')
+    })
+  }
+}

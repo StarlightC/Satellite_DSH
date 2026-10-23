@@ -12,6 +12,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
+import { isAbsoluteHostPathSyntax } from '../../../platform/paths.ts'
 
 import type { OperationEvidence, OperationOutcome, SandboxMode, ScopedExecution, SandboxLike, SubprocessLike } from './contracts.ts'
 import {
@@ -401,7 +402,7 @@ export async function runCapture(deps: CaptureDeps, request: CaptureRequest, now
   }
   const artifacts: OperationEvidence[] = []
 
-  if (!deps.adbPath.startsWith('/')) {
+  if (!isAbsoluteHostPathSyntax(deps.adbPath)) {
     return frozen('blocked', {
       error: { code: 'CAPABILITY_UNAVAILABLE', message: 'adb executable was not resolved to an absolute path' },
     })

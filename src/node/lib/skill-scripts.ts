@@ -1,6 +1,7 @@
 /** Project-owned parser entrypoints. No service, process launcher, or permission override. */
 import { createHash } from 'node:crypto'
 import type { defineTool } from '@deepseek-ai/dsh-tools'
+import { detectHostPlatform } from '../../platform/index.ts'
 
 export const SKILL_SCRIPT_TOOL = 'satellite_skill_script_run'
 const MANIFEST = 'scripts/manifest.json'
@@ -152,7 +153,6 @@ export function scriptArguments(script: ScriptDeclaration, value: unknown): stri
   })
 }
 const sha256 = (bytes: Uint8Array | string): string => createHash('sha256').update(bytes).digest('hex')
-const quote = (text: string): string => `'${text.replaceAll("'", "'\\''")}'`
 const decode = (bytes: Uint8Array): string => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
 function policyOf(services: SkillScriptServices, exec: Exec): Policy {
   if (!exec.agent?.session) fail('caller session unavailable')
@@ -197,26 +197,33 @@ async function prepare(services: SkillScriptServices, exec: Exec, skillName: str
   // Execute the exact approved bytes, not a mutable pathname after the last hash check.
   // Narrow ABI: node ESM stdin / isolated Python stdin, positional scalar arguments.
   if (!services.subprocess?.terminalEnvironment || !services.subprocess.resolveExecutable) fail('execution-world executable discovery unavailable')
-  if ((await services.subprocess.terminalEnvironment(exec.signal)).platform !== 'posix') fail('stdin-v1 currently requires POSIX execution world')
+  const platform = await detectHostPlatform({
+    fs: {
+      resolve: (path, options) => services.fs.resolve(path, options),
+      stat: (target, signal) => services.fs.stat(target as Target, signal),
+    },
+    terminalEnvironment: (signal) => services.subprocess.terminalEnvironment(signal),
+    signal: exec.signal,
+  })
+  if (!platform.supported) fail(`stdin-v1 requires a supported execution platform: ${platform.unsupportedReason}`)
   const executable = async (command: string) => {
     const path = safeText(await services.subprocess.resolveExecutable(command, undefined, exec.signal), 4096)
-    if (!path.startsWith('/')) fail('executable discovery did not return an absolute POSIX path')
+    if (!platform.isAbsoluteHostPath(path)) fail('executable discovery did not return an absolute path for the selected platform')
     return path
   }
-  const environmentExecutable = await executable('env')
-  const runtimeExecutable = await executable(script.runtime === 'node' ? 'node' : 'python3')
-  const invocation = [environmentExecutable, '-i', runtimeExecutable,
-    ...(script.runtime === 'node' ? ['--input-type=module', '-'] : ['-I', '-']), ...argv]
-  const command = invocation.map(quote).join(' ')
+  const environmentExecutable = platform.parserEnvironmentExecutableName
+    ? await executable(platform.parserEnvironmentExecutableName) : undefined
+  const runtimeExecutable = await executable(platform.parserRuntimeName(script.runtime))
+  const command = platform.skillScriptCommand({ environmentExecutable, runtimeExecutable, runtime: script.runtime, args: argv })
   const effectiveSessionPolicy = policyOf(services, exec)
   // Parsers need no writes; neither caller arguments nor host approval widen this.
   const policy: Policy = { ...effectiveSessionPolicy, mode: 'read-only' }
   const binding = JSON.stringify({ skill: skill.name, provider: skill.provider, source: skill.source,
-    execution: script.execution, environmentExecutable, runtimeExecutable, targetEnvironment: 'empty (env -i)', effectiveSessionPolicy,
+    execution: script.execution, hostPlatform: platform.id, environmentExecutable, runtimeExecutable, targetEnvironment: platform.parserEnvironmentDescription, environment: platform.parserEnvironment, effectiveSessionPolicy,
     skillHash: sha256(skill.content), root: rootPath, manifest: manifest.path, manifestHash: manifest.hash,
     script: source.path, scriptHash: source.hash, argv, command, sandboxPolicy: policy,
     timeoutMs: script.timeoutMs, outputMaxBytes: script.outputMaxBytes })
-  return { source, script, command, policy, effectiveSessionPolicy, binding, rootPath }
+  return { source, script, command, policy, effectiveSessionPolicy, binding, rootPath, platform }
 }
 export async function runSkillScript(services: SkillScriptServices, request: unknown, exec: Exec) {
   const args = record(request)
@@ -237,14 +244,14 @@ export async function runSkillScript(services: SkillScriptServices, request: unk
   const before = await prepare(services, exec, skill, script, parameters)
   const granted = await services.approval.request({ agent: exec.agent!, toolName: SKILL_SCRIPT_TOOL,
     ...(exec.callId ? { callId: exec.callId } : {}), signal: exec.signal,
-    reason: `Run declared project parser (stdin-v1; output is untrusted evidence). env -i clears the target interpreter environment, not the launching shell. The entry hash does not pin imported code. Network/device/subprocess isolation is NOT guaranteed by the file sandbox. Exact binding: ${before.binding}` })
+    reason: `Run declared project parser (stdin-v1; output is untrusted evidence). Target interpreter environment: ${before.platform.parserEnvironmentDescription}; this does not isolate the launching shell. The entry hash does not pin imported code. Network/device/subprocess isolation is NOT guaranteed by the file sandbox. Exact binding: ${before.binding}` })
   exec.signal.throwIfAborted()
   if (granted !== 'allowed-once') fail(`approval ${granted}`)
   const after = await prepare(services, exec, skill, script, parameters)
   if (before.binding !== after.binding) fail('skill, declaration, script, arguments, or policy changed after approval; retry required')
   const requestSpec: Spec = Object.freeze({ command: after.command, workdir: after.rootPath, timeoutMs: after.script.timeoutMs,
     onExpiry: 'kill', stdoutMaxBytes: after.script.outputMaxBytes, signal: exec.signal,
-    stdin: after.source.text, env: Object.freeze({ NODE_OPTIONS: '', PYTHONPATH: '', PYTHONSTARTUP: '' }),
+    stdin: after.source.text, env: Object.freeze({ ...after.platform.parserEnvironment }),
     sandboxPolicy: Object.freeze({ ...after.policy }) })
   const spec = services.shell.resolve(requestSpec)
   // A backend may narrow its caps, never widen or remove any bound or execution identity.

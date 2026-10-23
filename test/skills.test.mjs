@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { loadSkill, packageRootFrom, parseSkillFile, resourceDirFrom } from '../lib/skills.js'
 
@@ -145,6 +147,20 @@ test('没有 frontmatter 的文件解析为空元数据、正文为全文', () =
   const parsed = parseSkillFile(`${NODE_DIR}/../package.json`)
   assert.deepEqual(parsed.meta, {})
   assert.match(parsed.content, /"name": "satellite"/)
+})
+
+test('CRLF 行尾的 SKILL.md 仍能纯解析 frontmatter 与正文', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'satellite-skill-'))
+  try {
+    const path = join(dir, 'SKILL.md')
+    writeFileSync(path, '---\r\nname: crlf-skill\r\ndescription: CRLF only\r\n---\r\n# Body\r\n')
+    const parsed = parseSkillFile(path)
+    assert.equal(parsed.meta.name, 'crlf-skill')
+    assert.equal(parsed.meta.description, 'CRLF only')
+    assert.equal(parsed.content, '# Body')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // 技能目录下的 references/ 只有被 SKILL.md 用相对链接指到才可发现。

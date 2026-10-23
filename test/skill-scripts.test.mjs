@@ -29,7 +29,12 @@ function fixture() {
       async resolve(path, options) { const p = path.startsWith('/') ? path : `${options.cwd}/${path}`; return { targetKey: p, displayPath: p } },
       contains(parent, child) { return child.targetKey.startsWith(`${parent.targetKey}/`) },
       processPath(target) { return target.targetKey },
-      async stat(target) { return { type: target.targetKey === '/project/skill' ? 'directory' : 'file' } },
+      async stat(target) {
+        if (target.targetKey === '/project/skill') return { type: 'directory' }
+        // 显式构造 Apple 宿主：SystemVersion.plist 与 sw_vers 是文件；Linux 标记缺失。
+        if (target.targetKey === '/etc/os-release' || target.targetKey === '/proc/version') return undefined
+        return { type: 'file' }
+      },
       async readBytes(target, signal, cap) {
         assert.equal(signal, exec.signal)
         state.reads.push({ target, cap })
@@ -124,6 +129,33 @@ test('cancellation during approval prevents execution', async () => {
   const f = fixture(); f.state.onApproval = () => f.controller.abort()
   await assert.rejects(f.run(), { name: 'AbortError' }); assert.equal(f.state.specs.length, 0)
 })
+for (const target of ['windows', 'linux', 'unknown', 'denied']) {
+  const changePlatform = f => {
+    if (target === 'windows') { f.services.subprocess.terminalEnvironment = async () => ({ platform: 'windows' }); return }
+    const stat = f.services.fs.stat
+    f.services.fs.stat = async object => {
+      const path = object.targetKey
+      if (path === '/System/Library/CoreServices/SystemVersion.plist' || path === '/usr/bin/sw_vers') return undefined
+      if (path === '/etc/os-release') {
+        if (target === 'denied') throw Object.assign(new Error('denied'), { code: 'EACCES' })
+        return target === 'linux' ? { type: 'file' } : undefined
+      }
+      return stat(object)
+    }
+  }
+  test(`host platform ${target} before approval blocks without requesting execution`, async () => {
+    const f = fixture(); changePlatform(f)
+    await assert.rejects(f.run(), /supported execution platform/)
+    assert.equal(f.state.approvals.length, 0)
+    assert.equal(f.state.specs.length, 0)
+  })
+  test(`host platform change to ${target} during approval blocks execution`, async () => {
+    const f = fixture(); f.state.onApproval = () => changePlatform(f)
+    await assert.rejects(f.run(), /supported execution platform/)
+    assert.equal(f.state.approvals.length, 1)
+    assert.equal(f.state.specs.length, 0)
+  })
+}
 for (const source of ['runtime', 'user-agents', 'bundled', 'custom']) test(`does not execute nonproject ${source}`, async () => {
   const f = fixture(); f.state.skill.source = source
   await assert.rejects(f.run(), /project skill/); assert.equal(f.state.approvals.length, 0)

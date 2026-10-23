@@ -5,10 +5,20 @@ import {
   CLI_VERSION_POLICY, createObservationStore, digestDynamicFacts, inspectStaticProject,
   parseAndroidCliDescribe, parseAndroidCliVersion,
 } from '../lib/android/lib/execution/project.js'
-import { BUILD_TOOL, PROJECT_TOOL, registerAndroidExecutionTools } from '../lib/android/lib/execution/tools.js'
+import { BUILD_TOOL, DEVICE_TOOL, EMULATOR_TOOL, PROJECT_TOOL, registerAndroidExecutionTools } from '../lib/android/lib/execution/tools.js'
 import { resolveExecutionConfig } from '../lib/android/index.js'
 
 const ROOT = '/project'
+const parserPaths = {
+  gradleWrapperPath: (root) => `${root}/gradlew`,
+  isAbsoluteHostPath: (path) => path.startsWith('/'),
+}
+// 测试 fixtures 显式构造 Apple 宿主，而不是依赖运行测试的机器平台。
+const APPLE_FILES = {
+  '/System/Library/CoreServices/SystemVersion.plist': 1,
+  '/usr/bin/sw_vers': 1,
+}
+const LINUX_FILES = { '/etc/os-release': 1 }
 const DESCRIBE = [
   `Target project directory: ${ROOT}`,
   `Project directory exists: ${ROOT}`,
@@ -33,7 +43,7 @@ test('CLI 版本只接受 1.0.x', () => {
 })
 
 test('describe 报告解析出模块、变体与绝对产物路径', () => {
-  const parsed = parseAndroidCliDescribe(DESCRIBE, ROOT)
+  const parsed = parseAndroidCliDescribe(DESCRIBE, ROOT, parserPaths)
   assert.equal(parsed.gradleWrapper, `${ROOT}/gradlew`)
   assert.deepEqual(parsed.modules, [
     { path: ':app', variants: [{ name: 'debug', artifacts: [
@@ -80,7 +90,7 @@ test('describe 报告的锚点、重复与相对路径一律拒绝', () => {
     ].join('\n'), /variant before its module/],
   ]
   for (const [text, pattern] of cases) {
-    assert.throws(() => parseAndroidCliDescribe(text, ROOT), pattern, `应拒绝: ${pattern}`)
+    assert.throws(() => parseAndroidCliDescribe(text, ROOT, parserPaths), pattern, `应拒绝: ${pattern}`)
   }
 })
 
@@ -165,6 +175,7 @@ function fakeFs({ files = {}, dirs = {} } = {}) {
 function harness({
   mode = 'workspace-write', approval = 'allowed-once', cli, privacy, describeOut = DESCRIBE,
   versionOut = '1.0.7',
+  adbPath, emulatorPath, avdmanagerPath,
   // DESCRIBE 为该变体声明的两个 APK 默认存在：构建成功后才可能通过产物核对。
   files = {
     [`${ROOT}/app/build/outputs/apk/debug/app-debug.apk`]: 256,
@@ -175,7 +186,7 @@ function harness({
   const calls = { spawn: [], approvals: [], confined: [] }
   const services = {
     fs: fakeFs({
-      files: { [`${ROOT}/gradlew`]: 'x', ...files },
+      files: { ...APPLE_FILES, [`${ROOT}/gradlew`]: 'x', ...files },
       dirs,
     }),
     sandboxPolicy: { resolve: () => ({ mode, workspaceRoot: ROOT, sessionId: 's1' }) },
@@ -208,7 +219,14 @@ function harness({
     tools: { register: (tool) => { tools[tool.name] = tool; return () => {} } },
     effect: () => () => {},
   }
-  const config = resolveExecutionConfig({ execution: { enabled: true, ...(cli ? { androidCli: cli } : {}), ...(privacy ? { privacy } : {}) } })
+  const config = resolveExecutionConfig({ execution: {
+    enabled: true,
+    ...(cli ? { androidCli: cli } : {}),
+    ...(privacy ? { privacy } : {}),
+    ...(adbPath ? { adbPath } : {}),
+    ...(emulatorPath ? { emulatorPath } : {}),
+    ...(avdmanagerPath ? { avdmanagerPath } : {}),
+  } })
   registerAndroidExecutionTools(ctx, () => config)
   const exec = {
     agent: { id: 'caller-a', session: { header: { id: 'caller-a', cwd: projectRoot } } },
@@ -271,12 +289,67 @@ test('只读会话里不做动态发现：写元数据的动作失败关闭', as
   assert.equal(h.calls.spawn.length, 0)
 })
 
-test('非 POSIX 执行世界在批准之前就不可用', async () => {
+test('非 Apple 执行世界在批准之前就不可用', async () => {
   const h = harness({ cli: '/opt/android/bin/android', privacy: 'verified-disabled', platform: 'windows' })
   const value = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build' }, h.exec)
   assert.equal(value.status, 'blocked')
-  assert.match(value.error.message, /POSIX/)
+  assert.match(value.error.message, /supported host platform/)
+  assert.match(value.error.message, /Windows host execution is not implemented/)
   assert.equal(h.calls.approvals.length, 0)
+  assert.equal(h.calls.spawn.length, 0)
+})
+
+test('所有动态工具在 unsupported 宿主上零批准零进程', async () => {
+  const h = harness({
+    cli: '/opt/android/bin/android', privacy: 'verified-disabled',
+    adbPath: '/usr/bin/adb', emulatorPath: '/opt/emulator', avdmanagerPath: '/opt/avdmanager',
+  })
+  // 无任何宿主标记 → unknown，所有动态动作都必须在批准与 spawn 之前失败关闭。
+  h.services.fs.stat = async (target) => {
+    if (target.targetKey === ROOT) return { type: 'directory' }
+    return undefined
+  }
+  const cases = [
+    [PROJECT_TOOL, { action: 'discover-build' }],
+    [BUILD_TOOL, { action: 'build', observationId: 'x', module: ':app', variant: 'debug' }],
+    [DEVICE_TOOL, { action: 'discover', serial: 'emulator-5554' }],
+    [EMULATOR_TOOL, { action: 'list' }],
+    ['satellite_android_journey', { serial: 's', observationId: 'o', applicationId: 'com.example.app', steps: [{ action: 'tap', x: 1, y: 2 }] }],
+    ['satellite_android_capture', { action: 'logcat', serial: 's', observationId: 'o', durationSeconds: 5, output: 'a.txt' }],
+  ]
+  for (const [name, args] of cases) {
+    const value = await h.tools[name].execute(args, h.exec)
+    assert.equal(value.status, 'blocked', `${name} 应失败关闭`)
+    assert.equal(value.error.code, 'CAPABILITY_UNAVAILABLE')
+    assert.match(value.error.message, /no supported host marker matched/)
+  }
+  assert.equal(h.calls.spawn.length, 0)
+  assert.equal(h.calls.approvals.length, 0)
+})
+
+test('Linux 与未知宿主标记明确 unsupported，且零批准零进程', async () => {
+  const linux = harness({ cli: '/opt/android/bin/android', privacy: 'verified-disabled' })
+  linux.services.fs.stat = async (target) => {
+    if (target.targetKey in LINUX_FILES) return { type: 'file', size: 1 }
+    if (target.targetKey === ROOT) return { type: 'directory' }
+    return undefined
+  }
+  const linuxValue = await linux.tools[PROJECT_TOOL].execute({ action: 'discover-build' }, linux.exec)
+  assert.equal(linuxValue.status, 'blocked')
+  assert.match(linuxValue.error.message, /Linux host execution is not implemented/)
+  assert.equal(linux.calls.approvals.length, 0)
+  assert.equal(linux.calls.spawn.length, 0)
+
+  const unknown = harness({ cli: '/opt/android/bin/android', privacy: 'verified-disabled' })
+  unknown.services.fs.stat = async (target) => {
+    if (target.targetKey === ROOT) return { type: 'directory' }
+    return undefined
+  }
+  const unknownValue = await unknown.tools[PROJECT_TOOL].execute({ action: 'discover-build' }, unknown.exec)
+  assert.equal(unknownValue.status, 'blocked')
+  assert.match(unknownValue.error.message, /no supported host marker matched/)
+  assert.equal(unknown.calls.approvals.length, 0)
+  assert.equal(unknown.calls.spawn.length, 0)
 })
 
 test('批准被拒时零进程执行', async () => {
@@ -574,8 +647,9 @@ function externalHarness(over = {}) {
     },
     ...over,
   })
-  // 让外部目录可解析，且根 wrapper 可读。
+  // 让外部目录可解析，且根 wrapper 可读；同时保留 Apple 宿主标记。
   h.services.fs.stat = async (target) => {
+    if (target.targetKey in APPLE_FILES) return { type: 'file', size: 1 }
     if (target.targetKey === `${EXTERNAL}/gradlew`) return { type: 'file', size: 1 }
     if (target.targetKey === EXTERNAL || target.targetKey === ROOT) return { type: 'directory' }
     if (target.targetKey.startsWith(`${EXTERNAL}/app/build/`)) return { type: 'file', size: 10 }
@@ -758,4 +832,23 @@ test('未升级时不可能进入未围栏运行（结构上由 escalation 决�
   assert.equal(outcome.status, 'blocked')
   assert.equal(h.calls.spawn.length, 0)
   assert.equal(h.calls.confined.length, 0)
+})
+
+// The parser consumes an explicit path capability, not the executing test machine's OS.
+test('describe parser accepts injected Windows path policy without enabling Windows execution', () => {
+  const root = 'C:\\work'; const apk = 'C:\\work\\app.apk'
+  const report = DESCRIBE.replaceAll(ROOT, root).replaceAll(/APK: .*/g, `APK: ${apk}`)
+  const paths = { gradleWrapperPath: () => `${root}\\gradlew.bat`, isAbsoluteHostPath: (path) => /^[A-Z]:\\/.test(path) }
+  const value = parseAndroidCliDescribe(report, root, paths)
+  assert.equal(value.gradleWrapper, `${root}\\gradlew.bat`)
+  assert.equal(value.modules[0].variants[0].artifacts[0].path, apk)
+  assert.throws(() => parseAndroidCliDescribe(report.replaceAll(apk, '/wrong-world.apk'), root, paths), /non-absolute APK/)
+  assert.throws(() => parseAndroidCliDescribe(report, root, { ...paths, gradleWrapperPath: () => 'gradlew.bat' }), /wrapper path must be absolute/)
+})
+
+test('static inspection recognises gradlew.bat without a host implementation', async () => {
+  const fs = fakeFs({ files: { [`${ROOT}/gradlew.bat`]: 'x' }, dirs: { [ROOT]: [] } })
+  const value = await inspectStaticProject({ projectRoot: ROOT, fs, signal: new AbortController().signal })
+  assert.equal(value.leads.find((lead) => lead.kind === 'wrapper').path, `${ROOT}/gradlew.bat`)
+  assert.equal(value.missing.includes('gradlew'), false)
 })

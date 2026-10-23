@@ -33,6 +33,12 @@ export default defineConfig([
   entry('satellite/lib/notify', 'lib', 'src/lib/notify.ts', 'notify.js'),
   entry('satellite/lib/registry', 'lib', 'src/lib/registry.ts', 'registry.js'),
   entry('satellite/lib/skills', 'lib', 'src/lib/skills.ts', 'skills.js'),
+  // 宿主平台策略（共享模块：node 与 android 都引用，也供测试单独导入）
+  entry('satellite/platform/index', 'lib/platform', 'src/platform/index.ts', 'index.js'),
+  entry('satellite/platform/contracts', 'lib/platform', 'src/platform/contracts.ts', 'contracts.js'),
+  entry('satellite/platform/apple', 'lib/platform', 'src/platform/apple.ts', 'apple.js'),
+  entry('satellite/platform/linux', 'lib/platform', 'src/platform/linux.ts', 'linux.js'),
+  entry('satellite/platform/windows', 'lib/platform', 'src/platform/windows.ts', 'windows.js'),
   // 插槽服务入口（默认导出 Cordis Service 子类）
   entry('satellite/slots', 'lib/slots', 'src/slots/index.ts', 'index.js'),
   // 节点工具入口
