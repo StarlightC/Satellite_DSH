@@ -176,6 +176,10 @@ test('core real apply mounts node, read-only role service, generic query and scr
   const f = setup()
   const owner = new Context()
   const fibers = []
+  // Direct apply must provide the native contracts declared by node.inject.
+  f.services.agents = { roots: () => [] }
+  f.services.systemPrompt = { section: () => () => {} }
+  f.ctx.tools.guard = () => () => {}
   applyNode({
     ...f.ctx,
     plugin(plugin, options) { const fiber = owner.plugin(plugin, options); fibers.push(fiber); return fiber },

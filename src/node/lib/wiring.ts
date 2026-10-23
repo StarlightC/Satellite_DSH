@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'node:crypto'
 
-import type { defineTool } from '@deepseek-ai/dsh-tools'
+import type { defineTool, ToolGuard, ToolExecution } from '@deepseek-ai/dsh-tools'
 
 import type { SlotExtension, SlotFacts } from '../../lib/contracts.js'
 import type { Resolution } from '../../lib/registry.js'
@@ -31,6 +31,53 @@ import type { RoleCatalog } from './role-catalog.js'
 import { createCallStore, runNode } from './nodes.js'
 import type { BaseExecution, BaseOutcome, CallStore, ExtensionResult, NodeCallRecord, NodeRunResult } from './nodes.js'
 import { OUTPUT_SCHEMA, PARAMETERS_SCHEMA } from './tool-schema.js'
+
+type RuntimeAgent = NonNullable<ToolExecution['agent']>
+
+/** The native services this row reads; `inject` guarantees them at the entry. */
+export interface CoordinatorContext {
+  get(name: string): unknown
+  readonly tools: { guard(guard: ToolGuard): () => void }
+  effect(fn: () => void | (() => void)): unknown
+}
+
+const COORDINATION_TOOLS = new Set([
+  'satellite_node', 'skill', 'ask_user_question', 'exit_plan_mode',
+  'todo_write', 'present', 'get_goal', 'create_goal', 'update_goal',
+  // Listing never resumes agents; interrupt only cancels.
+  'list_agents', 'interrupt_agent',
+  'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete',
+])
+
+const COORDINATOR_PROMPT = 'Satellite 主会话只编排协调与基础汇总：具体调查、检索、读写、执行、审查和验证通过 satellite_node 执行（暂停节点用 token 恢复），不用 subagent、subagent_fork、workflow 或 send_message 代替。'
+
+/** Register once on the node row, so unload removes both effects and HMR needs no cache. */
+export function registerCoordinatorBoundary(ctx: CoordinatorContext): void {
+  const agents = ctx.get('agents') as { roots(): RuntimeAgent[] }
+  const prompt = ctx.get('systemPrompt') as {
+    section(section: {
+      name: string
+      order: number
+      text(context: { scope?: RuntimeAgent }): string
+      interpolate: boolean
+    }): () => void
+  }
+  function isCoordinator(agent: RuntimeAgent): boolean {
+    return agents.roots().includes(agent)
+  }
+  ctx.effect(() => ctx.tools.guard((exec) => {
+    // Agentless Host operations are not model calls; never infer an agent from ALS.
+    if (!exec.agent) return undefined
+    if (!isCoordinator(exec.agent) || COORDINATION_TOOLS.has(exec.name)) return undefined
+    return 'Satellite：主会话只编排协调；具体任务必须通过 satellite_node 执行'
+  }))
+  ctx.effect(() => prompt.section({
+    name: 'satellite:coordinator',
+    order: 50,
+    interpolate: false,
+    text: ({ scope }) => scope && isCoordinator(scope) ? COORDINATOR_PROMPT : '',
+  }))
+}
 
 /** `defineTool` 的真实签名来自 dsh-tools；这里直接复用，不另造一套作者 DSL 类型。 */
 export type DefineTool = typeof defineTool

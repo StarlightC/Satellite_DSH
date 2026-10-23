@@ -34,6 +34,11 @@ or when you need the line between "checked here" and full verification, read
 - Keep the diff reviewable: one unit at a time, and no unrelated edits mixed in.
 - Do not add tests that only assert the implementation you just wrote; add the
   check the unit actually needs.
+- Before adding a gate, fallback, or second check, give the real entry chain,
+  trigger condition, existing guarantee, and reachability evidence. Verify an
+  evidence gap first; a stand-in that can construct the state or a theoretical
+  possibility is not a reason to add one, and do not repeat the same rule in
+  several places.
 - Never commit, tag, push, publish, or touch credentials and secrets.
 
 If the change turns out to need a wider goal, a new permission, or a decision that

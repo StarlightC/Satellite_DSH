@@ -12,7 +12,8 @@ import z from '@deepseek-ai/schemastery'
 
 import { resourceDirFrom } from '../lib/skills.js'
 import { BUILTIN_ROLE_NAMES, BUILTIN_ROUTES } from './lib/config.js'
-import { createNodeRuntime } from './lib/wiring.js'
+import { createNodeRuntime, registerCoordinatorBoundary } from './lib/wiring.js'
+import type { CoordinatorContext } from './lib/wiring.js'
 import { SatelliteRoles } from './lib/role-service.js'
 import type { NodeRuntimeContext } from './lib/wiring.js'
 import { registerReuseQuery } from './lib/reuse-tools.js'
@@ -21,7 +22,7 @@ import { registerSkillScriptTool } from './lib/skill-scripts.js'
 import type { SkillScriptContext } from './lib/skill-scripts.js'
 
 // skills 是硬依赖：节点工具必须能注册并核对方法技能，不能靠装配顺序碰运气。
-export const inject = ['tools', 'satelliteSlots', 'skills']
+export const inject = ['tools', 'satelliteSlots', 'skills', 'agents', 'systemPrompt']
 
 const RouteSchema = z.object({
   role: z.string().min(1).required(),
@@ -69,6 +70,7 @@ export function apply(ctx: Context, config: unknown): void {
     // 资源（locale/icon/skills）不参与构建，构建后入口在 lib/node/，资源仍在包根的 node/。
     resourceDir: resourceDirFrom(import.meta.url, 'node'),
   })
+  registerCoordinatorBoundary(ctx as unknown as CoordinatorContext)
   // A read-only native Remote service, owned by this node row's lifecycle.
   // Ordinary roles/nodes remain deployment configuration, not editable volatile settings.
   ctx.plugin(SatelliteRoles, { describe: () => runtime.describeRoles() })
