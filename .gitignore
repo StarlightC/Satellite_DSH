@@ -2,3 +2,9 @@ node_modules/
 /lib/
 *.tsbuildinfo
 *.tgz
+
+# Local execution caches and validation artifacts
+/.satellite/
+
+# macOS filesystem metadata
+.DS_Store
