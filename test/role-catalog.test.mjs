@@ -35,7 +35,7 @@ test('目录来自有效角色覆盖，输出 JSON 数据而非路由或执行�
   assert.deepEqual(validation, {
     role: 'validation', label: '部署验证', description: '只测部署声明范围',
     skill: 'deployed-validation', sandbox: 'read-only',
-    bindings: [{ node: 'validate', phase: 'base', skill: 'deployed-validation', objective: '只测部署声明范围', condition: '调用 validate 节点且省略 tier 或 tier=standard时执行基础阶段。' }],
+    bindings: [{ node: 'validate', phase: 'base', skill: 'deployed-validation', objective: '只测部署声明范围', condition: '调用 validate 节点且省略 tier时执行基础阶段。' }],
   })
   assert.equal(roleByName(catalog, 'removed-role'), undefined)
   for (const entry of catalog.roles) {
@@ -191,10 +191,21 @@ test('目录按实际 tierRoles 合并同角色条件，保持 version 1 与角�
     }
   }
   assert.equal(roleByName(catalog, 'implementation').bindings.filter((b) => b.node === 'implement').length, 1)
+  for (const [node, tier, role] of [
+    ['solution', 'critical', 'solution-design-critical'],
+    ['implement', 'critical', 'implementation-critical'],
+    ['review', 'senior', 'change-review-senior'],
+    ['review', 'critical', 'change-review-critical'],
+  ]) {
+    const binding = roleByName(catalog, role).bindings.find((b) => b.node === node)
+    assert.ok(binding.condition.includes(`tier=${tier}`))
+  }
+  assert.equal(config.nodes.validate.tierRoles, undefined)
+  assert.equal(catalog.roles.flatMap((r) => r.bindings).some((b) => b.node === 'validate' && /tier=/.test(b.condition)), false)
 })
 
 // Entry: user replaces a builtin node binding and explicitly adds a specialist tier map.
-test('自定义档位目录不保留内置挂载，也不把无映射 Senior 伪装成存在', () => {
+test('自定义档位目录不保留内置挂载，也不把无映射档位伪装成存在', () => {
   const config = normalizeConfig({
     nodes: { review: { role: 'local', tierRoles: { senior: 'specialist' } } },
     roles: { local: { objective: 'local' }, specialist: { objective: 'specialist' } },
@@ -202,6 +213,7 @@ test('自定义档位目录不保留内置挂载，也不把无映射 Senior 伪
   const catalog = buildRoleCatalog(config, [])
   assert.deepEqual(roleByName(catalog, 'change-review-light').bindings, [])
   assert.deepEqual(roleByName(catalog, 'change-review').bindings, [])
+  assert.deepEqual(roleByName(catalog, 'change-review-critical').bindings, [])
   assert.match(roleByName(catalog, 'local').bindings[0].condition, /省略 tier/)
   assert.match(roleByName(catalog, 'specialist').bindings[0].condition, /tier=senior/)
   assert.equal(catalog.roles.flatMap((r) => r.bindings).some((b) => b.node === 'validate' && /tier=senior/.test(b.condition)), false)

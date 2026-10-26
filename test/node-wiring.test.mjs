@@ -1373,16 +1373,26 @@ test('省略 tier 保持节点默认，自定义 role 不暗中继承内置档�
 })
 
 // Entry: public node calls select each builtin supported mapping, using real defineTool.
-test('三个节点的实际档位经公开 schema 到 startActivation 使用正确方法与路由', async () => {
+test('solution/implement/review 三个节点的四档经公开 schema 使用正确方法与路由', async () => {
   const cases = [
+    ['solution', 'light', 'solution-design-light'],
+    ['solution', 'standard', 'solution-design'],
+    ['solution', 'senior', 'solution-design-senior'],
+    ['solution', 'critical', 'solution-design-critical'],
     ['implement', 'light', 'implementation-light'],
     ['implement', 'standard', 'implementation'],
     ['implement', 'senior', 'implementation-senior'],
+    ['implement', 'critical', 'implementation-critical'],
     ['review', 'light', 'change-review-light'],
     ['review', 'standard', 'change-review'],
-    ['validate', 'light', 'validation-light'],
-    ['validate', 'standard', 'validation'],
+    ['review', 'senior', 'change-review-senior'],
+    ['review', 'critical', 'change-review-critical'],
   ]
+  const baseRoles = {
+    solution: 'solution-design',
+    implement: 'implementation',
+    review: 'change-review',
+  }
   for (const [node, tier, role] of cases) {
     const checked = []
     const f = setup({
@@ -1405,23 +1415,27 @@ test('三个节点的实际档位经公开 schema 到 startActivation 使用正�
     assert.deepEqual(validateJsonSchemaValue(f.runtime.tool.output.schema, value), [])
     assert.match(actual.prompt[0].text, new RegExp(`SELECTED:${role}`))
     assert.ok(actual.prompt[0].text.includes(DEFAULT_CONFIG.roles[role].skill))
-    assert.deepEqual(actual.toolFilter, DEFAULT_CONFIG.roles[role].toolFilter)
-    assert.equal(f.calls.executed[0].mode, DEFAULT_CONFIG.roles[role].sandbox)
+    const baseRole = baseRoles[node]
+    assert.deepEqual(actual.toolFilter, DEFAULT_CONFIG.roles[baseRole].toolFilter, '档位不提升工具权限')
+    assert.equal(f.calls.executed[0].mode, DEFAULT_CONFIG.roles[baseRole].sandbox, '档位不提升文件权限')
   }
 })
 
-// Entry: a model emits invalid tier, or requests a valid but unconfigured grade.
-test('真实 defineTool 拒绝非法 tier，缺映射或未知角色在任何子调用前阻塞', async () => {
+// Entry: a model emits invalid tier, or requests a tier from a node with no default mapping.
+test('真实 defineTool 拒绝非法 tier，默认不分级节点拒绝显式档，未知角色在子调用前阻塞', async () => {
   const f = setup({ defineToolImpl: defineTool })
-  assert.deepEqual(f.runtime.tool.parameters.properties.tier.enum, ['light', 'standard', 'senior'])
-  for (const tier of ['critical', '', null, 1]) {
+  assert.deepEqual(f.runtime.tool.parameters.properties.tier.enum, ['light', 'standard', 'senior', 'critical'])
+  for (const tier of ['critical-plus', '', null, 1]) {
     await assert.rejects(f.runtime.tool.execute({ node: 'implement', task: '坏参数', tier }, fakeExec()), /tier/)
   }
-  for (const node of ['review', 'validate', 'context']) {
-    const value = await f.runtime.tool.execute({ node, task: '缺失映射', tier: 'senior' }, fakeExec())
-    assert.equal(value.kind, 'blocked')
-    assert.match(value.reason, /未配置.*档角色/)
-    assert.equal(value.execution, undefined)
+  for (const node of ['context', 'validate', 'signoff']) {
+    for (const tier of ['light', 'standard', 'senior', 'critical']) {
+      const value = await f.runtime.tool.execute({ node, task: '默认未分级', tier }, fakeExec())
+      assert.equal(value.kind, 'blocked')
+      assert.match(value.reason, /未配置.*档角色/)
+      assert.match(value.reason, /省略 tier 使用节点默认角色/)
+      assert.equal(value.execution, undefined)
+    }
   }
   assert.equal(f.calls.activations.length, 0)
   const missing = setup({ config: { nodes: { implement: { tierRoles: { senior: 'missing-role' } } } } })
@@ -1429,6 +1443,43 @@ test('真实 defineTool 拒绝非法 tier，缺映射或未知角色在任何子
   assert.equal(value.kind, 'blocked')
   assert.match(value.reason, /未配置角色/)
   assert.equal(missing.calls.activations.length, 0)
+})
+
+// Entry: a deployment saved a route and mapping that referenced the removed builtin role.
+test('旧 validation-light 路由保留但不再派发，也不静默回退默认角色', async () => {
+  const routes = [{ role: 'validation-light', provider: 'deepseek-official', model: 'deepseek-flash' }]
+  const f = setup({
+    config: {
+      routes: { get: () => routes },
+      nodes: { validate: { tierRoles: { light: 'validation-light' } } },
+    },
+  })
+  const value = await f.runtime.tool.options.execute({ node: 'validate', task: '旧档位', tier: 'light' }, fakeExec())
+  assert.equal(value.kind, 'blocked')
+  assert.match(value.reason, /未配置角色：validation-light/)
+  assert.equal(value.execution, undefined)
+  assert.equal(f.calls.activations.length, 0)
+  assert.deepEqual(routes, [{ role: 'validation-light', provider: 'deepseek-official', model: 'deepseek-flash' }])
+})
+
+// Entry: a profile still carries the removed builtin role's old local override.
+test('旧 validation-light 局部覆盖在装配前以迁移错误拒绝，不注册工具也不激活', () => {
+  const { ctx, calls } = setup({ withRuntime: false })
+  const config = Config({
+    roles: { 'validation-light': { objective: '旧局部覆盖' } },
+    nodes: { validate: { tierRoles: { light: 'validation-light' } } },
+    routes: [{ role: 'validation-light', provider: 'deepseek-official', model: 'deepseek-flash' }],
+  })
+  assert.throws(() => createNodeRuntime({
+    ctx,
+    config,
+    defineTool: fakeDefineTool,
+    resourceDir: RESOURCE_DIR,
+  }), /内置角色 validation-light 已移除[\s\S]*删除该局部覆盖/)
+  assert.equal(calls.tools.length, 0)
+  assert.equal(calls.skills.length, 0)
+  assert.equal(calls.activations.length, 0)
+  assert.deepEqual(config.routes.get(), [{ role: 'validation-light', provider: 'deepseek-official', model: 'deepseek-flash' }])
 })
 
 // Entry: deployment maps Senior to a read-only specialist with stricter tools than its custom default role.
@@ -1450,6 +1501,26 @@ test('显式 tierRoles 可绑定自定义角色，不开放调用方任意 role 
   assert.match(f.calls.activations[0].request.prompt[0].text, /SPECIALIST-METHOD/)
   assert.deepEqual(f.calls.activations[0].request.toolFilter.deny, ['satellite_node', 'edit', 'write', 'bash'])
   assert.equal(f.calls.executed[0].mode, 'read-only')
+})
+
+// Entry: a deployment opts a default non-tiered node into a custom tier map.
+test('默认不分级节点仍可通过自定义 tierRoles 选用角色，不硬编码禁止', async () => {
+  const f = setup({ config: {
+    nodes: { validate: { tierRoles: { critical: 'special-validator' } } },
+    roles: {
+      'special-validator': {
+        ...DEFAULT_CONFIG.roles.validation,
+        objective: 'SPECIAL-VALIDATION-METHOD',
+      },
+    },
+  } })
+  const value = await f.runtime.tool.options.execute({
+    node: 'validate', task: '专项验证', tier: 'critical',
+  }, fakeExec())
+  assert.deepEqual(value.selection, { role: 'special-validator', tier: 'critical' })
+  assert.match(f.calls.activations[0].request.prompt[0].text, /SPECIAL-VALIDATION-METHOD/)
+  assert.deepEqual(f.calls.activations[0].request.toolFilter, DEFAULT_CONFIG.roles.validation.toolFilter)
+  assert.equal(f.calls.executed[0].mode, DEFAULT_CONFIG.roles.validation.sandbox)
 })
 
 // Entry: before extension pauses; caller retries with a different tier or identity, then resumes.

@@ -112,7 +112,7 @@ export const PARAMETERS_SCHEMA = Object.freeze({
   unit: { type: 'string', description: '实施单元标识；同一节点的不同单元互不串用记录' },
   tier: {
     type: 'string', enum: NODE_TIERS,
-    description: '节点角色档（非执行风险）；省略用节点默认，显式档须有映射。resume 省略继承原选择，升降档须新建调用。',
+    description: '节点角色档，与任务执行难度独立；默认只用于 solution/implement/review。省略用节点默认，显式档须有映射。resume 省略继承原选择，改档须新建调用并携带证据。',
   },
   facts: {
     type: 'json',

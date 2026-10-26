@@ -140,15 +140,21 @@ test('默认值来自代码：BUILTIN_ROLE_NAMES/BUILTIN_ROUTES 与 DEFAULT_CONF
     'acceptance',
     'android-context',
     'change-review',
+    'change-review-critical',
     'change-review-light',
+    'change-review-senior',
     'implementation',
+    'implementation-critical',
     'implementation-light',
     'implementation-senior',
     'investigation',
     'solution-design',
+    'solution-design-critical',
+    'solution-design-light',
+    'solution-design-senior',
     'validation',
-    'validation-light',
   ])
+  assert.equal(declared.includes('validation-light'), false, '旧内置验证档位已移除')
   const rolesWithOptions = Object.entries(DEFAULT_CONFIG.roles)
     .filter(([, role]) => role.agentOptions)
     .map(([name]) => name)

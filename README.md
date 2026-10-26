@@ -78,39 +78,62 @@ install_bundle <解压后的 package 目录>
 
 ## 难度评级与升降级
 
-这套机制分为**任务执行难度**（light / standard / critical）和**节点角色等级**（light / standard / senior）。主 Agent 按事实初评、在新证据或重复失败后复评；Critical 不自动选 Senior，安全拆分后的轻量单元也不能取消整体风险检查。
+这里有两个**独立**选择：
 
-评级、失败预算与降级理由是技能指导下的判断和报告，不是自动评分器、持久计数器或任务调度服务。主 Agent 应读取基础流程技能链接的[评级与升降级方法](<node/skills/satellite-base-flow/references/difficulty-and-escalation.md>)，再分别选择实施、审查和验证角色。Android 的[平台风险补充](<android/skills/android-change-review/references/task-risk.md>)保留在领域技能中。
+- **任务执行难度**：light / standard / critical，描述整个任务的风险与所需审查、验证义务。
+- **节点角色档位**：light / standard / senior / critical，为一次 solution、implementation 或 review 单元选择已配置的角色。
 
-### 选择节点角色等级
+两者即使同名也不绑定：Critical 任务不自动选 Senior 或 Critical 角色，独立且安全的单元仍可用 Light；Critical 角色也可以处理一个 Standard 任务里反复失败的顽固问题。档位只改变职责深度，不提升工具、沙箱、父会话权限或其他审批权限。
 
-`satellite_node` 新增可选 `tier`，例如：
+评级、失败预算与降级理由是技能指导下的判断和报告，不是自动评分器、持久计数器或任务调度服务。主 Agent 应读取基础流程技能链接的[评级与升降级方法](<node/skills/satellite-base-flow/references/difficulty-and-escalation.md>)，再分别选择方案、实施和审查角色。Android 的[平台风险补充](<android/skills/android-change-review/references/task-risk.md>)保留在领域技能中。
+
+### 选择节点角色档位
+
+`satellite_node` 提供可选 `tier`，例如：
 
 ```json
 {"node":"implement","unit":"local-resource-fix","tier":"light","task":"修复已确认的局部资源引用；仅改指定单元并执行必要编译检查。"}
 ```
 
-| 节点 | light | standard | senior |
-| --- | --- | --- | --- |
-| implement | `implementation-light` | `implementation` | `implementation-senior` |
-| review | `change-review-light` | `change-review` | 默认未配置，返回缺口 |
-| validate | `validation-light` | `validation` | 默认未配置，返回缺口 |
+| 节点 | light | standard | senior | critical |
+| --- | --- | --- | --- | --- |
+| solution | `solution-design-light` | `solution-design` | `solution-design-senior` | `solution-design-critical` |
+| implement | `implementation-light` | `implementation` | `implementation-senior` | `implementation-critical` |
+| review | `change-review-light` | `change-review` | `change-review-senior` | `change-review-critical` |
 
-- **不传 `tier` 保持原有角色选择**。`context`、`solution`、`signoff` 默认不提供等级映射。
-- 显式等级必须存在于该节点的 `nodes.<node>.tierRoles`，且目标角色真实存在；缺失时不会静默退回默认角色。`critical` 不是合法的角色等级。
-- 等级映射只选择基础节点角色，不跳过前后扩展，不改变扩展自己的角色，也不改变父会话权限。
-- `selection` 表示本次选定的角色与等级；`execution` 表示已通过创建边界的基础角色及向后端请求的显式模型路由，不是从子会话读回的模型实测值。前置暂停或创建前拒绝可以只有选择、没有执行；启动也不等于业务完成或验收通过。
-- 同一暂停调用冻结等级和角色。`resume` 时可省略 `tier` 以继承原选择，不能改变它；需要升级或降级时发起新的有界节点调用。after 恢复复用原基础结果，不把新的模型设置当作上次已执行的模型。
+四档职责是方法深度，不是模型名称或口号：
 
-部署可通过 `nodes.<node>.tierRoles` 显式配置允许的角色映射，支持这三个等级名；提供的映射整体替换该节点默认映射，空对象可禁用显式等级。已有 `nodes.<node>.role` 覆盖会移除隐含的内置等级映射，避免绕过自定义角色；需要等级时须同时显式配置映射。角色定义、方法与文件沙箱仍归 `roles`，模型覆盖仍只走 `routes`。
+- **light**：边界清楚、局部低歧义的单元；说明局部影响和未检查范围，但不得略过该单元实际必要的安全检查。
+- **standard**：常规求解（审查为常规审查）并检查完整影响，核对真实消费者与相关检查。
+- **senior**：跨模块耦合、复杂约束或已有失败证据的单元；先复核旧证据，不重复已被否定的方法。
+- **critical**：重新检验核心假设、构造反例、深入处理顽固问题；不与高风险自动绑定，不要求每项都不可逆，也不禁止在证据充分时给出通过结论；仍无解时停止并报告缺口、请求决定。
 
-新增角色沿用对应类别的现有默认模型，不因为 Senior 名称另选更贵模型。各角色的 `routes` 独立：新增角色不会自动继承旧角色的用户模型覆盖，请核对所用档位的实际模型。模型相同不意味着职责相同，模型不同也不等于获得专项能力。
+- **不传 `tier` 保持原有默认角色**。`context`、`validate`、`signoff` 默认不提供档位映射，应不带 `tier` 调用；`validate` 仍是独立的验证步骤，不能由更高档的实施或审查角色替代。
+- 显式档位必须存在于该节点的 `nodes.<node>.tierRoles`，且目标角色真实存在；缺失时不会静默退回默认角色。省略 `tier` 时节点默认角色仍可用。
+- 档位只选择基础节点角色，不跳过前后扩展，也不改变扩展自己的角色。`solution`、`review` 各档保持只读；`implement` 各档继承同一写工具与沙箱边界，父会话权限仍是上限。
+- `selection` 表示本次选定的角色与档位；`execution` 表示已通过创建边界的基础角色及向后端请求的显式模型路由，不是从子会话读回的模型实测值。前置暂停或创建前拒绝可以只有选择、没有执行；启动也不等于业务完成或验收通过。
+- 同一暂停调用冻结档位和角色。`resume` 时可省略 `tier` 以继承原选择，不能改变它；需要改档时发起新的有界节点调用，并在任务包中携带触发改档的证据。after 恢复复用原基础结果，不把新的模型设置当作上次已执行的模型。
+
+部署可通过 `nodes.<node>.tierRoles` 为任意节点显式配置角色映射，支持 `light`、`standard`、`senior`、`critical` 四个档位名；提供的映射整体替换该节点默认映射，空对象可禁用显式档位。已有 `nodes.<node>.role` 覆盖会移除隐含的内置档位映射，避免绕过自定义角色；需要档位时须同时显式配置映射。角色定义、方法与文件沙箱仍归 `roles`，模型覆盖仍只走 `routes`。
+
+新增角色的代码默认路由复制对应基础角色的既有默认 `agentOptions`，不为 Senior/Critical 另选“更强”的模型；各角色运行时仍只匹配自己的 `routes` 条目，不自动继承用户给基础角色的覆盖。模型相同不意味着职责相同，模型不同也不等于获得专项能力。
+
+### 迁移：validation-light
+
+本版移除内置 `validation-light` 角色，并移除 `validate` 节点的默认 `tierRoles`。已有 profile 不会被自动改写，以下三种残留分别处理：
+
+- **只有旧 `route`**：`routes` 里仍有 `role: validation-light` 的条目会原样保留，但不再对应内置角色，也不会被派发；它不会自动映射到 `validation` 或其他角色。保留的旧 `route` 只是用户配置，不是可派发能力。
+- **旧 `tierRoles` 映射、无同名 `roles` 定义**：自定义 `nodes.validate.tierRoles` 仍指向 `validation-light` 时，显式选择该档会以“未配置角色：validation-light”停止，不会静默回退；其他角色或省略 `tier` 的默认验证仍按配置工作。
+- **旧 `roles['validation-light']` 局部覆盖**：不会再被当成自定义角色。配置归一化会直接以迁移错误停止（装配前，不注册工具、不启动任何节点），提示删除该局部覆盖；如确需自定义用途，请改用新角色名定义完整角色，并把 `nodes.<node>.tierRoles` 与 `routes` 的引用改到新名。旧名不会作为别名保留。
+- **清理办法**：删除旧 `route`；删除或改写自定义 `tierRoles` 中的旧引用，或把它指向一个真实存在的角色；删除旧的 `roles['validation-light']` 覆盖。
+- 这项检查只针对已退役的 `validation-light` 名称，不是通用角色名校验；其他自定义 `roles` 与 `tierRoles` 不受影响。
 
 ### 失败与复评边界
 
-- 实施预算为同一单元、当前等级最多三次有证据的失败尝试，可发生在一次子调用内；重派、改名或刷新上下文不能清零。耗尽后按 Light → Standard → Senior/专项 → 专项或用户方向处理。
-- 审查、验证使用各自的返工升级规则，不能机械套成三次。未配置更高角色或缺少专项方法时，报告缺口而不是重复同配置假装升级。
-- 计数依据完整修改假设和验收失败证据，不是工具报错次数、节点 `kind` 或 Agent `stopReason`；权限、设备、依赖等外部阻塞单独报告。
+- 只有**实施**使用“同一单元、当前档位最多三次有证据失败”的预算，可发生在一次子调用内；重派、改名或刷新上下文不能清零。达到当前档预算后按证据选择更高档或专项；更高档有自己的预算，并继承此前失败历史，但不把旧尝试算进新档次数。
+- `solution` 与 `review` **不套三次预算**；它们的换档依据是证据变化（歧义、耦合、影响面或既有失败），不是机械次数。`validate` 没有角色档位，验证失败是任务证据，不能仅凭它自动换成更贵模型。
+- `critical` 仍无法解决时停止，报告未解缺口并请求决定，不无限重试或自行升到不存在的档位。
+- 计数依据完整修改假设和验收失败证据，不是工具报错次数、节点 `kind` 或 Agent `stopReason`；权限、设备、依赖、凭据等外部阻塞单独报告，不通过升级模型解决。
 - 新证据可支持更轻的角色。不得为赶时间、工具不足或规避未解决问题而降级；若会减少已约定的审查/验收义务、改变批准范围或模型使用约定，先请用户确认。
 - 历史依赖现有会话记录和节点摘要；恢复后证据不足时明确报告，不声称自动恢复预算或未完成节点。原有 `resume` 令牌仍仅服务当前运行时调用，不承诺跨 Host 重启恢复。
 

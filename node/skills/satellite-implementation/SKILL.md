@@ -24,6 +24,19 @@ When it is hard to bound the unit, when a review finding has to become a rework 
 or when you need the line between "checked here" and full verification, read
 [the unit boundaries reference](references/unit-boundaries.md).
 
+## Role tier responsibilities
+
+The assigned tier changes the depth and scope of the same implementation method; it
+does not grant extra tools, sandbox breadth, or approval. Every implementation tier
+keeps the same permission posture and parent-imposed limits.
+
+| Tier | Responsibility |
+| --- | --- |
+| light | Implement a boundary-clear, local, low-ambiguity unit and state the local impact. Keep the safety and compatibility checks the unit actually needs; if the scope becomes cross-cutting or unresolved, stop and hand back. |
+| standard | Handle conventional implementation and check the complete impact against the real consumers, tests, and configuration. |
+| senior | Handle cross-module coupling, complex constraints, or a unit with existing failure evidence. Recheck that evidence, avoid repeating rejected methods, and return the unresolved gap rather than looping. |
+| critical | Re-examine the implementation's core assumptions and construct counterexamples. Pursue a stubborn problem in depth without treating high risk or total irreversibility as a requirement. With sufficient evidence, a Critical attempt may pass; when it remains unsolved, stop and request a decision. |
+
 ## While editing
 
 - Make the smallest change that satisfies the unit.
@@ -58,23 +71,28 @@ not imply that the optional maintenance tool is mounted or has run.
 
 ## Bounded correction and tier handoff
 
-At the assigned tier, stop after three failed implementation attempts on the same
+At the assigned implementation tier, stop after three failed attempts on the same
 unit (including internal corrections and earlier failures at this same tier), or
-earlier when no evidence-backed correction is worth trying. A higher tier has its
-own bounded budget; earlier tiers' failures remain evidence, not spent attempts
-against the new tier. One attempt is a coherent hypothesis
-or change shown by evidence not to meet its target; several diagnostics from one
-check count once. This is a reasoning/reporting budget, not a tool-call counter.
-Do not run extra checks to count attempts or take over full validation.
+earlier when no evidence-backed correction is worth trying. This three-attempt budget
+belongs only to implementation; solution and review do not inherit it. A higher
+implementation tier has its own bounded budget; earlier tiers' failures remain
+history and evidence, not spent attempts against the new tier. One attempt is a
+coherent hypothesis or change shown by evidence not to meet its target; several
+diagnostics from one check count once. This is a reasoning/reporting budget, not a
+tool-call counter. Do not run extra checks to count attempts or take over full
+validation.
 
 Report each failed hypothesis and its evidence, the failed count/limit, remaining
 blocker, partial edits and the smallest useful handoff. If history or evidence is
 missing, state that gap instead of inventing a count or claiming a fresh budget.
 New child calls or cosmetic subdivisions do not reset the same unit's history.
-Recommend Standard from Light, Senior or a relevant specialist from Standard, and
-specialist/user direction from exhausted Senior. The parent chooses reassignment;
-do not delegate upward yourself. A stronger role does not authorize a wider scope.
-Keep external environment/permission blockers separate from implementation failures.
+Recommend Standard from Light, Senior from Standard, and Critical or a relevant
+specialist from Senior when the remaining evidence supports that depth. An exhausted
+Critical unit stops with the unresolved gap and requests a decision; do not start
+another Critical loop or delegate upward yourself. The parent chooses reassignment;
+a stronger role does not authorize a wider scope. Keep external
+environment/permission/credential blockers separate from implementation failures;
+they do not justify a higher tier.
 
 ## After editing
 

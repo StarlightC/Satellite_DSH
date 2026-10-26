@@ -13,9 +13,9 @@ tokens, personal data, authentication, billing and payments need the strongest
 applicable data/security assessment. Assess actual effect, not keywords in a file.
 
 Cross-module/state ownership, lifecycle, background execution, Flow/coroutines,
-concurrency, migrations, integrity and performance uncertainty may require Senior
-implementation or a specialist when the work cannot be safely decomposed. A
-Critical task may still contain independent Light/Standard implementation units;
+concurrency, migrations, integrity and performance uncertainty may require a Senior
+or Critical role or a specialist when the work cannot be safely decomposed. Critical
+task difficulty may still contain independent Light/Standard implementation units;
 retain its platform review and validation obligations.
 
 A mechanical resource-ID rename can be exempt from the scope-3 direct trigger only
@@ -45,7 +45,7 @@ Critical. Preparation does not authorize signing-key access, upload or publishin
 - Architecture/security judgment beyond the registered methods is a capability gap.
   Return the exact specialist requirement to the parent/user; do not invent an
   `android.*` role, assume Android's presence supplies every specialist, or treat a
-  Senior model choice as proof of specialist review.
+  Senior/Critical role or model choice as proof of specialist review.
 
 The Android extensions return reports, not trusted machine acceptance facts. The
 parent still checks applicability, evidence and remaining limits. If a report needs

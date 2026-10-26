@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Config } from '../lib/node/index.js'
 
-import { BUILTIN_ROLE_NAMES, BUILTIN_ROUTES, DEFAULT_CONFIG, EXECUTOR_TOOL_FILTER, IMPLEMENT_TOOL_FILTER, READ_ONLY_REVIEW_TOOL_FILTER, effectiveAgentOptions, effectiveSandboxMode, isSandboxMode, normalizeConfig, readLiveConfigValue, strictestSandboxMode } from '../lib/node/lib/config.js'
+import { BUILTIN_ROLE_NAMES, BUILTIN_ROUTES, DEFAULT_CONFIG, EXECUTOR_TOOL_FILTER, IMPLEMENT_TOOL_FILTER, NODE_TIERS, READ_ONLY_REVIEW_TOOL_FILTER, effectiveAgentOptions, effectiveSandboxMode, isSandboxMode, normalizeConfig, readLiveConfigValue, selectNodeRole, strictestSandboxMode } from '../lib/node/lib/config.js'
 
 
 test('默认 provider 与默认角色存在', () => {
@@ -26,14 +26,30 @@ test('默认 provider 与默认角色存在', () => {
   assert.match(resolved.roles.investigation.persona, /缺口/)
   // 第四个基础节点：流程第二步的方案与决策（只读，到此停下等待决定）。
   assert.equal(resolved.nodes.solution.role, 'solution-design')
+  assert.deepEqual(resolved.nodes.solution.tierRoles, {
+    light: 'solution-design-light', standard: 'solution-design',
+    senior: 'solution-design-senior', critical: 'solution-design-critical',
+  })
   assert.equal(resolved.roles['solution-design'].skill, 'satellite-solution')
   assert.match(resolved.roles['solution-design'].objective, /可评审/)
   assert.match(resolved.roles['solution-design'].objective, /决定/)
   assert.match(resolved.roles['solution-design'].objective, /不实施/)
+  assert.match(resolved.roles['solution-design'].objective, /完整影响检查/)
   assert.match(resolved.roles['solution-design'].persona, /事实与推断/)
   assert.match(resolved.roles['solution-design'].persona, /不编造信心/)
+  assert.equal(resolved.nodes.validate.role, 'validation')
+  assert.equal(resolved.nodes.validate.tierRoles, undefined)
   // 第六个基础节点：流程第三步的实施（唯一允许写文件的角色）。
   assert.equal(resolved.nodes.implement.role, 'implementation')
+  assert.deepEqual(resolved.nodes.implement.tierRoles, {
+    light: 'implementation-light', standard: 'implementation',
+    senior: 'implementation-senior', critical: 'implementation-critical',
+  })
+  assert.equal(resolved.nodes.review.role, 'change-review')
+  assert.deepEqual(resolved.nodes.review.tierRoles, {
+    light: 'change-review-light', standard: 'change-review',
+    senior: 'change-review-senior', critical: 'change-review-critical',
+  })
   assert.equal(resolved.roles.implementation.skill, 'satellite-implementation')
   assert.match(resolved.roles.implementation.objective, /已同意的基线/)
   assert.match(resolved.roles.implementation.objective, /一次一个单元/)
@@ -41,6 +57,7 @@ test('默认 provider 与默认角色存在', () => {
   assert.match(resolved.roles.implementation.persona, /交回/)
   // 第五个基础节点：流程末步的验收（只按证据声明接受与否与剩余限制）。
   assert.equal(resolved.nodes.signoff.role, 'acceptance')
+  assert.equal(resolved.nodes.signoff.tierRoles, undefined)
   assert.equal(resolved.roles.acceptance.skill, 'satellite-acceptance')
   assert.match(resolved.roles.acceptance.objective, /证据/)
   assert.match(resolved.roles.acceptance.objective, /不提交/)
@@ -248,12 +265,18 @@ test('活配置整体替换路由时带上 effort 与 maxTokens', () => {
 
 test('每个默认角色都带代码默认的 sandbox 模式：只读角色 read-only，可写角色 workspace-write', () => {
   const resolved = normalizeConfig()
-  for (const name of ['investigation', 'solution-design', 'change-review', 'acceptance', 'android-context']) {
+  for (const name of [
+    'investigation', 'solution-design', 'change-review', 'acceptance', 'android-context',
+    'solution-design-light', 'solution-design-senior', 'solution-design-critical',
+    'change-review-light', 'change-review-senior', 'change-review-critical',
+  ]) {
     assert.equal(DEFAULT_CONFIG.roles[name].sandbox, 'read-only', `角色 ${name} 默认 read-only`)
     assert.equal(resolved.roles[name].sandbox, 'read-only')
   }
-  // 可写角色：validation 要跑测试/构建，implementation 要真实改文件。
-  for (const name of ['validation', 'implementation']) {
+  // 可写角色：validation 要跑测试/构建，implementation 要真实改文件；档位不提升权限。
+  for (const name of [
+    'validation', 'implementation', 'implementation-light', 'implementation-senior', 'implementation-critical',
+  ]) {
     assert.equal(DEFAULT_CONFIG.roles[name].sandbox, 'workspace-write', `角色 ${name} 默认 workspace-write`)
     assert.equal(resolved.roles[name].sandbox, 'workspace-write')
   }
@@ -366,6 +389,7 @@ test('自定义角色仍可使用声明层默认，用户覆盖统一 routes 且
 // Entry: user changes node.role or supplies a partial explicit tier map in deployment Config.
 test('tierRoles 整图替换，显式 role 覆盖即使同名也不继承隐式档位', () => {
   assert.equal(normalizeConfig().nodes.implement.tierRoles.senior, 'implementation-senior')
+  assert.equal(normalizeConfig().nodes.implement.tierRoles.critical, 'implementation-critical')
   const custom = normalizeConfig({ nodes: { implement: { role: 'custom' }, review: { role: 'change-review' } } })
   assert.equal(custom.nodes.implement.tierRoles, undefined)
   assert.equal(custom.nodes.review.tierRoles, undefined)
@@ -376,9 +400,44 @@ test('tierRoles 整图替换，显式 role 覆盖即使同名也不继承隐式�
 
 // Entry: malformed user-provided tierRoles reaches normalizeConfig through the existing open nodes field.
 test('拒绝非法 tierRoles 形状、未知档位与空角色', () => {
-  for (const tierRoles of [null, [], 'light', { critical: 'implementation' }, { light: '' }, { senior: '  ' }, { standard: 4 }]) {
+  for (const tierRoles of [null, [], 'light', { extreme: 'implementation' }, { light: '' }, { senior: '  ' }, { standard: 4 }]) {
     assert.throws(() => normalizeConfig(Config({ nodes: { implement: { tierRoles } } })), /tierRoles/)
   }
+})
+
+// Entry: a saved old route and old mapping still point at the removed builtin validation-light role.
+test('旧 validation-light 路由与自定义映射原样保留，但不再有内置角色或自动回退', () => {
+  const routes = [{ role: 'validation-light', provider: 'example', model: 'old-validation-model' }]
+  const normalized = normalizeConfig({
+    routes,
+    nodes: { validate: { tierRoles: { light: 'validation-light' } } },
+  })
+  assert.equal('validation-light' in DEFAULT_CONFIG.roles, false)
+  assert.equal(normalized.roles['validation-light'], undefined)
+  assert.deepEqual(normalized.nodes.validate.tierRoles, { light: 'validation-light' })
+  assert.deepEqual(routes, [{ role: 'validation-light', provider: 'example', model: 'old-validation-model' }])
+  assert.throws(
+    () => selectNodeRole(normalized.nodes.validate, normalized.roles, 'light'),
+    /未配置角色：validation-light/,
+  )
+  assert.throws(
+    () => selectNodeRole(normalizeConfig().nodes.validate, normalizeConfig().roles, 'light'),
+    /省略 tier 使用节点默认角色/,
+  )
+})
+
+// Entry: a saved old local roles override for the removed builtin name reaches normalizeConfig.
+test('旧 validation-light 的 roles 局部覆盖在装配前以迁移错误拒绝', () => {
+  const config = Config({
+    routes: [{ role: 'validation-light', provider: 'example', model: 'old-validation-model' }],
+    nodes: { validate: { tierRoles: { light: 'validation-light' } } },
+    roles: { 'validation-light': { objective: '旧局部覆盖' } },
+  })
+  assert.throws(
+    () => normalizeConfig(config),
+    /内置角色 validation-light 已移除[\s\S]*删除该局部覆盖[\s\S]*新角色名/,
+  )
+  assert.deepEqual(config.routes.get(), [{ role: 'validation-light', provider: 'example', model: 'old-validation-model' }])
 })
 
 // Entry: plugin upgrade adds defaults while a profile stores only one existing role override.
@@ -387,14 +446,20 @@ test('新增角色默认路由唯一且 sparse overrides 不冻结或丢失新�
   const normalized = normalizeConfig(config)
   assert.equal(new Set(BUILTIN_ROUTES.map((r) => r.role)).size, BUILTIN_ROUTES.length)
   for (const [variant, original] of [
+    ['solution-design-light', 'solution-design'], ['solution-design-senior', 'solution-design'],
+    ['solution-design-critical', 'solution-design'],
     ['implementation-light', 'implementation'], ['implementation-senior', 'implementation'],
-    ['change-review-light', 'change-review'], ['validation-light', 'validation'],
+    ['implementation-critical', 'implementation'],
+    ['change-review-light', 'change-review'], ['change-review-senior', 'change-review'],
+    ['change-review-critical', 'change-review'],
   ]) {
     assert.deepEqual(effectiveAgentOptions({ role: normalized.roles[variant], roleName: variant, routes: config.routes.get() }), DEFAULT_CONFIG.roles[original].agentOptions)
     assert.equal(normalized.roles[variant].skill, normalized.roles[original].skill)
     assert.deepEqual(normalized.roles[variant].toolFilter, normalized.roles[original].toolFilter)
     assert.equal(normalized.roles[variant].sandbox, normalized.roles[original].sandbox)
+    assert.ok(normalized.roles[variant].objective.startsWith(DEFAULT_CONFIG.roles[original].objective))
   }
+  assert.deepEqual(NODE_TIERS, ['light', 'standard', 'senior', 'critical'])
   assert.equal(config.routes.get().length, 1)
   assert.equal(effectiveAgentOptions({ role: normalized.roles.implementation, roleName: 'implementation', routes: config.routes.get() }).model, 'deepseek-flash')
 })
