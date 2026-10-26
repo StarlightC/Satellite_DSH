@@ -99,6 +99,13 @@ test('本包技能由自己在 apply 中注册', () => {
     'android-change-review',
     'android-validation-evidence',
     'android-acceptance-evidence',
+    'android-compose-performance',
+    'android-anr-diagnostics',
+    'android-permissions-security',
+    'android-kotlin-concurrency',
+    'android-compose-state-effects',
+    'android-compose-ui-testing',
+    'android-performance-analysis',
   ])
   assert.equal(calls.skills[0].source, 'bundled')
   // 执行工具必须在行加载时就注册：漏声明 tools 依赖会让它们被静默丢弃。

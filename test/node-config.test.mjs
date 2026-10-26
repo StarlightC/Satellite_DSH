@@ -169,10 +169,10 @@ test('验收角色的工具过滤同样拒绝写操作，但保留读证据的�
 })
 
 test('本包自带的技能清单同时包含基础流程、变更审查、有界调查、方案设计、验收与实施', () => {
-  const expected = ['satellite-base-flow', 'satellite-validation', 'satellite-change-review', 'satellite-investigation', 'satellite-solution', 'satellite-acceptance', 'satellite-implementation']
+  const expected = ['satellite-base-flow', 'satellite-validation', 'satellite-change-review', 'satellite-investigation', 'satellite-solution', 'satellite-acceptance', 'satellite-implementation', 'satellite-version-control']
   assert.deepEqual([...DEFAULT_CONFIG.skills], expected)
   assert.deepEqual([...normalizeConfig().skills], expected)
-  assert.deepEqual(Object.keys(DEFAULT_CONFIG.nodes).sort(), ['context', 'implement', 'review', 'signoff', 'solution', 'validate'])
+  assert.deepEqual(Object.keys(DEFAULT_CONFIG.nodes).sort(), ['context', 'implement', 'review', 'signoff', 'solution', 'validate', 'version-control'])
 })
 
 test('行配置只覆盖给出的字段，默认 persona 与 toolFilter 不被顶掉', () => {

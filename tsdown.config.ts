@@ -51,6 +51,9 @@ export default defineConfig([
   entry('satellite/node/lib/routes', 'lib/node/lib', 'src/node/lib/routes.ts', 'routes.js'),
   entry('satellite/node/lib/reuse-index', 'lib/node/lib', 'src/node/lib/reuse-index.ts', 'reuse-index.js'),
   entry('satellite/node/lib/reuse-tools', 'lib/node/lib', 'src/node/lib/reuse-tools.ts', 'reuse-tools.js'),
+  // Internal kernel test entry; the restricted runtime bridge is wired only by node.
+  entry('satellite/node/lib/version-control-runtime', 'lib/node/lib', 'src/node/lib/version-control-runtime.ts', 'version-control-runtime.js'),
+  entry('satellite/node/lib/version-control', 'lib/node/lib', 'src/node/lib/version-control.ts', 'version-control.js'),
   entry('satellite/node/lib/tool-schema', 'lib/node/lib', 'src/node/lib/tool-schema.ts', 'tool-schema.js'),
   entry('satellite/node/lib/wiring', 'lib/node/lib', 'src/node/lib/wiring.ts', 'wiring.js'),
   // Android 只读扩展入口

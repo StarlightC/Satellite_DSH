@@ -30,15 +30,19 @@ apply. You never call a slot yourself, and no argument skips the checks.
 - `validate` — run the checks the project actually has.
 - `signoff` — state acceptance, evidence, and remaining limits.
 
-All six nodes — `context`, `solution`, `implement`, `validate`, `review` and
-`signoff` — have base runners in this build. Calling a node without a base
-runner returns a gap naming what is missing; do not fake its completion.
+These six nodes plus optional `version-control` form an available directory of
+seven, not a mandatory pipeline. All have base runners. `version-control` has a
+same-name dedicated role and `satellite-version-control` method, without tiers;
+select it only for a concrete explicit user request, never as the default tail of
+another intent. It supports local status/diff/log/stage/commit only, with fresh
+host approval for writes and no remote operation. Version text edits still belong
+to `implement`, which does not commit. Missing services are a gap, not completion.
 
 The order is not fixed for every task. Read
 [the task intents and diagnostics reference](references/task-intents.md) when you
 need the node order for a specific intent (feature, bug-fix, refactor,
 test-coverage, ui-adjustment, project-health, current-change-analysis,
-review-and-plan, commit, release-preparation), when the right specialist method is
+review-and-plan, commit / optional version-control, release-preparation), when the right specialist method is
 not obvious, when a report has to be graded (blocked / needs a decision /
 suggestion / unverified), when a component looks unavailable, or when configuring a
 component whose shape changed. Read it for those decisions only; do not restate its
@@ -51,19 +55,26 @@ changes risk or a blocker repeats, read
 [the difficulty and escalation method](references/difficulty-and-escalation.md).
 Only `solution`, `implement`, and `review` have default role tiers;
 `context`, `validate`, and `signoff` are called without `tier` unless a deployment
-adds its own mapping. Keep whole-task execution difficulty separate from the node's
+adds its own mapping. The reserved `version-control` node never accepts `tier`.
+Keep whole-task execution difficulty separate from the node's
 optional `tier`; carry the reasons and failed-attempt history in the existing bounded
 task packet. This is an Agent judgment/reporting method, not an automatic scoring or
 retry engine.
 
 ## Rules that do not change per project
 
-1. Bounded investigation first: name the scope, the questions, and the stop
-   condition before reading widely.
+1. Establish sufficient bounded context, reusing current evidence when its inputs
+   are unchanged; do not repeat investigation merely to visit a node. Before any
+   side effect, check tool/service/route/permission availability without side effects.
 2. Real changes to the agreed baseline need the user's decision. New evidence
    does not silently widen the goal.
-3. One unit at a time: implement, review the real diff, then verify. Missing
-   evidence is not a pass.
+3. Select the nodes and checks the task actually needs. A simple version, wording,
+   or value change with sufficient context can use implementation plus targeted
+   checks, without mechanical context → solution → review → full validation. A
+   dependency or script change is not a pure version edit. Agreed necessary review,
+   mandatory slots, and host approval remain obligations: avoiding duplicate
+   execution does not remove them. One unit at a time; inspect the real diff and
+   retain required review/verification. Missing evidence is not a pass.
 4. Keep failed evidence. Do not restart a rejected approach under a new name.
 5. A finished agent run is a runtime fact, not business acceptance. Say what is
    verified, what is not, and where the limit comes from.

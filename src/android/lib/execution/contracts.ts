@@ -147,37 +147,10 @@ export function requireEnum<T extends string>(value: unknown, where: string, all
 /* ------------------------------------------------------- 调用作用域的服务 */
 
 /** 只声明真正读取的部分；全部按调用方 Agent 的作用域取，不回落注册根。 */
-export interface SandboxLike {
-  confine(
-    argv: readonly string[],
-    policy: { mode: 'read-only' | 'workspace-write' | 'danger-full-access'; workspaceRoot: string; sessionId?: string },
-    signal?: AbortSignal,
-  ): Promise<{ argv: string[]; enforcement: 'full' | 'partial'; denialSignatures: readonly string[] }>
-}
+export type { SandboxLike, SubprocessLike } from '../../../lib/process-contracts.ts'
 
 export interface PolicyLike {
   resolve(request: { session: unknown }): { mode?: string; workspaceRoot?: string; sessionId?: string } | undefined
-}
-
-export interface SubprocessLike {
-  resolveExecutable(command: string, env?: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string>
-  terminalEnvironment(signal?: AbortSignal): Promise<{ platform: 'posix' | 'windows'; defaultShell?: string }>
-  spawn(spec: {
-    argv: readonly string[]
-    cwd: string
-    stdio: { stdin: 'ignore' | 'pipe' | { data: string }; stdout: unknown; stderr: unknown; control?: 'pipe' }
-    graceMs: number
-    signal?: AbortSignal
-    env?: Record<string, string | undefined>
-  }): {
-    readonly done: Promise<{ exitCode: number | null; signal: string | null }>
-    terminate(): void
-    waitForExit(signal?: AbortSignal): Promise<boolean>
-    readonly collected: {
-      readonly stdout?: { readFrom(fromByte: number): { text: string; nextOffset: number; lossy: boolean; spillPath?: string } }
-      readonly stderr?: { readFrom(fromByte: number): { text: string; nextOffset: number; lossy: boolean; spillPath?: string } }
-    }
-  }
 }
 
 export interface ApprovalLike {

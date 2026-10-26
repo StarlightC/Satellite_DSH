@@ -256,11 +256,10 @@ test('角色说明复用装配配置并实时读取扩展，不启动角色或�
 
 test('装配：声明节点、注册工具，且只注册本包自带的技能', () => {
   const { calls, runtime } = setup()
-  assert.deepEqual(calls.nodes, ['context', 'solution', 'implement', 'validate', 'review', 'signoff'])
-  assert.deepEqual(runtime.nodeIds, ['context', 'solution', 'implement', 'validate', 'review', 'signoff'])
-  assert.equal(calls.tools.length, 1)
-  assert.equal(calls.tools[0].name, 'satellite_node')
-  assert.deepEqual(calls.tools[0].options.parameters.node.required, true)
+  assert.deepEqual(calls.nodes, ['context', 'solution', 'implement', 'validate', 'review', 'signoff', 'version-control'])
+  assert.deepEqual(runtime.nodeIds, ['context', 'solution', 'implement', 'validate', 'review', 'signoff', 'version-control'])
+  assert.deepEqual(calls.tools.map(tool => tool.name), ['satellite_version_control', 'satellite_node'])
+  assert.deepEqual(calls.tools[1].options.parameters.node.required, true)
   assert.deepEqual(calls.skills.map((skill) => skill.name), [
     'satellite-base-flow',
     'satellite-validation',
@@ -269,7 +268,23 @@ test('装配：声明节点、注册工具，且只注册本包自带的技能',
     'satellite-solution',
     'satellite-acceptance',
     'satellite-implementation',
+    'satellite-version-control',
   ])
+})
+
+test('缺guard只阻塞显式version-control，不影响旧节点；扩展不能取得保留角色身份', async () => {
+  const { runtime, calls, registry } = setup()
+  assert.equal(calls.activations.length, 0)
+  const blocked = await runtime.tool.options.execute({ node: 'version-control', task: '明确请求status' }, fakeExec())
+  assert.match(blocked.result, /guard/)
+  assert.equal(calls.activations.length, 0)
+  const ordinary = await runtime.tool.options.execute({ node: 'context', task: '旧调查节点' }, fakeExec())
+  assert.equal(ordinary.kind, 'completed')
+  registry.register(syntheticExtension({ id: 'test.reserved-role', slot: 'context.before', role: 'version-control', skill: 'satellite-version-control' }))
+  const before = calls.activations.length
+  const extension = await runtime.tool.options.execute({ node: 'context', task: '不能通过扩展调用保留角色' }, fakeExec('another'))
+  assert.notEqual(extension.kind, 'completed')
+  assert.equal(calls.activations.length, before)
 })
 
 test('没有技能表或子 Agent 服务时报告阻塞而不是抛错', () => {

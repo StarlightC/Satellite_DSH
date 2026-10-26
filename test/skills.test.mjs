@@ -128,6 +128,7 @@ test('全部绑定技能都能从构建产物入口读到：入口模块的 skil
     'satellite-solution',
     'satellite-acceptance',
     'satellite-implementation',
+    'satellite-version-control',
   ])
   // 入口模块必须真实可加载（子插件入口与技能资源在同一构建产物里）。
   const entry = await import(new URL('../lib/node/index.js', import.meta.url).href)

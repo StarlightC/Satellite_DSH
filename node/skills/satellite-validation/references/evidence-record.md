@@ -22,6 +22,16 @@ expectations, or repair the source to make a check pass.
 - where the raw output lives, and what it was truncated to;
 - what the check proves and what it does not.
 
+## Reuse without repeating blindly
+
+Record the evidence source and revision/digest, coverage, exact command, relevant
+environment and untested items. Reuse only if the inputs relevant to that claim
+(source, dependencies, scripts, configuration and execution environment) are
+unchanged; identify any invalidated coverage. A dependency/script change is not a
+pure version edit. Reusing evidence avoids duplicate execution, not an agreed
+necessary review or mandatory slot. Authorization and host approval never carry
+over as reusable evidence.
+
 ## Classify the outcome honestly
 
 - **code failure** — the check ran as intended and the claim did not hold;

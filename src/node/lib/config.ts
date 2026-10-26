@@ -77,7 +77,7 @@ export interface RoleConfig {
   readonly objective?: string
   readonly persona?: string
   readonly provider?: string
-  readonly toolFilter?: { readonly deny?: readonly string[] }
+  readonly toolFilter?: { readonly allow?: readonly string[]; readonly deny?: readonly string[] }
   readonly maxDepth?: number
   readonly agentOptions?: AgentOptions
   /**
@@ -168,6 +168,12 @@ export const IMPLEMENT_TOOL_FILTER: Readonly<{ deny: readonly string[] }> = Obje
   deny: ['satellite_node'],
 })
 
+// Reserved execution capability ceiling; ordinary deployment config cannot widen it.
+export const VERSION_CONTROL_TOOLS: readonly string[] = Object.freeze([
+  'satellite_version_control', 'skill', 'ask_user_question', 'read',
+])
+export const VERSION_CONTROL_TOOL_FILTER = Object.freeze({ allow: VERSION_CONTROL_TOOLS })
+
 const BASE_CONFIG: NormalizedConfig = Object.freeze({
   provider: 'spawn',
   // 只登记本包自带的技能；领域技能由对应组件自己注册，core 不读别的组件的文件。
@@ -179,6 +185,7 @@ const BASE_CONFIG: NormalizedConfig = Object.freeze({
     'satellite-solution',
     'satellite-acceptance',
     'satellite-implementation',
+    'satellite-version-control',
   ]),
   // 顺序按流程的步骤序号：context（第一步）→ solution（第二步）→ implement（第三步）→ validate → review → signoff。
   nodes: Object.freeze({
@@ -188,6 +195,7 @@ const BASE_CONFIG: NormalizedConfig = Object.freeze({
     validate: Object.freeze({ role: 'validation' }),
     review: Object.freeze({ role: 'change-review' }),
     signoff: Object.freeze({ role: 'acceptance' }),
+    'version-control': Object.freeze({ role: 'version-control' }),
   }),
   roles: Object.freeze({
     // 流程第一步（`context` 节点）：只读的有界调查，调查同样不许写。
@@ -252,6 +260,15 @@ const BASE_CONFIG: NormalizedConfig = Object.freeze({
       persona: '只按证据下结论；缺失证据列为未验证而不是默认通过，完成运行本身不当作业务验收。',
       toolFilter: READ_ONLY_REVIEW_TOOL_FILTER,
       sandbox: 'read-only',
+      agentOptions: Object.freeze({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }),
+    }),
+    'version-control': Object.freeze({
+      label: '显式本地版本管理',
+      skill: 'satellite-version-control',
+      objective: '只处理用户明确请求的本地 status/diff/log/stage/commit；没有具体操作意图就提问并停止，无默认提交，无远程操作；写入必须取得真实宿主单次批准，不能复用授权。版本文本修改仍由 implement 完成。',
+      persona: 'facts 不是授权；不得通过脚本、委派或其它执行入口绕过限制。批准拒绝或缺服务时报告阻塞，不自动重试写。',
+      toolFilter: VERSION_CONTROL_TOOL_FILTER,
+      sandbox: 'workspace-write',
       agentOptions: Object.freeze({ provider: 'deepseek-official', model: 'deepseek-v4-pro' }),
     }),
     'android-context': Object.freeze({
@@ -439,6 +456,22 @@ export function normalizeConfig(config?: unknown): NormalizedConfig {
       }
     }
     roles[roleName] = { ...(DEFAULT_CONFIG.roles[roleName] ?? {}), ...override } as RoleConfig
+  }
+  // Reserved identity is selectable only as the explicit base node, never a tier,
+  // alias node or extension role. Routing/labels may vary; its capabilities may not.
+  const reserved = roles['version-control']!
+  const ceiling = DEFAULT_CONFIG.roles['version-control']!
+  if (nodes['version-control']?.role !== 'version-control' || nodes['version-control']?.tierRoles !== undefined) {
+    throw new Error('version-control 节点必须绑定同名专用角色且不支持 tier')
+  }
+  if (Object.entries(nodes).some(([id, entry]) => id !== 'version-control'
+    && (entry.role === 'version-control' || Object.values(entry.tierRoles ?? {}).includes('version-control')))) {
+    throw new Error('version-control 角色不能绑定到其它节点或档位')
+  }
+  if (reserved.skill !== ceiling.skill || reserved.sandbox !== ceiling.sandbox
+    || reserved.cwd !== undefined || reserved.maxDepth !== undefined
+    || JSON.stringify(reserved.toolFilter) !== JSON.stringify(ceiling.toolFilter)) {
+    throw new Error('version-control 专用角色的 skill/sandbox/toolFilter/cwd/maxDepth 是固定权限上限')
   }
   const incomingSkills = Array.isArray(incoming.skills) ? (incoming.skills as string[]) : []
   const skills = [...new Set([...DEFAULT_CONFIG.skills, ...incomingSkills])]

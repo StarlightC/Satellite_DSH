@@ -153,6 +153,7 @@ test('默认值来自代码：BUILTIN_ROLE_NAMES/BUILTIN_ROUTES 与 DEFAULT_CONF
     'solution-design-light',
     'solution-design-senior',
     'validation',
+    'version-control',
   ])
   assert.equal(declared.includes('validation-light'), false, '旧内置验证档位已移除')
   const rolesWithOptions = Object.entries(DEFAULT_CONFIG.roles)

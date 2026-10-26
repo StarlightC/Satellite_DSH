@@ -172,7 +172,7 @@ test('core apply validates builtin role options before registering any operation
   assert.equal(f.disposers.length, 0)
 })
 
-test('core real apply mounts node, read-only role service, generic query and script entry without Android recognizer', async () => {
+test('core real apply mounts node, read-only role service, generic query, script entry and version-control tool without Android recognizer', async () => {
   const f = setup()
   const owner = new Context()
   const fibers = []
@@ -187,7 +187,7 @@ test('core real apply mounts node, read-only role service, generic query and scr
   }, {})
   await Promise.all(fibers)
   try {
-    assert.deepEqual([...f.tools.keys()].sort(), ['satellite_node', 'satellite_reuse_query', 'satellite_skill_script_run'])
+    assert.deepEqual([...f.tools.keys()].sort(), ['satellite_node', 'satellite_reuse_query', 'satellite_skill_script_run', 'satellite_version_control'])
     const catalog = owner.get('satelliteRoles').describe()
     assert.equal(catalog.version, 1)
     assert.equal(catalog.roles.find((role) => role.role === 'android-context').bindings.length, 0)

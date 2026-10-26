@@ -31,6 +31,8 @@ import type { RoleCatalog } from './role-catalog.js'
 import { createCallStore, runNode } from './nodes.js'
 import type { BaseExecution, BaseOutcome, CallStore, ExtensionResult, NodeCallRecord, NodeRunResult } from './nodes.js'
 import { OUTPUT_SCHEMA, PARAMETERS_SCHEMA } from './tool-schema.js'
+import { createVersionControlBoundary } from './version-control-runtime.ts'
+import type { VersionAgent } from './version-control-runtime.ts'
 
 type RuntimeAgent = NonNullable<ToolExecution['agent']>
 
@@ -238,6 +240,7 @@ interface SandboxExpectation {
   readonly policy: SandboxPolicyApi
   session?: ChildSessionLike
   verified?: boolean
+  versionControl?: { readonly parent: object; readonly parentCallId?: string; remove?: () => void }
 }
 
 /**
@@ -250,7 +253,11 @@ interface SandboxExpectation {
 export interface NodeRuntimeContext {
   readonly satelliteSlots: SlotsApi
   get(name: string): unknown
-  readonly tools: { register(tool: SatelliteNodeTool): () => void }
+  readonly tools: {
+    register(tool: SatelliteNodeTool): () => void
+    guard?(guard: ToolGuard): () => void
+    get?(name: string, scope?: object): unknown
+  }
   effect(fn: () => void | (() => void)): unknown
   on?: {
     (name: 'session/created', listener: (session: ChildSessionLike) => void): () => void
@@ -300,12 +307,14 @@ function textOf(result: SubagentResult | undefined): string {
     .trim()
 }
 
-function buildPrompt({ task, skill, objective }: { task: string; skill?: string; objective?: string }): string {
+function buildPrompt({ task, skill, objective, versionControl }: { task: string; skill?: string; objective?: string; versionControl?: boolean }): string {
   return [
     `本次节点任务：${task}`,
     `方法技能：${skill}（若该技能不可用，请明确报告不可用，不要编造方法）`,
     `本节点目标：${objective}`,
-    '边界：只完成本节点范围内的工作，不自行推进到下一节点，不执行提交或发布，不扩大任务范围。',
+    versionControl
+      ? '边界：只完成用户明确请求的本地5操作，不默认提交；写操作必须真实宿主单次批准，禁止远程、发布和其它历史操作，不自行推进下一节点。'
+      : '边界：只完成本节点范围内的工作，不自行推进到下一节点，不执行提交或发布，不扩大任务范围。',
     '返回：实际做了什么、真实结果与证据位置、未完成或未验证的部分。',
   ].join('\n')
 }
@@ -420,6 +429,8 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
   const slots = ctx.satelliteSlots
   const store: CallStore = createCallStore()
   const nodeIds = Object.keys(resolved.nodes)
+  const versionControl = createVersionControlBoundary(ctx, defineToolFn)
+  ctx.effect(() => () => versionControl.dispose())
 
   let skillStatus: { ready: true } | { ready: false; reason: string } = { ready: true }
   const registeredSkills = new Set<string>()
@@ -522,6 +533,9 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     // Preserve stricter child policy installed by setup or an earlier trusted hook.
     entry.mode = strictestSandboxMode([entry.mode, effective])
     if (effective !== entry.mode) enforceSandbox(agent.session, entry)
+    if (entry.versionControl) {
+      entry.versionControl.remove = versionControl.bind(agent as unknown as VersionAgent, entry.versionControl.parent as VersionAgent, entry.versionControl.parentCallId)
+    }
     entry.verified = true
     return undefined
   })
@@ -580,6 +594,9 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
      * 不改变角色、模型、工具限制或沙箱模式。
      */
     skill?: string
+    explicitVersionControl?: boolean
+    /** Trusted satellite_node callId of the parent's open invocation (wrapper closure). */
+    parentCallId?: string
     onStarted?: (execution: BaseExecution) => void
   }): Promise<
     { ok: true; result: SubagentResult | undefined; sandbox: SandboxReport } | { ok: false; error: string }
@@ -587,6 +604,9 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     const { roleName, label, task, exec } = params
     const role: RoleConfig | undefined = resolved.roles[roleName]
     if (!role) return { ok: false, error: `未配置角色：${roleName}` }
+    if (roleName === 'version-control' && (!params.explicitVersionControl || !versionControl.capable)) {
+      return { ok: false, error: 'version-control 仅支持显式同名基础节点，且必须有原生工具guard服务' }
+    }
     let effectiveSkill = role.skill
     if (params.skill !== undefined) {
       // 扩展声明的方法必须真的可见：拿不到目录或方法不在目录里都阻塞，
@@ -659,6 +679,7 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     const childId = randomUUID()
     const expectation: SandboxExpectation = {
       childId, parentSessionId: exec.agent.id, parentSession: exec.agent.session, mode, policy,
+      ...(params.explicitVersionControl ? { versionControl: { parent: exec.agent, ...(params.parentCallId !== undefined ? { parentCallId: params.parentCallId } : {}) } } : {}),
     }
     sandboxExpectations.set(childId, expectation)
 
@@ -670,7 +691,7 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
         label,
         request: {
           parent: exec.agent,
-          prompt: [{ type: 'text', text: buildPrompt({ task, skill: effectiveSkill, objective: role.objective }) }],
+          prompt: [{ type: 'text', text: buildPrompt({ task, skill: effectiveSkill, objective: role.objective, versionControl: params.explicitVersionControl }) }],
           ...(cwd ? { cwd } : {}),
           ...(agentOptions && capabilities.agentOptions ? { agentOptions } : {}),
           ...(role.persona && capabilities.persona ? { persona: role.persona } : {}),
@@ -682,6 +703,9 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
         signal: exec.signal,
         delivery: 'caller',
       })
+    } catch (error) {
+      expectation.versionControl?.remove?.()
+      throw error
     } finally {
       sandboxExpectations.delete(childId)
     }
@@ -706,7 +730,8 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
       return { ok: true, result, sandbox: report }
     } finally {
       // 已接受的子调用无论成功、失败还是取消都要释放。
-      await activation.dispose()
+      try { await activation.dispose() }
+      finally { expectation.versionControl?.remove?.() }
     }
   }
 
@@ -755,6 +780,7 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
         try {
           const outcome = await startRole({
             roleName: call.selection!.role,
+            ...(nodeId === 'version-control' ? { explicitVersionControl: true, ...(exec.callId !== undefined ? { parentCallId: exec.callId } : {}) } : {}),
             label,
             task: [
               String(args.task ?? ''),

@@ -57,8 +57,21 @@ install_bundle <解压后的 package 目录>
 | `validate` | 执行适用检查，报告证据与未测项 | 工作区写入 |
 | `review` | 独立审查当前改动 | 只读 |
 | `signoff` | 根据已有证据给出验收结论 | 只读 |
+| `version-control`（可选，无 tier） | 用户明确请求的本地5操作 | 读取只读，写入需工作区权限和真实逐次批准 |
 
-每次调用运行一个节点及其适用的前后扩展，不会自动串行执行全部六个节点。验证可能生成构建或测试产物，但不负责修复源码；验收不会自动修改代码，运行完成也不等于业务验收通过。
+七个节点是可用目录，不是默认流水线；`version-control` 不进入任何默认意图路径。每次调用运行一个节点及其适用的前后扩展，不会自动串行执行全部节点。验证可能生成构建或测试产物，但不负责修复源码；验收不会自动修改代码，运行完成也不等于业务验收通过。
+
+### 可选本地版本管理
+
+只有明确用户请求才选择 `satellite_node(node="version-control")`；不自动跟随 feature、验收或版本号修改。专用同名角色及 [方法技能](<node/skills/satellite-version-control/SKILL.md>) 仅可调用 `satellite_version_control` 和必要的 skill/提问/只读方法工具，真实 child scope guard 在开始前施加，拒绝 bash、编辑、解释器、PTC、脚本、网络、委派及衍生 scope；主会话和普通 child 不能直接调用本地工具。角色可在既有目录显示并配置模型路由，但普通配置不能改宽权限或绑定别的角色，无 tier。
+
+工具接收封闭 `request`：`status`、`diff`（working/staged）、`log`（HEAD 1–50）、`stage`（1–100明确文件）、`commit`（整个实际 index）。仓库相对于真实 child cwd，必须在有效父 workspace 内；无任意 flags/rev/remote 字段。每次写入绑定新鲜单次 snapshot、精确 argv、真实身份和 policy，并要求宿主 `allowed-once`，批准期间变化即拒绝。commit 覆盖已存在的全部暂存，不只是本次 stage 文件；不自动 stage/commit。失败可能返回 effect-unknown，必须先观察，不自动重试。
+
+禁止 fetch/pull/push/clone 等远程操作；不支持 tag/branch/reset/clean/amend/rebase/checkout/switch/restore/merge/stash 等。版本文本仍由 `implement` 修改，implementation 仍禁提交。缺服务只阻塞本功能，不借主会话服务或放宽沙箱。
+
+只支持 host-shared POSIX：child fs 必须证明 workspace/cwd 与固定 `/usr/bin/env`、`/usr/bin/git` 为同一宿主文件且进程路径不变，subprocess 与其共享执行世界；不明确、容器重映射或 Windows 拒绝。每进程强制 full 原生 confinement（读 read-only，写 workspace-write），不超过父权限；clean `env -i`，禁 hooks/filter/signing/extdiff/lazy fetch。普通惰性 origin 配置可读；仅 `[lfs] repositoryformatversion = 0` 可接受，filter lfs/attributes 驱动仍拒绝。
+
+**DSH child 固定 approval=never，本插件不修改它；stage/commit 改由受信运行时在父会话当前开放的显式 `satellite_node` 调用内另建父拥有操作：审批、沙箱、子进程、cwd 与策略都取自父作用域，父须重新观察并与子快照一致，取得宿主逐次 `allowed-once` 后、最终 confine 之后再次复核才执行。父为只读/never/无应答者即拒绝。** 主会话仍无 git/shell 工具；读操作仍用 child 服务。仓库扫描包括 ignored 文件，限2万项/64 MiB/单文件8 MiB，拒绝 symlink/hardlink、worktree/submodule/partial-clone/alternates/shallow 等；含依赖/缓存的项目可能受限。真实 commit 仅在临时 fixture 仓库以模拟服务测试；不等于 live-host 批准或隔离实测。完整限制见 [服务条件](<node/skills/satellite-version-control/references/limits.md>)。不承诺恶意宿主或外部最后瞬间竞态的完全隔离。
 
 ### 等待确认与恢复
 
@@ -114,7 +127,7 @@ install_bundle <解压后的 package 目录>
 - `selection` 表示本次选定的角色与档位；`execution` 表示已通过创建边界的基础角色及向后端请求的显式模型路由，不是从子会话读回的模型实测值。前置暂停或创建前拒绝可以只有选择、没有执行；启动也不等于业务完成或验收通过。
 - 同一暂停调用冻结档位和角色。`resume` 时可省略 `tier` 以继承原选择，不能改变它；需要改档时发起新的有界节点调用，并在任务包中携带触发改档的证据。after 恢复复用原基础结果，不把新的模型设置当作上次已执行的模型。
 
-部署可通过 `nodes.<node>.tierRoles` 为任意节点显式配置角色映射，支持 `light`、`standard`、`senior`、`critical` 四个档位名；提供的映射整体替换该节点默认映射，空对象可禁用显式档位。已有 `nodes.<node>.role` 覆盖会移除隐含的内置档位映射，避免绕过自定义角色；需要档位时须同时显式配置映射。角色定义、方法与文件沙箱仍归 `roles`，模型覆盖仍只走 `routes`。
+除保留的 `version-control` 节点外，部署可通过 `nodes.<node>.tierRoles` 为节点显式配置角色映射，支持 `light`、`standard`、`senior`、`critical` 四个档位名；提供的映射整体替换该节点默认映射，空对象可禁用显式档位。已有 `nodes.<node>.role` 覆盖会移除隐含的内置档位映射，避免绕过自定义角色；需要档位时须同时显式配置映射。角色定义、方法与文件沙箱仍归 `roles`，模型覆盖仍只走 `routes`。
 
 新增角色的代码默认路由复制对应基础角色的既有默认 `agentOptions`，不为 Senior/Critical 另选“更强”的模型；各角色运行时仍只匹配自己的 `routes` 条目，不自动继承用户给基础角色的覆盖。模型相同不意味着职责相同，模型不同也不等于获得专项能力。
 
@@ -208,6 +221,33 @@ routes:
 
 设备操作应先发现目标并取得观测 id；安装、启动、旅程和采集会使用该 id 复核设备，不接受仅凭 serial 执行。
 工具复用 Harness 的批准机制，遇到拒绝或权限不足时不会绕过。
+
+### 专项技能（按需）
+
+Android 组件共加载 12 个方法技能。**5 个**是既有只读扩展使用的方法技能，由**6 条**扩展绑定触发；其中 `validate.before` 与 `context.before` 共用 `android-validation-context`，因此不是 6 个独立技能。另 **7 个**是本次新增的按需专项技能，不新增角色、插槽或扩展绑定，供现有调查、方案、实施、审查、验证与验收节点在任务需要时显式调用。
+
+| 触发位置 | 既有只读扩展 | 方法技能 |
+| --- | --- | --- |
+| `validate.before` | `android.validation-context` | `android-validation-context` |
+| `context.before` | `android.project-context` | `android-validation-context` |
+| `solution.before` | `android.design-context` | `android-design-handoff` |
+| `review.after` | `android.platform-review` | `android-change-review` |
+| `validate.after` | `android.validation-evidence` | `android-validation-evidence` |
+| `signoff.before` | `android.acceptance-evidence` | `android-acceptance-evidence` |
+
+按需专项技能：
+
+| 技能 | 适用场景 | 主要边界 |
+| --- | --- | --- |
+| `android-compose-performance` | Compose 重组、布局、绘制、懒列表、动画和线程开销 | 先有 release 构建的帧/跟踪证据；重组计数与静态推断不算基准 |
+| `android-anr-diagnostics` | 静态 ANR 风险审计与 ANR trace 诊断 | 静态结果只是候选；没有 dump/日志不声称 ANR 已发生 |
+| `android-permissions-security` | manifest、导出组件、URI 授权、Binder 调用方和运行时权限 | 静态风险不等于可利用；不接触签名密钥或凭据 |
+| `android-kotlin-concurrency` | 协程作用域、取消、阻塞边界、Flow 状态/事件与 replay | 不运行 Gradle；消费者/事件契约未定时先停下要决定 |
+| `android-compose-state-effects` | 本地状态、状态提升、屏幕 seam、effect 生命周期与一次性事件 | 审查不虚构 owner；焦点导航不在本技能范围 |
+| `android-compose-ui-testing` | Compose UI 测试选层、语义断言、交互态和截图证据 | 不执行测试或 Gradle；写了测试不等于已通过 |
+| `android-performance-analysis` | 已有 Perfetto trace 的完整性检查、triage、PerfettoSQL、线程状态预算与依赖链归因 | 只分析已有 trace；不录制、不下载工具、不起子代理 |
+
+这些技能是方法指导：调查和审查默认只读，实施只在当前授权单元内修改，执行与测量归对应验证节点；**无授权不执行**构建、设备、外部脚本或发布，风险静态推断不得写成实测结论。
 
 Android CLI 与 Gradle 的用户目录定向到会话工作区内的 `.satellite/`，可能产生缓存和构建文件。
 启动的模拟器由当前会话管理，可显式停止；会话作用域退出或插件卸载时也会清理，但不保证 Host 崩溃后的清理，也不提供跨进程设备独占。

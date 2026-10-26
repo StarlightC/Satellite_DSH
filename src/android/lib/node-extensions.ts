@@ -382,4 +382,11 @@ export const ANDROID_SKILL_NAMES: readonly string[] = Object.freeze([
   'android-change-review',
   'android-validation-evidence',
   'android-acceptance-evidence',
+  'android-compose-performance',
+  'android-anr-diagnostics',
+  'android-permissions-security',
+  'android-kotlin-concurrency',
+  'android-compose-state-effects',
+  'android-compose-ui-testing',
+  'android-performance-analysis',
 ])
