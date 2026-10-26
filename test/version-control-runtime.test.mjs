@@ -28,7 +28,12 @@ async function fixture(t) {
   for (const name of [...methods, ...denied]) ctx.tools.register(simple(name))
   const parent = await realpath(tmpdir()), root = await mkdtemp(join(parent, 'satellite-vc-runtime-'))
   assert.equal(await realpath(root), root)
-  execFileSync('/usr/bin/git', ['init', '--quiet', root], { env: { PATH: '/usr/bin:/bin', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } })
+  const cleanGitEnv = { PATH: '/usr/bin:/bin', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }
+  execFileSync('/usr/bin/git', ['init', '--quiet', root], { env: cleanGitEnv })
+  // The runtime runs Git under env -i with no global/system config, so the fixture must
+  // carry its own identity instead of relying on whatever the host or CI happens to have.
+  execFileSync('/usr/bin/git', ['config', 'user.name', 'Fixture'], { cwd: root, env: cleanGitEnv })
+  execFileSync('/usr/bin/git', ['config', 'user.email', 'fixture@example.invalid'], { cwd: root, env: cleanGitEnv })
   await writeFile(join(root, 'x'), 'test\n')
   const services = {
     workingDirectory: { ensure: async () => root },
@@ -277,6 +282,8 @@ test('handoff: host allowed-once executes the frozen stage+commit with parent sc
   const committed = await h.f.call(LOCAL, h.child, { request: { action: 'commit', repo: '.', message: 'fixture', expectedSnapshot: commitSnap.expectedSnapshot } })
   assert.equal(committed.value.status, 'succeeded', JSON.stringify(committed))
   assert.match(git(h.f.root, 'log', '--format=%s', '-1'), /fixture/)
+  // Provenance: the commit uses the fixture-local identity, never an ambient one.
+  assert.equal(git(h.f.root, 'log', '--format=%an <%ae>|%cn <%ce>', '-1').trim(), 'Fixture <fixture@example.invalid>|Fixture <fixture@example.invalid>')
   assert.equal(writeSpawns(h.tagged.child).length, 0)
 })
 
