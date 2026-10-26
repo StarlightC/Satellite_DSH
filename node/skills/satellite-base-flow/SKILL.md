@@ -12,6 +12,11 @@ and user decisions, and decides the next node. A delegated executor completes on
 its assigned node and returns; it does not call this flow recursively. Validation
 executors use `satellite-validation`, not this orchestration skill.
 
+The main session coordinates: delegate concrete investigation, file changes,
+execution, review, and validation through `satellite_node`, and resume paused
+nodes with their token. Do not substitute `subagent`, `subagent_fork`,
+`workflow`, or generic `send_message`.
+
 The base flow is one entry with stable nodes. Before and after each node, the
 `satellite_node` tool checks the public slots and runs the extensions that
 apply. You never call a slot yourself, and no argument skips the checks.
