@@ -4,9 +4,14 @@ Parent-side reference for [the public base flow](../SKILL.md). Read it when a ta
 needs its node order, when the right specialist method is not obvious, when a report
 has to be graded, or when a component looks unavailable.
 
-The orders below are a recommendation for the parent that selects nodes. An executor
-completes its assigned node and stops; it never re-orders this flow, calls a node on
-its own, or turns the order into a scheduler.
+The orders below are recommendations, not fixed pipelines. The seven available
+nodes include optional `version-control`, selected only by explicit user request. Reuse
+sufficient context and select only necessary work: a simple version/wording/value
+edit can use implement + targeted checks, without mechanical context → solution →
+review → full validate. Dependency or script changes are not pure version edits.
+Agreed necessary review, mandatory slots and approval cannot be skipped; avoiding
+repeat execution is not removing an obligation. An executor completes its assigned
+node and stops; it never re-orders this flow or calls a node on its own.
 
 ## The ten intents
 
@@ -20,7 +25,7 @@ its own, or turns the order into a scheduler.
 | project-health | context → review → signoff | a bounded inspection surface and its evidence | read-only; never auto-fix |
 | current-change-analysis | context → review | the exact diff, its baseline, and its direct consumers | read-only conclusion |
 | review-and-plan | context → review → solution | the current diff and the confirmed problems in it | hand the plan back for a decision; do not continue into implementation |
-| commit | the commit method only, when one is declared; no commit node | separate, explicit authorization naming the exact files and history operation | never runs as an implicit part of another intent, and never without that authorization |
+| commit / version-control | optional `version-control`, only when explicitly requested by the user and available | exact repository, files/index scope and operation; fresh host approval for writes | never appended to feature or other intents by default; no remote operation |
 | release-preparation | context → review/validate as needed → signoff | the release goal and the readiness matrix that applies | readiness conclusion only; no signing, upload, tag, or publish |
 
 Per-intent notes:
@@ -41,9 +46,10 @@ Per-intent notes:
   it does not stage or commit anything to make the change easier to read.
 - **review-and-plan** — ends at a reviewable plan. The user decides whether it is
   implemented.
-- **commit** — the method exists to record intent and boundaries. It runs only with
-  explicit authorization and an exact file/history scope, and it is never implied by
-  finishing another intent.
+- **commit / version-control** — an optional local node, not a default tail of any
+  intent. Only an explicit user request selects it; method text does not make an
+  unavailable node callable. Exact scope and fresh host approval are required for
+  each write; prior evidence or authorization is not reusable approval.
 - **release-preparation** — collects the goal, checks the applicable readiness
   matrix, and reports readiness and blockers. Publishing is a separate decision.
 
@@ -105,8 +111,10 @@ collapsing them into "does not work":
 4. **Call actually usable** — a real invocation under the caller's own policy,
    approval, and execution world succeeds.
 
-Diagnosis defaults to read-only: use the available configuration and capability
-queries first. Do not spend a paid model call or start a device side effect only to
+Before side effects, check tools, services, routes and permissions with read-only
+configuration/capability queries. If availability cannot be established, report the
+gap rather than probing with a write. Diagnosis defaults to read-only: use the
+available configuration and capability queries first. Do not spend a paid model call or start a device side effect only to
 find out whether something is mounted, and do not add a resident diagnostic database.
 A successful lookup at one layer is not evidence for the next: "config present" does
 not mean "call usable", and a listed plugin is not a working capability.

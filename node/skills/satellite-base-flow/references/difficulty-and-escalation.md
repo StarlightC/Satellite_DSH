@@ -32,8 +32,9 @@ validation, scope changes, or a user report that the issue remains.
 Critical work does not automatically require Senior or Critical implementation.
 Split safely separable outcomes with clear ownership, interfaces, and merge order;
 choose the lightest safe role for each unit while retaining the whole task's risk
-checks. Review and validate each unit before dependent implementation. Separate
-files alone do not establish safe parallel work.
+checks. Complete each unit's necessary review and validation before dependent
+implementation; this does not require repeating unchanged evidence or full
+validation for every small unit. Separate files alone do not establish safe parallel work.
 
 ## Four role-tier responsibilities
 
@@ -49,6 +50,22 @@ These are method responsibilities, not model names or permission levels.
 A lower tier must still run the checks that are actually necessary for its unit.
 "Light" limits the scope and ambiguity of the role, not the safety obligations that
 the task already has.
+
+## Proportional execution and evidence reuse
+
+Difficulty selects necessary obligations, not a mandatory tour of every node. With
+sufficient current context, simple version/wording/value edits can use implement +
+targeted checks; dependency and script changes require their actual impact checks.
+Do not mechanically repeat context, solution, review or full validation. Do retain
+any agreed necessary review, forced slots and approval: duplicate execution and an
+outstanding obligation are different things. Check tool/service/route/permission
+availability without side effects before planning an execution that depends on it.
+
+Reuse evidence only with its source, revision or digest, covered scope, exact
+command, relevant environment and untested items recorded, and only while all
+relevant inputs are unchanged. Changed inputs invalidate the affected coverage,
+not necessarily unrelated checks. Evidence reuse never reuses authorization or
+host approval. See [the evidence record](../../satellite-validation/references/evidence-record.md).
 
 ## Evidence-based rubric
 
