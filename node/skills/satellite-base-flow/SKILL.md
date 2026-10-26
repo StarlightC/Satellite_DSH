@@ -46,12 +46,15 @@ tables in the task packet.
 
 ## Difficulty and reassignment
 
-Before choosing implementation, review, or validation roles, or when new evidence
+Before choosing a solution, implementation, or review role, or when new evidence
 changes risk or a blocker repeats, read
 [the difficulty and escalation method](references/difficulty-and-escalation.md).
-Keep whole-task execution difficulty separate from the node's optional `tier`;
-carry the reasons and failed-attempt history in the existing bounded task packet.
-This is an Agent judgment/reporting method, not an automatic scoring or retry engine.
+Only `solution`, `implement`, and `review` have default role tiers;
+`context`, `validate`, and `signoff` are called without `tier` unless a deployment
+adds its own mapping. Keep whole-task execution difficulty separate from the node's
+optional `tier`; carry the reasons and failed-attempt history in the existing bounded
+task packet. This is an Agent judgment/reporting method, not an automatic scoring or
+retry engine.
 
 ## Rules that do not change per project
 

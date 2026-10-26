@@ -30,15 +30,17 @@ run that failed, was blocked, or was only partial, read
 [the evidence record reference](references/evidence-record.md).
 
 Report failures without fixing them or weakening assertions. Distinguish code
-failures from environment/permission blocks, and list checks not run. Light
-validation is local partial evidence: do not silently replace required integration,
-device, security or visual checks with it.
+failures from environment/permission blocks, and list checks not run. A validation
+step is bounded evidence: do not silently replace required integration, device,
+security or visual checks with a narrower local check.
 
-On repeated same-cause failures or unresolved rework at Standard, or an unclear
-failure after one bounded retry, report the prior evidence and recommend Senior or
-the relevant specialist to the parent. Do not self-delegate or rerun deterministic
-failures without a changed hypothesis. At most one clearly transient environment
-retry is appropriate; never retry a denied approval as a workaround. An unavailable
+`validate` has no default role tier. On repeated same-cause failures or unresolved
+rework, report the prior evidence and keep the failure; do not rerun a deterministic
+failure without a changed hypothesis. The parent decides whether the task difficulty,
+a later implementation/review assignment, the required checks, or a specialist
+method should change. A validation failure alone does not select a stronger model or
+create a validation tier. At most one clearly transient environment retry is
+appropriate; never retry a denied approval as a workaround. An unavailable
 higher/specialist assignment is a capability gap, not permission to claim success.
 Hand back what was verified, what failed, and what remains unverified; the parent
 decides reassignment, further checks and acceptance.

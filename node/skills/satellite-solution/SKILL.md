@@ -15,6 +15,24 @@ Restate the bounded facts the plan rests on, each with its exact location, and
 say which of them came from `context` and which you checked yourself. A plan built
 on unstated facts cannot be reviewed.
 
+## Role tier responsibilities
+
+When the `solution` node is called with a role tier, the method stays the same while
+the depth and scope change. These are responsibilities, not model names or permission
+levels.
+
+| Tier | Responsibility |
+| --- | --- |
+| light | Shape a local, low-ambiguity option with a clear boundary. State the local facts and the impact left unexamined; do not skip a safety or compatibility check that is actually required. If the scope stops being local or ambiguous, stop and hand back. |
+| standard | Solve the conventional case and check the complete impact against the real consumers, constraints, and existing checks. |
+| senior | Work through cross-module coupling, complex constraints, or existing failure evidence. Recheck the prior evidence, do not repeat a rejected assumption, and return the unresolved gap rather than looping. |
+| critical | Re-examine the problem's core assumptions and construct counterexamples. Pursue a stubborn issue in depth, but do not require every decision to be irreversible and do not force a negative conclusion. With sufficient evidence, a Critical plan may pass; with none, stop and request a decision. |
+
+The tier does not grant file writes or bypass a required review. This node remains
+read-only in every tier. Solution does not use implementation's three-attempt
+budget: change tiers only when the evidence changes the ambiguity, coupling, or
+required checks, and a Critical dead end stops for a decision rather than looping.
+
 ## Reuse evidence
 
 When the task involves an existing shared surface, consume the bounded reuse query

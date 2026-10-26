@@ -28,14 +28,32 @@ When the change spans several kinds of surface — code, configuration or schema
 skills and public assets, tests — or when it is unclear what a surface has to prove,
 read [the review scopes reference](references/review-scopes.md).
 
+## Role tier responsibilities
+
+The tier changes the depth and scope of the same read-only review method. It does
+not grant write access, special tools, or a stronger conclusion by itself.
+
+| Tier | Responsibility |
+| --- | --- |
+| light | Review a local, low-ambiguity change with a clear boundary and direct consumers. State the local evidence and the impact left unexamined; keep any safety check the change actually requires. If evidence leaves that local scope, hand back instead of calling it a whole-change pass. |
+| standard | Review conventional work and check the complete impact against the real diff, its consumers, and the touched surfaces. |
+| senior | Review cross-module coupling, complex constraints, or a change with existing failure evidence. Recheck the prior findings and avoid repeating a rejected judgment; return what remains unresolved. |
+| critical | Re-examine the change's core assumptions and construct counterexamples. Pursue a stubborn issue in depth without treating high risk or total irreversibility as a requirement. With sufficient evidence, a Critical review may pass; when it remains unresolved, stop and request a decision. |
+
 ## Repeated findings and tier limits
 
-Compare inherited findings with current evidence, not just the latest report. A
-Light review needs Standard reassessment after the first unresolved rework cycle,
-repeated missing-context/changes requests, or a second failure on the same objective.
-Standard review needs Senior or a relevant specialist when rework remains repeatedly
-unresolved, or an unclear failure remains after one bounded retry. Senior review
-gets at most one unresolved bounded rework cycle before specialist/user direction.
+Compare inherited findings with current evidence, not just the latest report. Solution
+and review do not use implementation's three-attempt budget; move between their tiers
+only when the evidence changes ambiguity, coupling, or required checks.
+
+- A Light review whose local finding remains unresolved after a rework, or whose
+  evidence leaves the local scope, needs Standard review.
+- A Standard review whose findings remain repeated or unresolved after a bounded
+  retry needs Senior review or the relevant specialist.
+- A Senior review that remains unresolved after a bounded rework cycle moves to
+  Critical, a specialist, or user direction according to what the evidence shows.
+- A Critical review that remains unresolved stops with the unresolved gap and asks
+  for a decision; do not loop or invent a specialist.
 
 Report the recurring finding, prior evidence, what remains uncertain and the
 smallest needed assignment. Do not self-delegate, fix source, or keep retrying the
