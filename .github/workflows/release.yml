@@ -14,7 +14,8 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Keep release verification on the same pinned image as check.yml.
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -25,6 +26,19 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Verify trusted POSIX toolchain
+        run: |
+          node --input-type=module <<'DIAGNOSTICS'
+          import { lstat, realpath } from 'node:fs/promises'
+          for (const path of ['/usr/bin/env', '/usr/bin/git']) {
+            const stat = await lstat(path)
+            const resolved = await realpath(path)
+            console.log(JSON.stringify({ path, resolved, symlink: stat.isSymbolicLink(), regularFile: stat.isFile() }))
+            if (!stat.isFile() || stat.isSymbolicLink() || resolved !== path) {
+              throw new Error(`Local Git requires a canonical regular executable: ${path} -> ${resolved}`)
+            }
+          }
+          DIAGNOSTICS
       - name: Verify tag belongs to source
         run: |
           git fetch origin source

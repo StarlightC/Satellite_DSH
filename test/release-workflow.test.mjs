@@ -4,6 +4,22 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 
 const workflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8')
+const checkWorkflow = readFileSync(new URL('../.github/workflows/check.yml', import.meta.url), 'utf8')
+
+test('check and release pin the same POSIX image and diagnose executable identity before install', () => {
+  const diagnostic = text => text.match(/node --input-type=module <<'DIAGNOSTICS'\n([\s\S]*?)\n          DIAGNOSTICS/)?.[1]
+  for (const text of [checkWorkflow, workflow]) {
+    assert.match(text, /runs-on: ubuntu-24\.04\s/)
+    assert.doesNotMatch(text, /runs-on: ubuntu-latest/)
+    assert.ok(text.indexOf('Verify trusted POSIX toolchain') < text.indexOf('run: npm ci'))
+    const script = diagnostic(text)
+    assert.ok(script)
+    assert.ok(script.includes("['/usr/bin/env', '/usr/bin/git']"))
+    assert.ok(script.includes('!stat.isFile() || stat.isSymbolicLink() || resolved !== path'))
+    assert.ok(script.includes('console.log(JSON.stringify('))
+  }
+  assert.equal(diagnostic(checkWorkflow), diagnostic(workflow))
+})
 const scripts = [...workflow.matchAll(/node --input-type=module <<'JS'\n([\s\S]*?)\n          JS/g)]
   .map(match => match[1].replace(/^          /gm, '').replace(/^import .*$/gm, ''))
 
