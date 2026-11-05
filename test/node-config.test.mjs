@@ -463,3 +463,20 @@ test('新增角色默认路由唯一且 sparse overrides 不冻结或丢失新�
   assert.equal(config.routes.get().length, 1)
   assert.equal(effectiveAgentOptions({ role: normalized.roles.implementation, roleName: 'implementation', routes: config.routes.get() }).model, 'deepseek-flash')
 })
+
+test('role toolFilter is validated before assembly: plain object, allow/deny string arrays', () => {
+  const bad = [
+    [], 'read', { allow: 'read' }, { allow: [1] }, { allow: [''] }, { allow: ['a b'] },
+    { allow: [] }, { deny: ['read', 'read'] }, { allow: ['read'], extra: true }, Object.create({ allow: ['read'] }),
+  ]
+  for (const toolFilter of bad) {
+    assert.throws(() => normalizeConfig({ roles: { custom: { skill: 'x', toolFilter } } }), /toolFilter/, JSON.stringify(toolFilter))
+  }
+  assert.throws(() => normalizeConfig({ roles: { custom: 'not-an-object' } }), /roles\.custom/)
+  // Unknown (scope-local or not yet loaded) names are legal; deny [] adds nothing.
+  const ok = normalizeConfig({ roles: { custom: { skill: 'x', toolFilter: { allow: ['scope_local_tool', 'read'], deny: [] } } } })
+  assert.deepEqual(ok.roles.custom.toolFilter, { allow: ['scope_local_tool', 'read'], deny: [] })
+  // An explicit undefined keeps the built-in default instead of silently widening.
+  const kept = normalizeConfig({ roles: { investigation: { toolFilter: undefined } } })
+  assert.deepEqual(kept.roles.investigation.toolFilter, { deny: ['satellite_node', 'edit', 'write'] })
+})

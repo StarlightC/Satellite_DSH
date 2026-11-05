@@ -165,8 +165,16 @@ test('policy is resolved again at write time rather than reusing initial permiss
   assert.equal(f.writes.length, 0)
 })
 
+/** Target-source host contracts the node row checks before registering anything. */
+function hostContracts(f) {
+  f.services.subagents = { rootOf: () => undefined, startActivation: async () => ({}) }
+  f.ctx.tools.guard = () => () => {}
+  f.ctx.on = () => () => {}
+}
+
 test('core apply validates builtin role options before registering any operation', () => {
   const f = setup()
+  hostContracts(f)
   assert.throws(() => applyNode(f.ctx, { roles: { validation: { agentOptions: { provider: 'unapproved', model: 'override' } } } }), /routes/)
   assert.equal(f.tools.size, 0)
   assert.equal(f.disposers.length, 0)
@@ -179,7 +187,7 @@ test('core real apply mounts node, read-only role service, generic query, script
   // Direct apply must provide the native contracts declared by node.inject.
   f.services.agents = { roots: () => [] }
   f.services.systemPrompt = { section: () => () => {} }
-  f.ctx.tools.guard = () => () => {}
+  hostContracts(f)
   applyNode({
     ...f.ctx,
     plugin(plugin, options) { const fiber = owner.plugin(plugin, options); fibers.push(fiber); return fiber },

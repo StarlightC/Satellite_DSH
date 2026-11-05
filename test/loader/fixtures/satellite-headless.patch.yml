@@ -1,0 +1,59 @@
+# Test-only overlay over the real headless profile layers (dsh-base +
+# dsh-headless) plus the Satellite bundle layer. It owns only the keyless model
+# route, the deterministic approval answerer, isolated persistence, and turning
+# off the one-shot CLI driver so the test drives the configured root agent.
+- id: headless-startup
+  disabled: true
+
+- id: headless-runner
+  disabled: true
+
+- id: llm-deepseek
+  disabled: true
+
+- id: session-log-deepseek
+  config:
+    enabled: false
+
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-v4-pro
+
+- id: agent-loop
+  config:
+    agents:
+      - id: main
+        provider: deepseek-official
+        model: deepseek-v4-pro
+        cwd: !!js process.cwd()
+
+# Persistence keeps the base row's production root `dshHomePath('sessions')`
+# (the temporary DSH_HOME, outside the Git repo the test uses as cwd); only
+# the physical encoding is overridden so the test can read the JSONL logs.
+- id: session-persistence-jsonl
+  config:
+    root: !!js dshHomePath('sessions')
+    compression: none
+
+- id: sandbox-policy
+  inject: []
+  config:
+    mode: workspace-write
+    workspaceRoot: !!js process.cwd()
+
+- insert:
+    # A second real native delegation row under a non-default alias with depth 3,
+    # so a role child (depth 1) could start a grandchild if Satellite let it.
+    - id: satellite-test-delegate-task
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: delegate_task
+        maxDepth: 3
+    - id: satellite-scripted-llm
+      name: './scripted-llm.mjs'
+    - id: satellite-approval-answerer
+      name: './approval-answerer.mjs'
+    - id: satellite-lifecycle-probe
+      name: './lifecycle-probe.mjs'

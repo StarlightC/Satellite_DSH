@@ -1,4 +1,5 @@
 /** Trusted execution identity bridge. No model/fact field can mint membership. */
+import { symbols } from '@deepseek-ai/cordis'
 import type { defineTool, ToolGuard } from '@deepseek-ai/dsh-tools'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { createLocalVersionControl, type LocalGitDependencies } from './version-control.ts'
@@ -29,6 +30,8 @@ interface Member {
   /** Exact delegating parent, bound by the trusted node runtime closure (never model args). */
   parent: VersionAgent
   parentCallId?: string
+  /** Private delegation record check (exact child/parent live, record active, call not cancelled). */
+  delegated: () => boolean
   active: boolean
   remove: () => void
   kernel?: ReturnType<typeof createLocalVersionControl>
@@ -62,6 +65,31 @@ function scopeServices(agent: VersionAgent, label: string): Services {
   return v
 }
 const allowed = new Set(VERSION_CONTROL_TOOLS)
+/**
+ * Cordis 4 `ctx.get` returns a fresh traceable proxy per call, so service
+ * identity is the proxied target (`symbols.original`), not the proxy.
+ */
+const serviceTarget = (value: unknown): unknown =>
+  value && (typeof value === 'object' || typeof value === 'function')
+    ? (value as Record<symbol, unknown>)[symbols.original] ?? value
+    : value
+
+/**
+ * Auxiliary only: exact live child and parent resolve to the same live subagent
+ * tree. It never replaces the private direct-parent delegation record.
+ */
+function sameLiveTree(ctx: ScopeContext, agent: VersionAgent, parent: VersionAgent): boolean {
+  const agents = ctx.get('agents') as { get(id: string): unknown } | undefined
+  const subagents = ctx.get('subagents') as { rootOf(caller: object): unknown } | undefined
+  if (!agents || typeof agents.get !== 'function' || !subagents || typeof subagents.rootOf !== 'function') return false
+  if (agents.get(agent.id) !== agent || agents.get(parent.id) !== parent) return false
+  try {
+    const root = subagents.rootOf(parent)
+    return root !== undefined && subagents.rootOf(agent) === root
+  } catch {
+    return false
+  }
+}
 
 /** Called by the node runtime, bound to its private creation reservation. */
 export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: typeof defineTool) {
@@ -105,7 +133,7 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
     async execute(args, exec) {
       try {
         const member = exec.agent && members.get(exec.agent)
-        if (!member || !member.active || disposed) deny('active version-control execution identity required')
+        if (!member || !member.active || disposed || !member.delegated()) deny('active version-control execution identity required')
         if (Reflect.ownKeys(args).some(key => key !== 'request')) deny('unknown tool field')
         const request = parseGitRequest(args.request) // independent of host schema validation
         const agent = member.agent
@@ -113,7 +141,8 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
         const child = scopeServices(agent, 'child')
         const boundSession = agent.session
         const live = (): void => {
-          if (disposed || !member.active || members.get(agent) !== member || agent.session !== boundSession) deny('execution identity ended or changed')
+          if (disposed || !member.active || members.get(agent) !== member || agent.session !== boundSession
+            || !member.delegated()) deny('execution identity ended or changed')
         }
         // Resolve, per call, a scope-pinned policy reader + adapters for ONE agent.
         const prepare = async (who: VersionAgent, s: Services, label: string) => {
@@ -121,7 +150,7 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
           const policy = (): Policy => {
             live()
             if (who.session !== session) deny(`${label} session changed`)
-            for (const name of SERVICES) if (who.ctx.get(name) !== s[name]) deny(`${label} scope service changed: ${name}`)
+            for (const name of SERVICES) if (serviceTarget(who.ctx.get(name)) !== serviceTarget(s[name])) deny(`${label} scope service changed: ${name}`)
             const p = s.sandboxPolicy.resolve({ session: who.session })
             if (!p || !['read-only', 'workspace-write'].includes(p.mode) || p.sessionId !== who.id
               || !isAbsolute(p.workspaceRoot) || who.session.header.id !== who.id) deny(`${label} session policy unavailable or mismatched`)
@@ -176,8 +205,7 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
         // caller of this explicit satellite_node invocation; every service (approval,
         // sandbox, subprocess, cwd, policy, fs) comes from the PARENT's own scope.
         const parent = member.parent, childKernel = member.kernel
-        const agents = ctx.get('agents') as { get(id: string): unknown; isOwnedBy(id: string, owner: object): boolean } | undefined
-        if (!agents || typeof agents.isOwnedBy !== 'function' || agents.get(agent.id) !== agent || !agents.isOwnedBy(agent.id, parent)) deny('parent/child ownership unavailable or mismatched')
+        if (!member.delegated() || !sameLiveTree(ctx, agent, parent)) deny('parent/child delegation unavailable or mismatched')
         const parentPrepared = await prepare(parent, scopeServices(parent, 'parent'), 'parent')
         if (parentPrepared.p.workspaceRoot !== p.workspaceRoot || parentPrepared.cwd !== cwd) deny('parent and child workspace differ')
         const parentKernel = createLocalVersionControl({
@@ -197,29 +225,30 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
   // Monotonic gate also covers a same-name scoped replacement and ordinary children.
   const removeGlobal = capable ? ctx.tools.guard!(exec => {
     if (exec.name !== NAME) return undefined
-    if (!exec.agent || !members.get(exec.agent)?.active || disposed) return 'Satellite: active version-control execution identity required'
+    const member = exec.agent && members.get(exec.agent)
+    if (!member || !member.active || disposed || !member.delegated()) return 'Satellite: active version-control execution identity required'
     if (ctx.tools.get!(NAME, exec.agent) !== tool) return 'Satellite: version-control tool shadowed'
     return undefined
   }) : () => {}
   const removeTool = ctx.tools.register!(tool)
   return {
     capable,
-    bind(agent: VersionAgent, parent: VersionAgent, parentCallId?: string): () => void {
+    bind(agent: VersionAgent, parent: VersionAgent, parentCallId: string | undefined, delegated: () => boolean): () => void {
       if (!capable || disposed || !agent.ctx || typeof agent.ctx.get !== 'function' || typeof agent.ctx.effect !== 'function') deny('child scope guard service unavailable')
       const childTools = agent.ctx.get('tools') as Tools | undefined
       if (!childTools || typeof childTools.guard !== 'function' || typeof childTools.get !== 'function') deny('child scope guard service unavailable')
-      const agents = ctx.get('agents') as { get(id: string): unknown; isOwnedBy(id: string, owner: object): boolean } | undefined
-      if (!agents || typeof agents.get !== 'function' || typeof agents.isOwnedBy !== 'function'
-        || agents.get(agent.id) !== agent || !agents.isOwnedBy(agent.id, parent)) deny('runtime child ownership unavailable or mismatched')
+      // Bound during receipt preparation, before the record activates: the record is
+      // checked live at every use, while same-tree is an exact-live auxiliary check now.
+      if (!sameLiveTree(ctx, agent, parent)) deny('runtime child tree unavailable or mismatched')
       // Freeze canonical allowed definitions at creation; a scoped replacement cannot
       // turn a read/skill/question name into an alternate execution entry afterwards.
       const definitions = new Map(VERSION_CONTROL_TOOLS.map(name => [name, ctx.tools.get!(name, agent)]))
       if (definitions.get(NAME) !== tool) deny('version-control tool shadowed at creation')
-      const member: Member = { agent, parent, ...(parentCallId !== undefined ? { parentCallId } : {}), active: true, remove: () => {} }
+      const member: Member = { agent, parent, ...(parentCallId !== undefined ? { parentCallId } : {}), delegated, active: true, remove: () => {} }
       members.set(agent, member)
       try {
         member.remove = childTools.guard(exec => {
-          if (!member.active || disposed || exec.agent !== agent) return 'Satellite: version-control descendant/derived or ended scope denied'
+          if (!member.active || disposed || exec.agent !== agent || !member.delegated()) return 'Satellite: version-control descendant/derived or ended scope denied'
           if (exec.parent || !allowed.has(exec.name)) return 'Satellite: version-control permits only its fixed direct method tools'
           if (ctx.tools.get!(exec.name, agent) !== definitions.get(exec.name)) return 'Satellite: version-control method tool shadowed'
           return undefined

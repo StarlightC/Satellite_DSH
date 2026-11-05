@@ -1,12 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import { readFile } from 'node:fs/promises'
 
 import { BUILTIN_ROLE_NAMES, BUILTIN_ROUTES, DEFAULT_CONFIG } from '../lib/node/lib/config.js'
 import { Config } from '../lib/node/index.js'
 
 const packageDir = new URL('../', import.meta.url)
+const ROOT = fileURLToPath(packageDir)
 const pkg = JSON.parse(await readFile(new URL('package.json', packageDir), 'utf8'))
 
 /** 发布脚本用到的生命周期钩子：一个都不允许出现（它们能触发 git 依赖准备与隐式构建）。 */
@@ -37,7 +40,7 @@ test('发布质量门：scripts 不含任何生命周期钩子', () => {
   for (const hook of LIFECYCLE_HOOKS) {
     assert.equal(pkg.scripts?.[hook], undefined, `${hook} 不在允许的发布形态里`)
   }
-  assert.deepEqual(Object.keys(pkg.scripts ?? {}).sort(), ['build', 'test', 'typecheck'])
+  assert.deepEqual(Object.keys(pkg.scripts ?? {}).sort(), ['build', 'test', 'test:loader', 'typecheck'])
 })
 
 test('发布质量门：main / exports / dsh.bundle.patch 指向的文件真实存在', () => {
@@ -68,7 +71,14 @@ test('发布质量门：files 含 lib 与包内资源，且每个条目在磁盘
 test('发布质量门：不声明 dependencies，@deepseek-ai/* 走 peer 区间 + dev 钉版', () => {
   assert.equal(pkg.dependencies, undefined, '@deepseek-ai/* 由 Host 提供，不另装依赖树')
   const peers = Object.keys(pkg.peerDependencies ?? {}).filter((name) => name.startsWith('@deepseek-ai/'))
-  const devs = Object.keys(pkg.devDependencies ?? {}).filter((name) => name.startsWith('@deepseek-ai/'))
+  // Test-only native packages (never imported by lib/src) are dev-only by design.
+  const TEST_ONLY = ['@deepseek-ai/dsh-tool-executor-ptc']
+  const devs = Object.keys(pkg.devDependencies ?? {}).filter((name) => name.startsWith('@deepseek-ai/') && !TEST_ONLY.includes(name))
+  for (const name of TEST_ONLY) {
+    for (const file of readdirSync(join(ROOT, 'src'), { recursive: true }).filter((f) => String(f).endsWith('.ts'))) {
+      assert.equal(readFileSync(join(ROOT, 'src', String(file)), 'utf8').includes(name), false, `${file} 不得引用仅测试依赖 ${name}`)
+    }
+  }
   assert.deepEqual([...peers].sort(), [...devs].sort(), 'peer 与 dev 的 @deepseek-ai 包集合必须一致')
   assert.ok(peers.length > 0)
   for (const name of peers) {

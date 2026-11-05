@@ -168,6 +168,58 @@ export const IMPLEMENT_TOOL_FILTER: Readonly<{ deny: readonly string[] }> = Obje
   deny: ['satellite_node'],
 })
 
+/**
+ * 不受 Satellite 控制的委派/跨 Agent 通信入口（DSH 0.2.2-alpha.3 真实注册名）。
+ * 普通角色子 Agent 一律拒绝，角色 `toolFilter.allow` 不能重新授予。这只是按名的提前拒绝：
+ * `tool-subagent`/`tool-workflow` 的 `toolName` 可任意配置，按名无法覆盖别名；真正的边界
+ * 是 wiring 中 `session/created` 对"由受管角色子会话创建的任何会话"的同步 veto（与入口名无关）。
+ * `send_message`/`interrupt_agent`/`team_task_*` 在目标源码中名字固定，由本表覆盖。
+ * 只读入口不在此列：`list_agents`（列出不恢复）、`list_subagent_models`、
+ * `team_task_list`/`team_task_get`、`job_list`/`job_output`。
+ */
+export const CONTROLLED_ORCHESTRATION_TOOLS: readonly string[] = Object.freeze([
+  'subagent', 'subagent_fork', 'workflow', 'send_message', 'interrupt_agent',
+  'team_task_create', 'team_task_update',
+])
+const READ_ONLY_SUBAGENT_PREFIXED = new Set(['list_subagent_models'])
+
+/** Fixed child baseline: true when `name` is an uncontrolled delegation/communication entry. */
+export function isControlledOrchestrationTool(name: string): boolean {
+  if (CONTROLLED_ORCHESTRATION_TOOLS.includes(name)) return true
+  return name.startsWith('subagent_') && !READ_ONLY_SUBAGENT_PREFIXED.has(name)
+}
+
+const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,128}$/
+
+/**
+ * 校验角色 `toolFilter`：必须是只含 `allow`/`deny` 的普通对象，值为去重的合法工具名数组。
+ * 语义：省略 `allow` = 不设白名单；`allow: []` 无可用工具，视为配置错误拒绝；
+ * `deny: []` = 不追加拒绝。未知名字（作用域局部工具、尚未加载的插件工具）合法，
+ * 不按当前注册表硬编码排除。
+ */
+export function validateToolFilter(roleName: string, value: unknown): RoleConfig['toolFilter'] {
+  const where = `roles.${roleName}.toolFilter`
+  if (value === undefined) return undefined
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error(`${where} 必须是只含 allow/deny 的普通对象`)
+  }
+  const record = value as Record<string, unknown>
+  const unknownKeys = Object.keys(record).filter((key) => key !== 'allow' && key !== 'deny')
+  if (unknownKeys.length > 0) throw new Error(`${where} 含不支持的字段：${unknownKeys.join('、')}`)
+  const out: { allow?: readonly string[]; deny?: readonly string[] } = {}
+  for (const key of ['allow', 'deny'] as const) {
+    if (!Object.hasOwn(record, key) || record[key] === undefined) continue
+    const list = record[key]
+    if (!Array.isArray(list) || list.some((name) => typeof name !== 'string' || !TOOL_NAME.test(name))) {
+      throw new Error(`${where}.${key} 必须是合法工具名字符串数组`)
+    }
+    if (new Set(list).size !== list.length) throw new Error(`${where}.${key} 含重复工具名`)
+    if (key === 'allow' && list.length === 0) throw new Error(`${where}.allow 为空会使角色无工具可用；不设白名单请省略 allow`)
+    out[key] = Object.freeze([...(list as string[])])
+  }
+  return Object.freeze(out)
+}
+
 // Reserved execution capability ceiling; ordinary deployment config cannot widen it.
 export const VERSION_CONTROL_TOOLS: readonly string[] = Object.freeze([
   'satellite_version_control', 'skill', 'ask_user_question', 'read',
@@ -438,7 +490,15 @@ export function normalizeConfig(config?: unknown): NormalizedConfig {
     if (RETIRED_BUILTIN_ROLE_NAMES.has(roleName)) {
       throw new Error(`内置角色 ${roleName} 已移除，roles.${roleName} 不再被当作自定义角色；请删除该局部覆盖；如确需自定义用途，请改用新角色名定义完整角色，并更新 nodes.<node>.tierRoles 与 routes 中的引用`)
     }
-    const override = asRecord(entry)
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error(`roles.${roleName} 必须是对象`)
+    }
+    const override = { ...asRecord(entry) }
+    if (Object.hasOwn(override, 'toolFilter')) {
+      const filter = validateToolFilter(roleName, override.toolFilter)
+      if (filter === undefined) delete override.toolFilter
+      else override.toolFilter = filter
+    }
     if (Object.hasOwn(DEFAULT_CONFIG.roles, roleName) && Object.hasOwn(override, 'agentOptions')) {
       // Built-in routing has one user-facing source: routes. Hidden role defaults
       // would otherwise change when a sparse routes array replaces schema defaults.

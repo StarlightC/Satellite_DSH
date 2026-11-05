@@ -14,6 +14,7 @@ import { normalizeConfig, DEFAULT_CONFIG } from '../lib/node/lib/config.js'
 import { createNodeCatalog, MATCH_YES, READY } from '../lib/contracts.js'
 import { createSlotRegistry } from '../lib/registry.js'
 import { resourceDirFrom } from '../lib/skills.js'
+import { executeTool } from './tool-call-helper.mjs'
 
 const LOCAL = 'satellite_version_control'
 const denied = ['bash', 'write', 'edit', 'python', 'satellite_skill_script_run', 'web_fetch', 'web_search', 'subagent', 'subagent_fork', 'workflow', 'send_message', 'satellite_android_project']
@@ -22,8 +23,19 @@ const simple = name => defineTool({ name, description: name, parameters: {}, out
 const signal = () => new AbortController().signal
 async function fixture(t) {
   const ctx = new Context(), roots = [], live = new Map(), owners = new Map(), scopes = [], calls = { spawn: [], approval: [], confine: [] }
+  // Stand-in for the node runtime's private delegation record: membership is active only while listed.
+  const delegated = new Set()
   ctx.provide('systemPrompt', { tools: () => () => {}, section: () => () => {}, getSectionOrder: () => 1 })
-  ctx.provide('agents', { roots: () => roots, get: id => live.get(id), isOwnedBy: (id, owner) => owners.get(id) === owner })
+  ctx.provide('agents', { get: id => live.get(id) })
+  // DSH 0.2.2 three-state tree lookup: exact live caller, else throws.
+  ctx.provide('subagents', {
+    rootOf(caller) {
+      if (live.get(caller.id) !== caller) throw new Error('UNAUTHORIZED')
+      let current = caller
+      while (owners.has(current.id)) current = owners.get(current.id)
+      return current
+    },
+  })
   await ctx.plugin(ToolRuntime)
   for (const name of [...methods, ...denied]) ctx.tools.register(simple(name))
   const parent = await realpath(tmpdir()), root = await mkdtemp(join(parent, 'satellite-vc-runtime-'))
@@ -62,14 +74,20 @@ async function fixture(t) {
     return agent
   }
   let counter = 0
-  const call = (name, agent, args = {}) => ctx.tools.execute({ name, agent, arguments: args, callId: `runtime-${++counter}`, signal: signal() })
+  const call = (name, agent, args = {}, extra = {}) => executeTool(ctx, { name, agent, arguments: args, callId: `runtime-${++counter}`, signal: signal(), ...extra })
+  /** Bind as the node runtime does after its receipt, then mark the record active. */
+  const bind = (boundary, child, parent, callId) => {
+    const release = boundary.bind(child, parent, callId, () => delegated.has(child))
+    delegated.add(child)
+    return () => { delegated.delete(child); release() }
+  }
   t.after(async () => {
     for (const scope of scopes.reverse()) await scope.dispose()
     await ctx.fiber.dispose()
     assert.equal(dirname(root), parent); assert.ok(root.startsWith(join(parent, 'satellite-vc-runtime-'))); assert.equal(await realpath(root), root)
     await rm(root, { recursive: true })
   })
-  return { ctx, root, services, calls, agent, call, live, owners, scopes }
+  return { ctx, root, services, calls, agent, call, live, owners, scopes, bind, delegated }
 }
 
 test('reserved config cannot widen capability or route the identity through aliases/tiers', () => {
@@ -94,9 +112,14 @@ test('reserved config cannot widen capability or route the identity through alia
 test('real ToolRuntime: main/ordinary/sibling/forged identity cannot invoke local tool; method-only child denies alternate entries and derived scopes', async t => {
   const f = await fixture(t), boundary = createVersionControlBoundary(f.ctx, defineTool)
   const root = f.agent('root'), child = f.agent('version', root), sibling = f.agent('implementation', root)
-  const coordinator = await f.ctx.plugin({ inject: ['tools', 'agents', 'systemPrompt'], apply: registerCoordinatorBoundary })
+  const coordinator = await f.ctx.plugin({ inject: ['tools', 'agents', 'subagents', 'systemPrompt'], apply: registerCoordinatorBoundary })
   for (const agent of [root, child, sibling, undefined]) assert.equal((await f.call(LOCAL, agent, { request: { action: 'status', repo: '.' } })).isError, true)
-  const release = boundary.bind(child, root)
+  // Bound but record not yet active (provisional): every entry, including the local tool, is denied.
+  const pendingRelease = boundary.bind(child, root, undefined, () => f.delegated.has(child))
+  assert.equal((await f.call(LOCAL, child, { request: { action: 'status', repo: '.' } })).isError, true)
+  for (const name of methods) assert.equal((await f.call(name, child)).isError, true, name)
+  pendingRelease()
+  const release = f.bind(boundary, child, root)
   for (const name of methods) assert.equal((await f.call(name, child)).isError, false, name)
   for (const name of denied) assert.equal((await f.call(name, child)).isError, true, name)
   // Own-scope registration is exempt from host allow masks: the guard must deny it.
@@ -111,10 +134,16 @@ test('real ToolRuntime: main/ordinary/sibling/forged identity cannot invoke loca
     assert.equal((await f.call('bash', agent)).isError, true)
     assert.equal((await f.call(LOCAL, agent, { request: { action: 'status', repo: '.' } })).isError, true)
   }
-  child.ctx.get('tools').presentAs('ptc')
+  // Native pipeline: a model-direct run_code is denied by the version-control guard
+  // itself (exact message), not passed through as a generic failure. The real
+  // PTC-executor case is covered in coordinator-boundary/node-wiring tests.
   const ptc = await f.call('run_code', child, { code: 'print(1)' })
-  assert.equal(ptc.isError, true); assert.match(ptc.error.message, /fixed direct method/)
-  child.ctx.get('tools').presentAs // presentation disposer is scope-owned
+  assert.equal(ptc.isError, true)
+  assert.match(ptc.error.message, /version-control permits only its fixed direct method tools/)
+  // A nested (transport sub-dispatch) call of an allowed method is denied by the VC guard itself.
+  const nested = await f.call('read', child, {}, { parent: Symbol('outer-run_code') })
+  assert.equal(nested.isError, true)
+  assert.match(nested.error.message, /version-control permits only its fixed direct method tools/)
   release()
   assert.equal((await f.call('bash', sibling)).isError, false)
   assert.equal((await f.call(LOCAL, sibling, { request: { action: 'status', repo: '.' } })).isError, true)
@@ -126,7 +155,7 @@ test('runtime bridge reads real child services; closed input/missing mapping or 
   let rawExecute
   const boundary = createVersionControlBoundary(f.ctx, options => { rawExecute = options.execute; return defineTool(options) })
   const root = f.agent('root'), child = f.agent('version', root)
-  boundary.bind(child, root)
+  f.bind(boundary, child, root)
   for (const request of [{ action: 'push', repo: '.' }, { action: 'status', repo: '.', remote: 'origin' }, { action: 'status', repo: '.', flags: ['--porcelain'] }]) {
     assert.equal((await f.call(LOCAL, child, { request })).isError, true)
   }
@@ -163,12 +192,12 @@ test('runtime bridge reads real child services; closed input/missing mapping or 
 test('real ToolRuntime: same-name scoped replacement is denied; scope disposal revokes membership; unload removes unrelated guards', async t => {
   const f = await fixture(t), boundary = createVersionControlBoundary(f.ctx, defineTool)
   const root = f.agent('root'), child = f.agent('version', root)
-  const release = boundary.bind(child, root)
+  const release = f.bind(boundary, child, root)
   const replace = child.ctx.get('tools').register(simple(LOCAL))
   assert.equal((await f.call(LOCAL, child)).isError, true)
   replace(); release()
   assert.equal((await f.call('bash', child)).isError, false)
-  boundary.bind(child, root)
+  f.bind(boundary, child, root)
   await f.scopes.at(-1).dispose()
   const direct = f.ctx.tools.get(LOCAL)
   assert.equal((await direct.execute({ request: { action: 'status', repo: '.' } }, { agent: child, signal: signal() })).status, 'blocked')
@@ -177,31 +206,52 @@ test('real ToolRuntime: same-name scoped replacement is denied; scope disposal r
   assert.equal((await f.call('bash', root)).isError, false)
 })
 
-test('real coordinator/node creation boundary installs guard before child begins, preserves slots/acceptance-after and clears at completion', async t => {
-  const f = await fixture(t), catalog = createNodeCatalog(), registry = createSlotRegistry(catalog), skills = new Set(), listeners = { 'session/created': [], 'agent/created': [] }
+test('real coordinator/node creation boundary: provisional child is fully denied before the receipt, active only after it, cleared at completion', async t => {
+  const f = await fixture(t), catalog = createNodeCatalog(), registry = createSlotRegistry(catalog), skills = new Set()
+  const listeners = { 'session/created': [], 'agent/created': [], 'subagent/start': [], 'subagent/end': [] }
   f.ctx.provide('satelliteSlots', { defineNode: (...args) => catalog.defineNode(...args), register: ext => registry.register(ext), snapshot: () => registry.snapshot(), resolve: (...args) => registry.resolve(...args) })
   f.ctx.provide('skills', { register: skill => { skills.add(skill.name); return () => {} }, snapshot: async () => ({ complete: true, skills: [...skills].map(name => ({ name })) }) })
   f.ctx.provide('sessions', {})
   let child, started = 0
   const stages = []
-  f.ctx.provide('subagents', {
-    list: () => ['spawn'], getProvider: () => ({ prepareContinuable() {}, capabilities: { persona: true, toolFilter: true, agentOptions: true } }),
+  Object.assign(f.ctx.get('subagents'), {
+    list: () => ['spawn'], getProvider: () => ({ prepareContinuable() {}, capabilities: { agentOptions: true, agentPreset: false, depthLimit: true, outputSchema: true } }),
+    resolveMaxDepth: value => value,
     async startActivation(spec) {
       started++
       assert.deepEqual(stages, ['before'])
-      child = f.agent(spec.childId, spec.request.parent)
-      child.session.header = { ...child.session.header, origin: 'subagent', parentSession: spec.request.parent.id }
-      child.session.append = (_, event) => { child.session.mode = event.mode }
+      assert.equal('request' in spec, false, 'flat DSH 0.2.2 activation spec')
+      child = f.agent(spec.childId, spec.parent)
+      child.session.header = { ...child.session.header, origin: 'subagent', parentSession: spec.parent.id }
+      // DSH 0.2.2 Session: append is illegal until session/created has completed.
+      let published = false
+      child.session.append = (_, event) => {
+        if (!published) throw new Error('Session append before session/created completed')
+        child.session.mode = event.mode
+      }
       for (const fn of listeners['session/created']) fn(child.session)
+      published = true
       // Native setup may seed parent policy; the final creation gate narrows it.
       child.session.mode = 'danger-full-access'
       for (const fn of listeners['agent/created']) await fn({ agent: child })
       assert.equal(child.session.mode, 'workspace-write')
-      assert.equal((await f.call('bash', child)).isError, true)
-      assert.equal((await f.call('read', child)).isError, false)
-      const local = await f.call(LOCAL, child, { request: { action: 'status', repo: '.' } })
-      assert.equal(local.value.status, 'succeeded', JSON.stringify(local))
-      return { childId: child.id, result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'observed only' }] }), dispose: async () => {} }
+      for (const fn of listeners['subagent/start']) fn({ runId: 'run-1', provider: 'spawn', parentSessionId: spec.parent.id, id: child.id, local: true })
+      // First-tool race before the receipt: everything is denied, including the method tools.
+      for (const name of ['bash', 'read', LOCAL]) assert.equal((await f.call(name, child, name === LOCAL ? { request: { action: 'status', repo: '.' } } : {})).isError, true, name)
+      return {
+        childId: child.id,
+        messageId: 'm-1',
+        get result() {
+          return (async () => {
+            assert.equal((await f.call('bash', child)).isError, true)
+            assert.equal((await f.call('read', child)).isError, false)
+            const local = await f.call(LOCAL, child, { request: { action: 'status', repo: '.' } })
+            assert.equal(local.value.status, 'succeeded', JSON.stringify(local))
+            return { stopReason: 'completed', output: [{ type: 'text', text: 'observed only' }] }
+          })()
+        },
+        dispose: async () => {},
+      }
     },
   })
   const adapter = { get: name => f.ctx.get(name), tools: f.ctx.tools, satelliteSlots: f.ctx.get('satelliteSlots'), effect: fn => f.ctx.effect(fn), on: (name, fn) => { listeners[name].push(fn); return () => {} } }
@@ -215,8 +265,9 @@ test('real coordinator/node creation boundary installs guard before child begins
   assert.equal(started, 0)
   const first = await f.call('satellite_node', root, { node: 'version-control', task: 'Explicit user request: local status only', facts: { 'acceptance.required': true } })
   assert.equal(first.isError, false, JSON.stringify(first)); assert.equal(first.value.kind, 'suspended', JSON.stringify(first)); assert.equal(started, 1)
+  // Revoked before disposal; the child scope keeps denying until it is released.
   assert.equal((await f.call(LOCAL, child, { request: { action: 'status', repo: '.' } })).isError, true)
-  assert.equal((await f.call('bash', child)).isError, false)
+  assert.equal((await f.call('read', child)).isError, true)
   const resumed = await f.call('satellite_node', root, { node: 'version-control', task: 'same', resume: first.value.token, decision: 'accept' })
   assert.equal(resumed.value.kind, 'completed'); assert.equal(started, 1)
   assert.deepEqual(stages, ['before', 'after'])
@@ -248,7 +299,7 @@ async function handoff(t, { approve = 'allowed-once' } = {}) {
   const childSubprocess = { ...f.services.subprocess, spawn(spec) { tagged.child.push(spec); return f.services.subprocess.spawn(spec) } }
   const childApproval = { request: async () => { throw new Error('child approval must never be used') } }
   scoped(child, name => (name === 'subprocess' ? childSubprocess : name === 'approval' ? childApproval : undefined))
-  boundary.bind(child, root, 'parent-node-call')
+  f.bind(boundary, child, root, 'parent-node-call')
   const status = async (who = child) => (await f.call(LOCAL, who, { request: { action: 'status', repo: '.' } })).value
   const stage = async (token, who = child, paths = ['x']) => f.call(LOCAL, who, { request: { action: 'stage', repo: '.', paths, expectedSnapshot: token } })
   t.after(() => boundary.dispose())
@@ -274,7 +325,7 @@ test('handoff: host allowed-once executes the frozen stage+commit with parent sc
   }
   assert.equal(h.tagged.parentApproval.length, 1)
   // A sibling version child (other kernel) cannot spend this child's token.
-  const other = h.f.agent('version-2', h.root); h.boundary.bind(other, h.root, 'other-call')
+  const other = h.f.agent('version-2', h.root); h.f.bind(h.boundary, other, h.root, 'other-call')
   const fresh = await h.status()
   const foreign = await h.stage(fresh.expectedSnapshot, other)
   assert.equal(foreign.value.status, 'blocked')
@@ -293,7 +344,8 @@ test('handoff fail-closed: parent read-only / approval never / missing parent se
     ['read-only', () => { h.root.session.mode = 'read-only' }, () => { h.root.session.mode = 'workspace-write' }, /parent sandbox denies writes|policy/],
     ['never', () => {}, () => {}, /approval rejected/],
     ['missing', () => { const g = h.rootCtx.get; h.rootCtx.get = n => n === 'approval' ? undefined : g(n); return g }, g => { h.rootCtx.get = g }, /parent scope service unavailable: approval/],
-    ['owner', () => { h.f.owners.set(h.child.id, {}) }, () => { h.f.owners.set(h.child.id, h.root) }, /ownership/],
+    ['record revoked', () => { h.f.delegated.delete(h.child) }, () => { h.f.delegated.add(h.child) }, /execution identity|delegation/],
+    ['other tree', () => { const other = h.f.agent('other-root'); h.f.owners.set(h.child.id, other) }, () => { h.f.owners.set(h.child.id, h.root) }, /delegation/],
     ['cwd', () => { const s = h.parentServices.workingDirectory; h.parentServices.workingDirectory = { ensure: async () => dirname(h.f.root) }; return s }, s => { h.parentServices.workingDirectory = s }, /cwd outside|workspace differ/],
   ]
   for (const [name, arrange, restore, message] of cases) {
@@ -301,7 +353,9 @@ test('handoff fail-closed: parent read-only / approval never / missing parent se
     const token = arrange()
     const result = await h.stage(snap.expectedSnapshot)
     restore(token)
-    assert.equal(result.value.status, 'blocked', name); assert.match(result.value.message, message, name)
+    // A revoked record is denied by the guard before the body: the failure is the tool error.
+    const outcome = result.value ?? { status: 'blocked', message: result.error.message }
+    assert.equal(outcome.status, 'blocked', name); assert.match(outcome.message, message, name)
   }
   assert.equal(writeSpawns([...h.tagged.parent, ...h.tagged.child]).length, 0)
   assert.equal(git(h.f.root, 'diff', '--cached', '--name-only'), '')
@@ -342,11 +396,44 @@ test('real ToolRuntime: cancellation after the write spawned keeps ABORTED but s
   const controller = new AbortController()
   const spawn = h.parentServices.subprocess.spawn
   h.parentServices.subprocess.spawn = spec => { const handle = spawn(spec); if (spec.argv.includes('add')) controller.abort(); return handle }
-  const result = await h.f.ctx.tools.execute({ name: LOCAL, agent: h.child, arguments: { request: { action: 'stage', repo: '.', paths: ['x'], expectedSnapshot: snap.expectedSnapshot } }, callId: 'cancel-1', signal: controller.signal })
+  const result = await executeTool(h.f.ctx, { name: LOCAL, agent: h.child, arguments: { request: { action: 'stage', repo: '.', paths: ['x'], expectedSnapshot: snap.expectedSnapshot } }, callId: 'cancel-1', signal: controller.signal })
   assert.equal(result.isError, true); assert.equal(result.error.info.name, 'AbortError')
   const text = result.content.map(c => c.text).join('\n')
   assert.match(text, /aborted/); assert.match(text, /effect-unknown: Write may have taken effect/); assert.match(text, /never automatically retry/)
   assert.match(git(h.f.root, 'diff', '--cached', '--name-only'), /^x$/m) // the write did happen
   // Repository queue released: a following observation proceeds.
   assert.equal((await h.status()).status, 'succeeded')
+})
+
+test('service identity: fresh Cordis proxies of the same original pass; a swapped original is refused; scopes stay isolated', async t => {
+  const { Service, symbols } = await import('@deepseek-ai/cordis')
+  const f = await fixture(t), boundary = createVersionControlBoundary(f.ctx, defineTool)
+  const root = f.agent('root'), child = f.agent('version', root), sibling = f.agent('sibling', root)
+  // Real Cordis Service rows: every ctx.get() is a fresh traceable proxy over one original.
+  class SandboxRow extends Service { confine(...args) { return f.services.sandbox.confine(...args) } }
+  class FirstRow extends SandboxRow { constructor(ctx) { super(ctx, 'vcSandboxA') } }
+  class SecondRow extends SandboxRow { constructor(ctx) { super(ctx, 'vcSandboxB') } }
+  await f.ctx.plugin(FirstRow); await f.ctx.plugin(SecondRow)
+  const a = f.ctx.get('vcSandboxA'), b = f.ctx.get('vcSandboxA')
+  assert.notEqual(a, b, 'Cordis returns a fresh proxy per get')
+  assert.ok(a[symbols.original] && a[symbols.original] === b[symbols.original])
+  assert.notEqual(a[symbols.original], f.ctx.get('vcSandboxB')[symbols.original])
+  const base = child.ctx.get.bind(child.ctx)
+  let row = 'vcSandboxA'
+  child.ctx.get = name => (name === 'sandbox' ? f.ctx.get(row) : base(name))
+  f.bind(boundary, child, root)
+  const ok = await f.call(LOCAL, child, { request: { action: 'status', repo: '.' } })
+  assert.equal(ok.value.status, 'succeeded', JSON.stringify(ok))
+  // A different original after prepare: policy() re-reads before confine and refuses.
+  const before = f.calls.spawn.length
+  const confine = f.services.sandbox.confine
+  f.services.sandbox.confine = async (...args) => { row = 'vcSandboxB'; return confine(...args) }
+  const refused = await f.call(LOCAL, child, { request: { action: 'status', repo: '.' } })
+  f.services.sandbox.confine = confine
+  assert.equal(refused.value.status, 'blocked', JSON.stringify(refused))
+  assert.match(refused.value.message, /scope service changed: sandbox/)
+  assert.equal(f.calls.spawn.length, before, 'no spawn after the swap')
+  child.ctx.get = base
+  // Unwrapping identity does not merge scopes: a sibling is still not a member.
+  assert.equal((await f.call(LOCAL, sibling, { request: { action: 'status', repo: '.' } })).isError, true)
 })

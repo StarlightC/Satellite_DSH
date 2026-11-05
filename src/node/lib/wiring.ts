@@ -18,6 +18,7 @@ import {
   normalizeConfig,
   readLiveConfigValue,
   isSandboxMode,
+  isControlledOrchestrationTool,
   UNSUPPORTED_ROLE_CWD,
   strictestSandboxMode,
   selectNodeRole,
@@ -48,36 +49,71 @@ const COORDINATION_TOOLS = new Set([
   'todo_write', 'present', 'get_goal', 'create_goal', 'update_goal',
   // Listing never resumes agents; interrupt only cancels.
   'list_agents', 'interrupt_agent',
-  'schedule_create', 'schedule_list', 'schedule_update', 'schedule_delete',
+  // DSH 0.2.2-alpha.3 @deepseek-ai/dsh-tool-schedule registered names.
+  'schedule_create', 'schedule_list', 'schedule_view', 'schedule_edit',
 ])
+
+/** Reserved PTC transport name (`RUN_CODE_NAME` in @deepseek-ai/dsh-tools). */
+const RUN_CODE = 'run_code'
+/**
+ * A guard only sees a direct `run_code` when the scope selected the PTC executor
+ * (the native executor rejects the reserved name before policy). Satellite supports
+ * only the native executor for the coordinator and its roles: PTC's executor accepts
+ * only direct `run_code`, while the coordinator boundary and version-control reject
+ * nested/script execution.
+ */
+export const PTC_UNSUPPORTED = 'Satellite：当前作用域选择了 PTC 工具执行器（run_code），Satellite 协调者与角色只支持 native 执行器；请改用挂载 @deepseek-ai/dsh-tool-executor-native 的 preset（例如默认 preset）后重试'
 
 const COORDINATOR_PROMPT = 'Satellite 主会话只编排协调与基础汇总：具体调查、检索、读写、执行、审查和验证通过 satellite_node 执行（暂停节点用 token 恢复），不用 subagent、subagent_fork、workflow 或 send_message 代替。'
 
+/** Exact live registry lookup (`ctx.agents.get`). */
+interface AgentRegistry { get(id: string): unknown }
+/** `ctx.subagents.rootOf`: returns the live tree root, or throws when ownership is unknown. */
+interface SubagentTrees { rootOf(caller: RuntimeAgent): unknown }
+
+/**
+ * Three-state coordinator check. `unknown` (not the exact live agent, no tree
+ * service, or `rootOf` rejects) is never treated as a non-coordinator.
+ */
+export function coordinatorState(ctx: { get(name: string): unknown }, agent: RuntimeAgent): 'coordinator' | 'member' | 'unknown' {
+  const agents = ctx.get('agents') as AgentRegistry | undefined
+  const subagents = ctx.get('subagents') as SubagentTrees | undefined
+  if (!agents || typeof agents.get !== 'function' || agents.get(agent.id) !== agent) return 'unknown'
+  if (!subagents || typeof subagents.rootOf !== 'function') return 'unknown'
+  try {
+    return subagents.rootOf(agent) === agent ? 'coordinator' : 'member'
+  } catch {
+    return 'unknown'
+  }
+}
+
 /** Register once on the node row, so unload removes both effects and HMR needs no cache. */
 export function registerCoordinatorBoundary(ctx: CoordinatorContext): void {
-  const agents = ctx.get('agents') as { roots(): RuntimeAgent[] }
   const prompt = ctx.get('systemPrompt') as {
     section(section: {
       name: string
       order: number
-      text(context: { scope?: RuntimeAgent }): string
+      text(context: { scope?: unknown }): string
       interpolate: boolean
     }): () => void
-  }
-  function isCoordinator(agent: RuntimeAgent): boolean {
-    return agents.roots().includes(agent)
   }
   ctx.effect(() => ctx.tools.guard((exec) => {
     // Agentless Host operations are not model calls; never infer an agent from ALS.
     if (!exec.agent) return undefined
-    if (!isCoordinator(exec.agent) || COORDINATION_TOOLS.has(exec.name)) return undefined
+    // Identity first: an allow-listed name never bypasses an unknown identity.
+    const state = coordinatorState(ctx, exec.agent)
+    if (state === 'member') return undefined
+    if (state === 'unknown') return 'Satellite：无法确认调用方 Agent 的委派树身份，拒绝执行'
+    if (exec.name === RUN_CODE && !exec.parent) return PTC_UNSUPPORTED
+    if (COORDINATION_TOOLS.has(exec.name)) return undefined
     return 'Satellite：主会话只编排协调；具体任务必须通过 satellite_node 执行'
   }))
   ctx.effect(() => prompt.section({
     name: 'satellite:coordinator',
     order: 50,
     interpolate: false,
-    text: ({ scope }) => scope && isCoordinator(scope) ? COORDINATOR_PROMPT : '',
+    text: ({ scope }) => scope && typeof scope === 'object' && 'id' in scope
+      && coordinatorState(ctx, scope as RuntimeAgent) === 'coordinator' ? COORDINATOR_PROMPT : '',
   }))
 }
 
@@ -117,10 +153,14 @@ export interface SkillsService {
   } | undefined>
 }
 
+/**
+ * DSH 0.2.2 `SubagentCapabilities`（`@deepseek-ai/dsh-subagent` types.ts）。
+ * persona/toolFilter 已不再是后端能力：角色提示与工具限制由本插件在 exact
+ * child 的 `agent/created` 作用域内用 `systemPrompt.section` 与 `tools.guard` 施加。
+ */
 export interface SubagentCapabilities {
   readonly agentOptions?: boolean
-  readonly persona?: boolean
-  readonly toolFilter?: boolean
+  readonly agentPreset?: boolean
   readonly depthLimit?: boolean
   readonly outputSchema?: boolean
 }
@@ -137,16 +177,43 @@ export interface SubagentResult {
 
 export interface SubagentActivation {
   readonly childId: string
+  readonly messageId?: string
   readonly result: Promise<SubagentResult | undefined>
   dispose(): Promise<void>
+}
+
+/**
+ * DSH 0.2.2 `SubagentActivationSpec & { childId }`：扁平任务字段，不再有 `request` 包装。
+ * 只列出本插件实际传入的字段。
+ */
+export interface SubagentActivationRequest {
+  readonly provider: string
+  readonly label: string
+  readonly childId: string
+  readonly parent: RuntimeAgent
+  readonly prompt: Array<{ type: 'text'; text: string }>
+  readonly cwd?: string
+  readonly agentOptions?: Record<string, unknown>
+  readonly maxDepth?: number
+  readonly signal: AbortSignal
+  readonly delivery: 'caller'
+}
+
+/** `subagent/start` / `subagent/end` 共用的运行身份（DSH 0.2.2 `SubagentRunInfo`）。 */
+export interface SubagentRunInfoLike {
+  readonly runId: string
+  readonly provider: string
+  readonly parentSessionId: string
+  readonly id: string
+  readonly local: boolean
 }
 
 /** 子 Agent 服务（DSH 原生服务）。 */
 export interface SubagentsService {
   list(): readonly string[]
   getProvider(name: string): SubagentProvider | undefined
-  resolveMaxDepth(value: number): unknown
-  startActivation(spec: unknown): Promise<SubagentActivation>
+  resolveMaxDepth(value: number): number | undefined
+  startActivation(spec: SubagentActivationRequest): Promise<SubagentActivation>
 }
 
 /** 工作目录服务（DSH 原生服务）。 */
@@ -165,7 +232,7 @@ export interface NodeExecutionContext {
    * 调用方 Agent。`id` 就是它的会话 id（`@deepseek-ai/dsh-agent` 的
    * `Agent.id: SessionId`），也正是本次委派创建的子会话 `SessionHeader.parentSession` 的值。
    */
-  readonly agent: { readonly id: string; readonly session?: unknown }
+  readonly agent: RuntimeAgent
   readonly signal: AbortSignal
 }
 
@@ -231,16 +298,38 @@ export interface SandboxReport {
   readonly note?: string
 }
 
-/** Exact reserved identity, retained through both publication gates. */
-interface SandboxExpectation {
+/**
+ * The real child `Agent` (DSH 0.2.2 types via dsh-tools). Its `session.append` is
+ * only typed for `sandbox/mode` once the sandbox-policy augmentation is loaded, which
+ * this package does not install; read it through this one narrowed view.
+ */
+function childSession(agent: RuntimeAgent): ChildSessionLike {
+  return agent.session as unknown as ChildSessionLike
+}
+
+/**
+ * 私有委派记录：只由本插件的 `startRole` 闭包创建，凭 exact parent/Session、唯一
+ * childId、exact child/Session、runId 与回执逐步推进；任何 header、事实或模型输入都不能建立它。
+ * reserved → provisional（agent/created）→ active（回执后同步）→ revoked（单向终态）。
+ */
+interface DelegationRecord {
   readonly childId: string
+  readonly parent: RuntimeAgent
   readonly parentSessionId: string
-  mode: SandboxMode
   readonly parentSession: unknown
+  readonly callSignal: AbortSignal
+  readonly parentCallId?: string
+  readonly persona?: string
+  readonly toolFilter?: RoleConfig['toolFilter']
+  readonly explicitVersionControl: boolean
   readonly policy: SandboxPolicyApi
+  readonly gate: PromiseWithResolvers<void>
+  mode: SandboxMode
+  state: 'reserved' | 'provisional' | 'active' | 'revoked'
   session?: ChildSessionLike
-  verified?: boolean
-  versionControl?: { readonly parent: object; readonly parentCallId?: string; remove?: () => void }
+  child?: RuntimeAgent
+  runId?: string
+  removeVersionControl?: () => void
 }
 
 /**
@@ -261,7 +350,8 @@ export interface NodeRuntimeContext {
   effect(fn: () => void | (() => void)): unknown
   on?: {
     (name: 'session/created', listener: (session: ChildSessionLike) => void): () => void
-    (name: 'agent/created', listener: (payload: { agent: { id: string; session: ChildSessionLike } }) => undefined): () => void
+    (name: 'agent/created', listener: (payload: { agent: RuntimeAgent }) => undefined): () => void
+    (name: 'subagent/start' | 'subagent/end', listener: (info: SubagentRunInfoLike) => void): () => void
   }
 }
 
@@ -421,6 +511,33 @@ export interface NodeRuntime {
   ): { ready: true } | { ready: false; reason: string; missing?: readonly string[] }
 }
 
+/**
+ * Host contracts this build is written against (DSH source 8bd0733, labelled
+ * 0.2.2-alpha.3). `engines.dsh` is necessary but not sufficient: the npm
+ * release with the same version string has a `request`-wrapped activation and no
+ * `subagents.rootOf`. `rootOf` is the public discriminator of the flat
+ * activation contract, so it is checked before anything registers; there is no
+ * fallback to the other shape.
+ */
+export function missingHostContracts(ctx: { get(name: string): unknown; tools?: unknown; on?: unknown }): string[] {
+  const missing: string[] = []
+  const subagents = ctx.get('subagents') as { rootOf?: unknown; startActivation?: unknown } | undefined
+  if (typeof subagents?.rootOf !== 'function') missing.push('subagents.rootOf')
+  if (typeof subagents?.startActivation !== 'function') missing.push('subagents.startActivation')
+  if (typeof (ctx.tools as { guard?: unknown } | undefined)?.guard !== 'function') missing.push('tools.guard')
+  if (typeof ctx.on !== 'function') missing.push('ctx.on(agent/created)')
+  return missing
+}
+
+/** Refuse the row with an explicit diagnostic instead of registering against an unknown host. */
+export function assertHostContracts(ctx: Parameters<typeof missingHostContracts>[0]): void {
+  const missing = missingHostContracts(ctx)
+  if (missing.length > 0) {
+    throw new Error(`Satellite 需要 DSH 源码 8bd0733 的宿主契约，当前宿主缺少：${missing.join('、')}。`
+      + '同名 npm 0.2.2-alpha.3 与旧版 App 不受支持；本行未注册任何节点或工具。')
+  }
+}
+
 export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntime {
   const { ctx, config, defineTool: defineToolFn, resourceDir } = options
   // 原始 config 保留下来：volatile 字段要在**每次调用时**读取，而不是装配时快照。
@@ -494,19 +611,51 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     })
   }
 
-  // Public lifecycle gates (DSH inspect): session/created is synchronous and
-  // vetoable; agent/created runs AFTER factory setup, before queued input starts.
-  // The second gate is essential: native setup seeds the parent's policy after
-  // session publication. Rewriting after startActivation returns is too late.
-  const sandboxExpectations = new Map<string, SandboxExpectation>()
+  // Public lifecycle gates (DSH 0.2.2 source): session/created is synchronous and
+  // vetoable; agent/created runs AFTER factory setup and is awaited before creation
+  // resolves, while AgentLoop holds queued input. It must not wait for the receipt
+  // (startActivation itself awaits creation), so it only installs a cancellable
+  // agent/pre-step barrier; the receipt path activates the record and releases it.
+  const delegations = new Map<string, DelegationRecord>()
 
-  function refreshParentLimit(entry: SandboxExpectation): void {
+  function liveAgent(id: string): unknown {
+    const agents = ctx.get('agents') as AgentRegistry | undefined
+    return agents && typeof agents.get === 'function' ? agents.get(id) : undefined
+  }
+
+  /** Exact identities still live and the parent call not cancelled. */
+  function delegationLive(record: DelegationRecord): boolean {
+    return record.state === 'active' && !record.callSignal.aborted && record.child !== undefined
+      && liveAgent(record.childId) === record.child && childSession(record.child) === record.session
+      && liveAgent(record.parent.id) === record.parent
+  }
+
+  /**
+   * Synchronous, one-way revocation: deny first, then unlock the barrier so the
+   * child's pending pre-step wakes and rejects. Guards stay installed in the child
+   * scope (they read `state`) until the child itself is released.
+   */
+  function revoke(record: DelegationRecord): void {
+    if (record.state === 'revoked') return
+    record.state = 'revoked'
+    if (delegations.get(record.childId) === record) delegations.delete(record.childId)
+    try { record.removeVersionControl?.() }
+    finally { record.gate.resolve() }
+  }
+  /** Per-call idempotent shutdowns; unload runs them so activations are disposed, not only revoked. */
+  const shutdowns = new Set<() => void>()
+  ctx.effect(() => () => {
+    for (const shutdown of [...shutdowns]) shutdown()
+    for (const record of [...delegations.values()]) revoke(record)
+  })
+
+  function refreshParentLimit(entry: DelegationRecord): void {
     const mode = entry.policy.resolve({ session: entry.parentSession })?.mode
     if (!isSandboxMode(mode)) throw new Error('创建边界无法读取父会话权限，拒绝启动')
     entry.mode = strictestSandboxMode([entry.mode, mode])
   }
 
-  function enforceSandbox(session: ChildSessionLike, entry: SandboxExpectation): void {
+  function enforceSandbox(session: ChildSessionLike, entry: DelegationRecord): void {
     refreshParentLimit(entry)
     if (session.header.origin !== 'subagent' || session.header.parentSession !== entry.parentSessionId) {
       throw new Error('子会话身份与预留委派身份不符，拒绝启动')
@@ -516,28 +665,129 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     if (effective !== entry.mode) throw new Error(`沙箱模式读回失败：要求 ${entry.mode}，实际 ${effective ?? '未知'}`)
   }
 
+  /** Role restrictions + pending/revoked denial, independent of guard order. */
+  function installChildBoundary(child: RuntimeAgent, entry: DelegationRecord): void {
+    const childTools = child.ctx.get('tools') as { guard?(guard: ToolGuard): () => void } | undefined
+    if (!childTools || typeof childTools.guard !== 'function') throw new Error('子 Agent 作用域缺少工具 guard，拒绝启动')
+    const filter = entry.toolFilter
+    childTools.guard((exec) => {
+      if (entry.state !== 'active') return 'Satellite：委派尚未生效或已撤销，拒绝执行'
+      if (exec.name === RUN_CODE && !exec.parent) return PTC_UNSUPPORTED
+      // Fixed baseline, independent of role config: allow cannot re-grant it.
+      if (isControlledOrchestrationTool(exec.name)) return `Satellite：角色不能使用不受控的委派/通信入口 ${exec.name}；委派只能经 satellite_node`
+      if (filter?.allow && !filter.allow.includes(exec.name)) return `Satellite：角色不允许使用工具 ${exec.name}`
+      if (filter?.deny?.includes(exec.name)) return `Satellite：角色不允许使用工具 ${exec.name}`
+      return undefined
+    })
+    if (entry.persona) {
+      const prompt = child.ctx.get('systemPrompt') as { section?(section: {
+        name: string; order: number; interpolate: boolean; text(context: { scope?: unknown }): string
+      }): () => void } | undefined
+      if (!prompt || typeof prompt.section !== 'function') throw new Error('子 Agent 作用域缺少系统提示服务，无法施加角色提示')
+      const persona = entry.persona
+      prompt.section({
+        name: `satellite:role:${entry.childId}`,
+        order: 60,
+        interpolate: false,
+        text: ({ scope }) => scope === child && entry.state !== 'revoked' ? persona : '',
+      })
+    }
+    child.ctx.on('agent/pre-step', async ({ signal }, next) => {
+      while (entry.state === 'reserved' || entry.state === 'provisional') {
+        // The turn signal is essential: a failed start may dispose the child and
+        // await its idle before rejecting, which would deadlock on the gate alone.
+        if (signal.aborted) return { kind: 'reject' }
+        await new Promise<void>((resolve) => {
+          const wake = (): void => { signal.removeEventListener('abort', wake); resolve() }
+          signal.addEventListener('abort', wake, { once: true })
+          void entry.gate.promise.then(wake)
+        })
+      }
+      if (signal.aborted || !delegationLive(entry)) return { kind: 'reject' }
+      return next()
+    }, { prepend: true })
+    // Child release (disposal, failed creation) revokes synchronously.
+    child.ctx.effect(() => () => revoke(entry))
+  }
+
+  /**
+   * Name-independent delegation boundary. Every native delegation entry of this
+   * composition — `tool-subagent` under any configured `toolName`, workflow-ptc
+   * `agent()`, fork — creates its child through the subagent manager, whose
+   * `childSessionMeta` records the caller's session as `parentSession` (DSH
+   * 8bd0733 subagent/src/child-agent.ts). A role child therefore cannot obtain
+   * a grandchild under any alias: its creation is vetoed here, synchronously,
+   * before the session is published. Role `toolFilter.allow` is not consulted.
+   */
+  function managedCreator(parentSessionId: string | undefined): DelegationRecord | undefined {
+    if (parentSessionId === undefined) return undefined
+    for (const record of delegations.values()) {
+      if (record.session?.header.id === parentSessionId) return record
+    }
+    return undefined
+  }
+
   ctx.on?.('session/created', (session) => {
-    const entry = sandboxExpectations.get(session.header.id)
-    if (!entry) return
-    enforceSandbox(session, entry) // synchronous throw vetoes session publication
+    const creator = managedCreator(session.header.parentSession)
+    if (creator) {
+      throw new Error(`Satellite：角色子 Agent ${creator.childId} 不能创建下级 Agent；委派只能经 satellite_node`)
+    }
+    const entry = delegations.get(session.header.id)
+    if (!entry || entry.state !== 'reserved' || entry.session !== undefined) return
+    // DSH 0.2.2 Session rejects append until session/created completes; the
+    // child's mode is written at agent/created (after manager setup appended the
+    // delegated parent policy). Here only identity is checked: a synchronous
+    // throw vetoes session publication.
+    refreshParentLimit(entry)
+    if (session.header.origin !== 'subagent' || session.header.parentSession !== entry.parentSessionId) {
+      throw new Error('子会话身份与预留委派身份不符，拒绝启动')
+    }
     entry.session = session
   })
   ctx.on?.('agent/created', ({ agent }) => {
-    const entry = sandboxExpectations.get(agent.id)
+    const entry = delegations.get(agent.id)
     if (!entry) return undefined
-    if (entry.session !== agent.session) throw new Error('子 Agent 未经过预期会话创建边界，拒绝启动')
-    refreshParentLimit(entry)
-    // Setup may have overwritten the first event with inherited parent policy.
-    const effective = entry.policy.resolve({ session: agent.session })?.mode
-    if (!isSandboxMode(effective)) throw new Error('Agent 创建边界无法读回沙箱模式，拒绝启动')
-    // Preserve stricter child policy installed by setup or an earlier trusted hook.
-    entry.mode = strictestSandboxMode([entry.mode, effective])
-    if (effective !== entry.mode) enforceSandbox(agent.session, entry)
-    if (entry.versionControl) {
-      entry.versionControl.remove = versionControl.bind(agent as unknown as VersionAgent, entry.versionControl.parent as VersionAgent, entry.versionControl.parentCallId)
+    const session = childSession(agent)
+    if (entry.state !== 'reserved' || entry.session === undefined || entry.session !== session) {
+      revoke(entry)
+      throw new Error('子 Agent 未经过预期会话创建边界，拒绝启动')
     }
-    entry.verified = true
+    if (liveAgent(agent.id) !== agent || liveAgent(entry.parent.id) !== entry.parent || entry.callSignal.aborted) {
+      revoke(entry)
+      throw new Error('子 Agent 或委派方不是 exact live 身份，拒绝启动')
+    }
+    try {
+      refreshParentLimit(entry)
+      // Setup may have overwritten the first event with inherited parent policy.
+      const effective = entry.policy.resolve({ session })?.mode
+      if (!isSandboxMode(effective)) throw new Error('Agent 创建边界无法读回沙箱模式，拒绝启动')
+      // Preserve stricter child policy installed by setup or an earlier trusted hook.
+      entry.mode = strictestSandboxMode([entry.mode, effective])
+      // The child's own durable mode record: Session appends are first legal here.
+      enforceSandbox(session, entry)
+      installChildBoundary(agent, entry)
+    } catch (error) {
+      revoke(entry)
+      throw error
+    }
+    entry.child = agent
+    entry.state = 'provisional'
     return undefined
+  })
+  // Observation only: records the matching runId; never authorizes.
+  ctx.on?.('subagent/start', (info) => {
+    const entry = delegations.get(info.id)
+    if (!entry) return
+    if (entry.state !== 'provisional' || entry.runId !== undefined || !info.local
+      || info.parentSessionId !== entry.parentSessionId || typeof info.runId !== 'string') {
+      revoke(entry)
+      return
+    }
+    entry.runId = info.runId
+  })
+  ctx.on?.('subagent/end', (info) => {
+    const entry = delegations.get(info.id)
+    if (entry && entry.runId !== undefined && entry.runId === info.runId) revoke(entry)
   })
 
   /** ready 只回答“当前作用域能不能执行”；是否获准由 DSH 工具管线决定。 */
@@ -571,12 +821,6 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     }
     if (role.agentOptions && !capabilities.agentOptions) {
       return { ready: false, reason: `后端 ${providerName} 不支持 agentOptions 角色路由`, missing: ['agentOptions'] }
-    }
-    if (role.persona && !capabilities.persona) {
-      return { ready: false, reason: `后端 ${providerName} 不支持 persona`, missing: ['persona'] }
-    }
-    if (role.toolFilter && !capabilities.toolFilter) {
-      return { ready: false, reason: `后端 ${providerName} 不支持工具过滤`, missing: ['toolFilter'] }
     }
     if (role.maxDepth !== undefined && !capabilities.depthLimit) {
       return { ready: false, reason: `后端 ${providerName} 不支持深度上限`, missing: ['depthLimit'] }
@@ -677,61 +921,118 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     // inherited from the parent; legacy role.cwd has already been rejected.
     const cwd = workspace
     const childId = randomUUID()
-    const expectation: SandboxExpectation = {
-      childId, parentSessionId: exec.agent.id, parentSession: exec.agent.session, mode, policy,
-      ...(params.explicitVersionControl ? { versionControl: { parent: exec.agent, ...(params.parentCallId !== undefined ? { parentCallId: params.parentCallId } : {}) } } : {}),
+    const record: DelegationRecord = {
+      childId, parent: exec.agent, parentSessionId: exec.agent.id, parentSession: exec.agent.session,
+      callSignal: exec.signal, mode, policy, state: 'reserved', gate: Promise.withResolvers<void>(),
+      explicitVersionControl: params.explicitVersionControl === true,
+      ...(params.parentCallId !== undefined ? { parentCallId: params.parentCallId } : {}),
+      ...(role.persona ? { persona: role.persona } : {}),
+      ...(role.toolFilter ? { toolFilter: role.toolFilter } : {}),
     }
-    sandboxExpectations.set(childId, expectation)
+    if (exec.signal.aborted) return { ok: false, error: '调用已取消，未启动子 Agent' }
+    delegations.set(childId, record)
 
-    let activation: SubagentActivation
+    // One idempotent shutdown for abort, unload, normal end and failure: revoke
+    // (deny + release the barrier) synchronously, then start disposal immediately
+    // without waiting for the result. Before the receipt it only records the need;
+    // the receipt path disposes as soon as the activation exists.
+    let activation: SubagentActivation | undefined
+    let shutdownRequested = false
+    let disposing: Promise<void> | undefined
+    const stopped = Promise.withResolvers<void>()
+    const shutdown = (): void => {
+      revoke(record)
+      shutdownRequested = true
+      stopped.resolve()
+      if (activation && !disposing) {
+        const current = activation
+        disposing = (async () => { await current.dispose() })()
+        // Guards stay in the child scope until the child is actually released.
+        disposing.catch(() => {})
+      }
+    }
+    shutdowns.add(shutdown)
+    exec.signal.addEventListener('abort', shutdown, { once: true })
+    const finish = async (): Promise<void> => {
+      shutdown()
+      shutdowns.delete(shutdown)
+      exec.signal.removeEventListener('abort', shutdown)
+      await disposing
+    }
+
     try {
       activation = await subagents.startActivation({
         provider: providerName,
         childId,
         label,
-        request: {
-          parent: exec.agent,
-          prompt: [{ type: 'text', text: buildPrompt({ task, skill: effectiveSkill, objective: role.objective, versionControl: params.explicitVersionControl }) }],
-          ...(cwd ? { cwd } : {}),
-          ...(agentOptions && capabilities.agentOptions ? { agentOptions } : {}),
-          ...(role.persona && capabilities.persona ? { persona: role.persona } : {}),
-          ...(role.toolFilter && capabilities.toolFilter ? { toolFilter: role.toolFilter } : {}),
-          ...(role.maxDepth !== undefined && capabilities.depthLimit
-            ? { maxDepth: subagents.resolveMaxDepth(role.maxDepth) }
-            : {}),
-        },
+        parent: exec.agent,
+        prompt: [{ type: 'text', text: buildPrompt({ task, skill: effectiveSkill, objective: role.objective, versionControl: params.explicitVersionControl }) }],
+        ...(cwd ? { cwd } : {}),
+        ...(agentOptions && capabilities.agentOptions ? { agentOptions: { ...agentOptions } } : {}),
+        ...(role.maxDepth !== undefined && capabilities.depthLimit
+          ? { maxDepth: subagents.resolveMaxDepth(role.maxDepth) }
+          : {}),
         signal: exec.signal,
         delivery: 'caller',
       })
     } catch (error) {
-      expectation.versionControl?.remove?.()
+      await finish()
       throw error
-    } finally {
-      sandboxExpectations.delete(childId)
     }
 
     try {
-      if (activation.childId !== childId || !expectation.verified) {
-        throw new Error('子 Agent 未通过权限创建边界，拒绝接受运行结果')
+      // A shutdown recorded before the receipt disposes as soon as the activation exists.
+      if (shutdownRequested) {
+        await finish()
+        throw new Error('委派在启动回执前已取消或卸载，子 Agent 已释放')
       }
+      // Receipt: every identity must still match before any fallible preparation…
+      const assertReceipt = (): void => {
+        if (activation!.childId !== childId || record.state !== 'provisional' || record.runId === undefined
+          || exec.signal.aborted || !record.child || liveAgent(childId) !== record.child
+          || liveAgent(exec.agent.id) !== exec.agent) {
+          throw new Error('子 Agent 未通过委派创建边界或已失效，拒绝接受运行结果')
+        }
+        // Creation resolved only after EVERY agent/created hook ran; a hook ordered
+        // after ours may have appended a wider mode. Read back before activation.
+        const effective = policy.resolve({ session: record.session })?.mode
+        if (!isSandboxMode(effective) || strictestSandboxMode([record.mode, effective]) !== effective) {
+          throw new Error(`子会话沙箱模式在创建后被改宽或不可读回：要求 ${record.mode}，实际 ${effective ?? '未知'}，拒绝启动`)
+        }
+        record.mode = effective
+      }
+      assertReceipt()
+      if (record.explicitVersionControl) {
+        record.removeVersionControl = versionControl.bind(
+          record.child as VersionAgent, exec.agent as VersionAgent,
+          params.parentCallId, () => delegationLive(record),
+        )
+      }
+      // …and again after it, then activate synchronously and release the barrier.
+      assertReceipt()
+      record.state = 'active'
+      record.gate.resolve()
       const report: SandboxReport = {
         requested: sandboxDecision.mode,
         source: sandboxDecision.source,
         applied: true,
-        effective: expectation.mode,
-        ...(expectation.mode !== sandboxDecision.mode ? { note: '已按父会话权限上限或既有子会话约束收窄' } : {}),
+        effective: record.mode,
+        ...(record.mode !== sandboxDecision.mode ? { note: '已按父会话权限上限或既有子会话约束收窄' } : {}),
       }
       params.onStarted?.({
         role: roleName,
         ...(agentOptions?.provider !== undefined ? { provider: agentOptions.provider } : {}),
         ...(agentOptions?.model !== undefined ? { model: agentOptions.model } : {}),
       })
-      const result = await activation.result
-      return { ok: true, result, sandbox: report }
+      // Cancellation/unload does not wait for the result: shutdown already disposed.
+      const settled = await Promise.race([
+        activation.result.then((result) => ({ result })),
+        stopped.promise.then(() => undefined),
+      ])
+      if (!settled) throw new Error('委派已取消或卸载，子 Agent 已释放')
+      return { ok: true, result: settled.result, sandbox: report }
     } finally {
-      // 已接受的子调用无论成功、失败还是取消都要释放。
-      try { await activation.dispose() }
-      finally { expectation.versionControl?.remove?.() }
+      await finish()
     }
   }
 

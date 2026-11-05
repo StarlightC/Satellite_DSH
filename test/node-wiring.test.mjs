@@ -17,6 +17,43 @@ const RESOURCE_DIR = resourceDirFrom(new URL('../lib/node/index.js', import.meta
 /** 真实包目录：`RoleConfig.cwd` 的写范围核对需要一个真实工作区。 */
 const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
+/** Exact live registry for fake parents/children (`ctx.agents.get`). */
+const LIVE = new Map()
+/** Tool names probed through the child's installed guards while it runs. */
+const PROBE_TOOLS = ['satellite_node', 'edit', 'write', 'bash', 'read', 'skill']
+
+/**
+ * Fake exact child Agent: its scoped ctx records guards, prompt sections, the
+ * pre-step barrier and scope effects exactly where the runtime installs them.
+ */
+function makeChild(id, session) {
+  const child = { id, session, guards: [], sections: [], preSteps: [], effects: [] }
+  child.ctx = {
+    get(name) {
+      if (name === 'tools') return { guard(fn) { child.guards.push(fn); return () => {} } }
+      if (name === 'systemPrompt') return { section(section) { child.sections.push(section); return () => {} } }
+      return undefined
+    },
+    on(name, listener) {
+      if (name === 'agent/pre-step') child.preSteps.push(listener)
+      return () => {}
+    },
+    effect(fn) { child.effects.push(fn()) },
+  }
+  /** Run the child's pre-step chain the way the agent loop does. */
+  child.step = async (signal = new AbortController().signal) => {
+    let decision = { kind: 'enter', messages: [] }
+    for (const listener of [...child.preSteps].reverse()) {
+      const inner = decision
+      decision = await listener({ agent: child, signal, messages: [] }, async () => inner)
+    }
+    return decision
+  }
+  /** Release the child scope (runs its effect disposers). */
+  child.release = () => { for (const dispose of child.effects.splice(0)) dispose?.() }
+  return child
+}
+
 function fakeDefineTool(options) {
   return { name: options.name, description: options.description, options }
 }
@@ -42,6 +79,13 @@ function setup({
   withSandbox = true,
   external = false,
   beforeCreate,
+  // Runs after agent/created + subagent/start, before the receipt returns.
+  afterCreate,
+  emitRunStart = true,
+  // Receipt-after long run: the result never settles on its own (only the barrier step runs).
+  hangResult = false,
+  // Extra tool names whose first guard reason is recorded while the child is active.
+  probeTools = [],
   setupMode,
   appendError = false,
   resolveError = false,
@@ -51,6 +95,7 @@ function setup({
   interlopers = [],
   afterListeners = [],
   earlierAgentListeners = [],
+  laterAgentListeners = [],
   // 会话工作区：`RoleConfig.cwd` 的包含关系与存在性都以它为边界。
   workspace = '/fake/project',
   // F1 回归：允许测试替换 skills.snapshot 的实现。
@@ -64,6 +109,7 @@ function setup({
   const skillNames = new Set()
   const sessionListeners = []
   const agentListeners = [...earlierAgentListeners]
+  const runListeners = { 'subagent/start': [], 'subagent/end': [] }
   let sessionSequence = 0
 
   // 模拟官方 fold：最后一条 sandbox/mode 事件就是该会话的覆盖；没有事件时是部署默认。
@@ -84,7 +130,10 @@ function setup({
       // header 由调用方给全（`origin` 缺省就是"不是子会话"）；这里只补 id 与 cwd。
       header: { id, cwd: '/fake/project', ...header },
       events: [],
+      // DSH 0.2.2 Session: append is illegal until session/created has completed.
+      published: false,
       append(type, data) {
+        if (!this.published) throw new Error('Session append before session/created completed')
         if (appendError) throw new Error('append failed')
         this.events.push({ type, data })
         if (type === 'sandbox/mode') calls.sandboxEvents.push({ sessionId: id, type, data })
@@ -98,6 +147,7 @@ function setup({
     const session = makeSession(header)
     calls.sessions.push(session)
     for (const listener of [...sessionListeners]) listener(session)
+    session.published = true
     return session
   }
 
@@ -136,28 +186,52 @@ function setup({
           }),
           resolveMaxDepth: (value) => value,
           async startActivation(spec) {
-            calls.activations.push(spec)
+            const entry = { ...spec }
+            calls.activations.push(entry)
             if (beforeCreate) await beforeCreate(spec)
+            let child
             if (withSandbox) {
               for (const header of interlopers) fireSession(header)
-              const session = fireSession({ id: spec.childId, parentSession: spec.request.parent.id, origin: 'subagent' })
+              const session = fireSession({ id: spec.childId, parentSession: spec.parent.id, origin: 'subagent' })
               if (setupMode) session.append('sandbox/mode', { mode: setupMode, source: 'delegation' })
-              for (const listener of agentListeners) await listener({ agent: { id: spec.childId, session } })
+              child = makeChild(spec.childId, session)
+              entry.child = child
+              LIVE.set(child.id, child)
+              for (const listener of agentListeners) await listener({ agent: child, source: { kind: 'new' } })
+              if (emitRunStart) for (const listener of runListeners['subagent/start']) {
+                listener({ runId: `run-${spec.childId}`, provider: spec.provider, parentSessionId: spec.parent.id, id: spec.childId, local: true })
+              }
               calls.executed ??= []
               calls.executed.push({ childId: spec.childId, mode: sandboxPolicy.resolve({ session }).mode })
+              if (afterCreate) await afterCreate({ child, spec, runListeners })
             }
             return {
               childId: spec.childId,
+              messageId: `message-${spec.childId}`,
               get result() {
-                return resultError
-                  ? Promise.reject(resultError)
-                  : Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: reply }] })
+                return (async () => {
+                  if (child) {
+                    // The driver was woken at acceptance; it reaches the model only through the barrier.
+                    entry.decision = await child.step()
+                    entry.denied = PROBE_TOOLS.filter((name) => child.guards.some((guard) => guard({ name, agent: child }) !== undefined))
+                    entry.reasons = Object.fromEntries(probeTools.map((name) => [name, child.guards.map((guard) => guard({ name, agent: child })).find(Boolean)]))
+                    entry.persona = child.sections.map((section) => section.text({ scope: child })).filter(Boolean).join('\n') || undefined
+                  }
+                  if (resultError) throw resultError
+                  if (hangResult) { calls.hanging = true; await new Promise(() => {}) }
+                  return { stopReason: 'completed', output: [{ type: 'text', text: reply }] }
+                })()
               },
-              dispose: async () => {},
+              dispose: async () => {
+                calls.disposed ??= []
+                calls.disposed.push(spec.childId)
+                if (child) { LIVE.delete(child.id); child.release() }
+              },
             }
           },
         }
       }
+      if (name === 'agents') return { get: (id) => LIVE.get(id) }
       if (name === 'workingDirectory') return { ensure: async () => workspace }
       if (name === 'llm') return llm
       if (name === 'subagentModelSelection') return selection
@@ -179,7 +253,7 @@ function setup({
   }
   if (withSandbox) {
     ctx.on = (name, listener) => {
-      const listeners = name === 'session/created' ? sessionListeners : agentListeners
+      const listeners = name === 'session/created' ? sessionListeners : runListeners[name] ?? agentListeners
       listeners.push(listener)
       return () => {
         const index = listeners.indexOf(listener)
@@ -193,7 +267,8 @@ function setup({
     : undefined
   // 晚于本插件注册的监听器：用来验证"我们之后还有写入者"时仍然失败关闭。
   for (const listener of afterListeners) sessionListeners.push(listener)
-  return { ctx, calls, registry, runtime, disposers, skillNames, fireSession }
+  for (const listener of laterAgentListeners) agentListeners.push(listener)
+  return { ctx, calls, registry, runtime, disposers, skillNames, fireSession, runListeners }
 }
 
 /** F1 回归用台架：记录 skills.snapshot 收到的 view options，并允许改返回。 */
@@ -222,7 +297,9 @@ function fixtureSkillsProbe(seen) {
 }
 
 function fakeExec(id = 'session-1', mode = 'workspace-write') {
-  return { agent: { id, session: { header: { id, cwd: '/fake/project' }, events: [{ type: 'sandbox/mode', data: { mode } }] } }, signal: new AbortController().signal }
+  const agent = { id, session: { header: { id, cwd: '/fake/project' }, events: [{ type: 'sandbox/mode', data: { mode } }] } }
+  LIVE.set(id, agent)
+  return { agent, signal: new AbortController().signal }
 }
 
 /** 模拟 Android 组件：注册自己的技能与扩展（与真实入口同一份声明）。 */
@@ -318,11 +395,11 @@ test('before/base/after 全链路：领域扩展先跑，再跑基础节点', as
   const base = calls.activations[1]
   assert.equal(base.provider, 'spawn')
   assert.equal(base.delivery, 'caller')
-  assert.equal(base.request.cwd, '/fake/project')
-  assert.deepEqual(base.request.toolFilter.deny, ['satellite_node'])
-  assert.ok(base.request.persona, '默认 persona 不应被行配置顶掉')
-  assert.match(base.request.prompt[0].text, /跑一次真实验证/)
-  assert.match(calls.activations[0].request.prompt[0].text, /确认当前模块、变体/)
+  assert.equal(base.cwd, '/fake/project')
+  assert.deepEqual(base.denied, ['satellite_node'])
+  assert.ok(base.persona, '默认 persona 不应被行配置顶掉')
+  assert.match(base.prompt[0].text, /跑一次真实验证/)
+  assert.match(calls.activations[0].prompt[0].text, /确认当前模块、变体/)
   assert.match(value.result, /验证通过/)
   assert.deepEqual(value.ran, ['android.validation-context'], '完成结果应报告实际执行的扩展')
 })
@@ -360,13 +437,13 @@ test('review 节点：走完 before/base/after，子 Agent 用 change-review 的
 
   const base = calls.activations[0]
   assert.equal(base.provider, 'spawn')
-  assert.deepEqual(base.request.agentOptions, configured, '审查角色按角色路由绑定模型')
-  assert.deepEqual(base.request.toolFilter.deny, ['satellite_node', 'edit', 'write'])
-  assert.equal(base.request.toolFilter.deny.includes('bash'), false)
-  assert.equal(base.request.toolFilter.deny.includes('read'), false)
-  assert.match(base.request.persona, /未验证/)
-  assert.match(base.request.prompt[0].text, /独立审查当前差异/)
-  assert.match(base.request.prompt[0].text, /satellite-change-review/)
+  assert.deepEqual(base.agentOptions, configured, '审查角色按角色路由绑定模型')
+  assert.deepEqual(base.denied, ['satellite_node', 'edit', 'write'])
+  assert.equal(base.denied.includes('bash'), false)
+  assert.equal(base.denied.includes('read'), false)
+  assert.match(base.persona, /未验证/)
+  assert.match(base.prompt[0].text, /独立审查当前差异/)
+  assert.match(base.prompt[0].text, /satellite-change-review/)
   assert.match(value.result, /审查结论/)
 })
 
@@ -403,13 +480,13 @@ test('context 节点：走完 before/base/after，子 Agent 用 investigation �
 
   const base = calls.activations[0]
   assert.equal(base.provider, 'spawn')
-  assert.deepEqual(base.request.agentOptions, configured, '调查角色按角色路由绑定模型')
-  assert.deepEqual(base.request.toolFilter.deny, ['satellite_node', 'edit', 'write'])
-  assert.equal(base.request.toolFilter.deny.includes('bash'), false)
-  assert.equal(base.request.toolFilter.deny.includes('read'), false)
-  assert.match(base.request.persona, /缺口/)
-  assert.match(base.request.prompt[0].text, /有界调查：节点插槽的装配路径/)
-  assert.match(base.request.prompt[0].text, /satellite-investigation/)
+  assert.deepEqual(base.agentOptions, configured, '调查角色按角色路由绑定模型')
+  assert.deepEqual(base.denied, ['satellite_node', 'edit', 'write'])
+  assert.equal(base.denied.includes('bash'), false)
+  assert.equal(base.denied.includes('read'), false)
+  assert.match(base.persona, /缺口/)
+  assert.match(base.prompt[0].text, /有界调查：节点插槽的装配路径/)
+  assert.match(base.prompt[0].text, /satellite-investigation/)
   assert.match(value.result, /事实：入口在/)
 })
 
@@ -449,13 +526,13 @@ test('solution 节点：走完 before/base/after，子 Agent 用 solution-design
 
   const base = calls.activations[0]
   assert.equal(base.provider, 'spawn')
-  assert.deepEqual(base.request.agentOptions, configured, '方案角色按角色路由绑定模型')
-  assert.deepEqual(base.request.toolFilter.deny, ['satellite_node', 'edit', 'write'])
-  assert.equal(base.request.toolFilter.deny.includes('bash'), false)
-  assert.equal(base.request.toolFilter.deny.includes('read'), false)
-  assert.match(base.request.persona, /不编造信心/)
-  assert.match(base.request.prompt[0].text, /把当前差异的事实转成可评审的方案/)
-  assert.match(base.request.prompt[0].text, /satellite-solution/)
+  assert.deepEqual(base.agentOptions, configured, '方案角色按角色路由绑定模型')
+  assert.deepEqual(base.denied, ['satellite_node', 'edit', 'write'])
+  assert.equal(base.denied.includes('bash'), false)
+  assert.equal(base.denied.includes('read'), false)
+  assert.match(base.persona, /不编造信心/)
+  assert.match(base.prompt[0].text, /把当前差异的事实转成可评审的方案/)
+  assert.match(base.prompt[0].text, /satellite-solution/)
   assert.match(value.result, /推荐方案/)
 })
 
@@ -499,12 +576,12 @@ test('implement 节点：走完 before/base/after，继承父权限而不是通�
   const base = calls.activations[0]
   assert.equal(base.provider, 'spawn')
   // 写角色：不拒绝 edit/write，但仍拒绝节点入口（禁止递归包裹）。
-  assert.deepEqual(base.request.toolFilter.deny, ['satellite_node'])
-  assert.equal(base.request.toolFilter.deny.includes('edit'), false)
-  assert.equal(base.request.toolFilter.deny.includes('write'), false)
-  assert.equal(base.request.cwd, PACKAGE_ROOT, '只透传当前工作目录，不声称改变权限根')
-  assert.match(base.request.prompt[0].text, /satellite-implementation/)
-  assert.match(base.request.persona, /交回/)
+  assert.deepEqual(base.denied, ['satellite_node'])
+  assert.equal(base.denied.includes('edit'), false)
+  assert.equal(base.denied.includes('write'), false)
+  assert.equal(base.cwd, PACKAGE_ROOT, '只透传当前工作目录，不声称改变权限根')
+  assert.match(base.prompt[0].text, /satellite-implementation/)
+  assert.match(base.persona, /交回/)
   assert.deepEqual(calls.sandboxEvents.map((entry) => entry.data), [
     { mode: 'workspace-write', source: 'delegation' },
   ])
@@ -518,8 +595,8 @@ test('implement 节点：未配置 cwd 时子 Agent 用会话工作区（现状�
   const value = await runtime.tool.options.execute({ node: 'implement', task: '改一个已同意的单元' }, fakeExec())
 
   assert.equal(value.kind, 'completed')
-  assert.equal(calls.activations[0].request.cwd, '/fake/project')
-  assert.deepEqual(calls.activations[0].request.toolFilter.deny, ['satellite_node'])
+  assert.equal(calls.activations[0].cwd, '/fake/project')
+  assert.deepEqual(calls.activations[0].denied, ['satellite_node'])
   assert.deepEqual(value.sandbox, ['satellite_node:implement=workspace-write'])
 })
 
@@ -569,13 +646,13 @@ test('signoff 节点：走完 before/base/after，子 Agent 用 acceptance 的�
 
   const base = calls.activations[0]
   assert.equal(base.provider, 'spawn')
-  assert.deepEqual(base.request.agentOptions, configured, '验收角色按角色路由绑定模型')
-  assert.deepEqual(base.request.toolFilter.deny, ['satellite_node', 'edit', 'write'])
-  assert.equal(base.request.toolFilter.deny.includes('bash'), false)
-  assert.equal(base.request.toolFilter.deny.includes('read'), false)
-  assert.match(base.request.persona, /业务验收/)
-  assert.match(base.request.prompt[0].text, /按证据声明接受与否与剩余限制/)
-  assert.match(base.request.prompt[0].text, /satellite-acceptance/)
+  assert.deepEqual(base.agentOptions, configured, '验收角色按角色路由绑定模型')
+  assert.deepEqual(base.denied, ['satellite_node', 'edit', 'write'])
+  assert.equal(base.denied.includes('bash'), false)
+  assert.equal(base.denied.includes('read'), false)
+  assert.match(base.persona, /业务验收/)
+  assert.match(base.prompt[0].text, /按证据声明接受与否与剩余限制/)
+  assert.match(base.prompt[0].text, /satellite-acceptance/)
   assert.match(value.result, /接受：100\/100/)
 })
 
@@ -761,7 +838,7 @@ test('角色路由透传给原生创建请求', async () => {
     fakeExec(),
   )
   assert.deepEqual(calls.activations.at(-1).label, 'satellite_node:validate')
-  assert.deepEqual(calls.activations.at(-1).request.agentOptions, configured)
+  assert.deepEqual(calls.activations.at(-1).agentOptions, configured)
 })
 
 test('非法路由在创建子 Agent 之前被原生校验拒绝，不产生子会话', async () => {
@@ -811,12 +888,12 @@ test('改活配置后下一次调用立即生效，无需重新装配', async ()
   mountAndroid({ registry, skillNames })
 
   await scoped.tool.options.execute({ node: 'validate', task: '验证', facts: { projectKind: 'android' } }, fakeExec())
-  assert.deepEqual(calls.activations.at(-1).request.agentOptions, { provider: 'deepseek-official', model: 'deepseek-flash' })
+  assert.deepEqual(calls.activations.at(-1).agentOptions, { provider: 'deepseek-official', model: 'deepseek-flash' })
 
   // 不重建 runtime、不重新装配，只改活配置值
   live = [{ role: 'validation', provider: 'deepseek-official', model: 'deepseek-v4-pro' }]
   await scoped.tool.options.execute({ node: 'validate', task: '验证', facts: { projectKind: 'android' } }, fakeExec())
-  assert.deepEqual(calls.activations.at(-1).request.agentOptions, { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
+  assert.deepEqual(calls.activations.at(-1).agentOptions, { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
 })
 
 test('行配置为空时走 schema 代码默认路由：review→v4-pro、validate→flash', async () => {
@@ -831,14 +908,14 @@ test('行配置为空时走 schema 代码默认路由：review→v4-pro、valida
   mountAndroid({ registry, skillNames })
 
   await scoped.tool.options.execute({ node: 'review', task: '独立审查当前差异' }, fakeExec())
-  assert.deepEqual(calls.activations.at(-1).request.agentOptions, {
+  assert.deepEqual(calls.activations.at(-1).agentOptions, {
     provider: 'deepseek-official',
     model: 'deepseek-v4-pro',
   })
 
   await scoped.tool.options.execute({ node: 'validate', task: '验证', facts: { projectKind: 'android' } }, fakeExec())
   assert.equal(calls.activations.at(-1).label, 'satellite_node:validate')
-  assert.deepEqual(calls.activations.at(-1).request.agentOptions, {
+  assert.deepEqual(calls.activations.at(-1).agentOptions, {
     provider: 'deepseek-official',
     model: 'deepseek-flash',
   })
@@ -976,25 +1053,35 @@ test('恢复路径复用已完成的基础结果时，如实说明本次没有�
   assert.deepEqual(resumed.sandbox, ['satellite_node:validate=未重新施加（复用上次调用已完成的基础结果）'])
 })
 
-test('失败关闭：晚于本插件注册的监听器把模式改宽时，窗口关闭前重写并如实报告', async () => {
-  // 合成的反例：一个在我们之后注册、无条件写 danger-full-access 的监听器。
-  const widening = (session) => {
-    if (session.header.origin === 'subagent') {
-      session.append('sandbox/mode', { mode: 'danger-full-access', source: 'delegation' })
+test('失败关闭：晚于本插件的 agent/created 监听器把模式改宽时，回执读回拒绝启动', async () => {
+  // 反例：一个在我们之后注册、无条件写 danger-full-access 的 agent/created 监听器。
+  // （session/created 期间真实 Session 拒绝 append，那条路径改由 veto 覆盖。）
+  const widening = ({ agent }) => {
+    if (agent.session.header.origin === 'subagent') {
+      agent.session.append('sandbox/mode', { mode: 'danger-full-access', source: 'delegation' })
     }
   }
-  const { calls, runtime } = setup({ withSandbox: true, afterListeners: [widening], reply: '审查结论' })
+  const { calls, runtime } = setup({ withSandbox: true, laterAgentListeners: [widening], reply: '审查结论' })
 
   const value = await runtime.tool.options.execute({ node: 'review', task: '独立审查当前差异' }, fakeExec())
 
-  assert.deepEqual(
-    calls.sandboxEvents.map((entry) => entry.data.mode),
-    ['read-only', 'danger-full-access', 'read-only'],
-    '发现被改宽后必须再写一次，让目标模式成为最后一条事件',
-  )
-  assert.deepEqual(value.sandbox, [
-    'satellite_node:review=read-only',
-  ])
+  assert.deepEqual(calls.sandboxEvents.map((entry) => entry.data.mode).slice(-2), ['read-only', 'danger-full-access'])
+  assert.equal(value.kind, 'failed', JSON.stringify(value))
+  // The fake records `executed` at creation; the child's first step only happens via result.
+  assert.equal(calls.activations[0].decision, undefined, 'widened child never reaches a step')
+  assert.deepEqual(calls.disposed, [calls.activations[0].childId], 'widened child released')
+  assert.match(JSON.stringify(value), /被改宽/)
+})
+
+test('session/created 期间的 append 被真实 Session 时序拒绝，后注册监听器无法借此改宽', async () => {
+  const widening = (session) => {
+    if (session.header.origin === 'subagent') session.append('sandbox/mode', { mode: 'danger-full-access', source: 'delegation' })
+  }
+  const { calls, runtime } = setup({ withSandbox: true, afterListeners: [widening], reply: '审查结论' })
+  const value = await runtime.tool.options.execute({ node: 'review', task: '审查' }, fakeExec())
+  assert.equal(calls.sandboxEvents.some((entry) => entry.data.mode === 'danger-full-access'), false)
+  assert.notEqual(value.kind, 'completed')
+  assert.equal(calls.executed?.length ?? 0, 0, 'vetoed session publication creates no child')
 })
 
 test('只挂载会话事件但缺策略时启动前失败', async () => {
@@ -1027,7 +1114,7 @@ test('原生 setup 在 session/created 后播种父权限，agent/created 必须
   const { calls, runtime } = setup({ setupMode: 'workspace-write' })
   const value = await runtime.tool.options.execute({ node: 'review', task: '审查' }, fakeExec())
   assert.equal(value.kind, 'completed')
-  assert.deepEqual(calls.sandboxEvents.map((entry) => entry.data.mode), ['read-only', 'workspace-write', 'read-only'])
+  assert.deepEqual(calls.sandboxEvents.map((entry) => entry.data.mode), ['workspace-write', 'read-only'])
   assert.equal(calls.executed[0].mode, 'read-only')
 })
 
@@ -1050,9 +1137,11 @@ test('同父乱序创建按预留 childId 绑定，普通子会话不能抢走�
       if (spec.label === 'satellite_node:review') { reviewEntered(); await reviewGate }
     },
   })
-  const review = runtime.tool.options.execute({ node: 'review', task: '审查' }, fakeExec())
+  // One exact live parent issuing two concurrent calls (each with its own signal).
+  const parent = fakeExec()
+  const review = runtime.tool.options.execute({ node: 'review', task: '审查' }, parent)
   await entered
-  const implementation = await runtime.tool.options.execute({ node: 'implement', task: '实施' }, fakeExec())
+  const implementation = await runtime.tool.options.execute({ node: 'implement', task: '实施' }, { agent: parent.agent, signal: new AbortController().signal })
   releaseReview()
   assert.equal((await review).kind, 'completed')
   assert.equal(implementation.kind, 'completed')
@@ -1082,10 +1171,10 @@ test('扩展收到节点任务和事实，base 收到前置原始结果，暂停
     node: 'validate', task: 'TASK-UNIT-42', facts: { projectKind: 'android', 'acceptance.required': true },
   }, fakeExec())
   assert.equal(value.kind, 'suspended')
-  assert.match(calls.activations[0].request.prompt[0].text, /TASK-UNIT-42/)
-  assert.match(calls.activations[0].request.prompt[0].text, /projectKind/)
-  assert.match(calls.activations[1].request.prompt[0].text, /UNIQUE-PRECHECK/)
-  assert.match(calls.activations[1].request.prompt[0].text, /projectKind/)
+  assert.match(calls.activations[0].prompt[0].text, /TASK-UNIT-42/)
+  assert.match(calls.activations[0].prompt[0].text, /projectKind/)
+  assert.match(calls.activations[1].prompt[0].text, /UNIQUE-PRECHECK/)
+  assert.match(calls.activations[1].prompt[0].text, /projectKind/)
   assert.equal(value.extensions.find((entry) => entry.id === 'android.validation-context').note, '证据 UNIQUE-PRECHECK')
   const text = runtime.tool.options.output.render({}, value)[0].text
   assert.match(text, /基础节点结果/)
@@ -1114,7 +1203,7 @@ test('更早 agent/created 钩子施加更严子权限时保留只读，不写�
   const value = await runtime.tool.options.execute({ node: 'implement', task: '实施' }, fakeExec())
   assert.equal(value.kind, 'completed')
   assert.equal(calls.executed[0].mode, 'read-only')
-  assert.deepEqual(calls.sandboxEvents.map((entry) => entry.data.mode), ['workspace-write', 'read-only'])
+  assert.deepEqual(calls.sandboxEvents.map((entry) => entry.data.mode), ['read-only', 'read-only'])
   assert.match(value.sandbox[0], /read-only/)
 })
 
@@ -1171,11 +1260,11 @@ test('扩展显式声明的方法技能真的进入子会话提示，且不改�
   assert.equal(value.kind, 'completed')
   const extensionRole = calls.activations.at(-1)
   assert.match(extensionRole.label, /test\.method-override/)
-  assert.match(extensionRole.request.prompt[0].text, /android-change-review/)
-  assert.doesNotMatch(extensionRole.request.prompt[0].text, /android-validation-context/)
+  assert.match(extensionRole.prompt[0].text, /android-change-review/)
+  assert.doesNotMatch(extensionRole.prompt[0].text, /android-validation-context/)
   // 覆盖只影响方法：角色、provider、模型与工具限制仍来自用户配置。
   assert.equal(extensionRole.provider, 'spawn')
-  assert.deepEqual(extensionRole.request.agentOptions, { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
+  assert.deepEqual(extensionRole.agentOptions, { provider: 'deepseek-official', model: 'deepseek-v4-pro' })
   assert.equal(value.sandbox.length > 0, true)
 })
 
@@ -1187,7 +1276,7 @@ test('未声明方法时沿用角色默认技能，保持既有兼容', async ()
   assert.equal(value.kind, 'completed')
   const extensionActivation = calls.activations.at(-1)
   assert.match(extensionActivation.label, /test\.default-skill/)
-  assert.match(extensionActivation.request.prompt[0].text, /android-validation-context/)
+  assert.match(extensionActivation.prompt[0].text, /android-validation-context/)
 })
 
 test('扩展声明的方法不可见时阻塞，且不创建任何子会话', async () => {
@@ -1229,8 +1318,8 @@ test('after 扩展收到基础原始结果与已完成扩展，before 看不到�
   assert.equal(after[0].evidence.previousExtensions[0].status, 'completed')
   // 扩展角色的提示里确实能看到这段基础证据，而不只是代码里拿到对象。
   const afterActivation = calls.activations.find((entry) => /test\.after-evidence/.test(entry.label))
-  assert.match(afterActivation.request.prompt[0].text, /BASE-EVIDENCE-MARKER/)
-  assert.match(afterActivation.request.prompt[0].text, /test\.before-evidence/)
+  assert.match(afterActivation.prompt[0].text, /BASE-EVIDENCE-MARKER/)
+  assert.match(afterActivation.prompt[0].text, /test\.before-evidence/)
 })
 
 test('执行证据是只读快照：扩展改写不会污染基础结果或后续扩展', async () => {
@@ -1290,9 +1379,9 @@ test('真实 Android 专项：review.after 用声明的方法技能并看到基�
   assert.deepEqual(value.extensions.map((entry) => entry.id), ['android.platform-review'])
   const extensionActivation = calls.activations.find((entry) => /android\.platform-review/.test(entry.label))
   assert.ok(extensionActivation, '专项扩展必须真的启动了角色')
-  assert.match(extensionActivation.request.prompt[0].text, /android-change-review/)
-  assert.match(extensionActivation.request.prompt[0].text, /BASE-REVIEW-MARKER/)
-  assert.match(extensionActivation.request.prompt[0].text, /lifecycle/)
+  assert.match(extensionActivation.prompt[0].text, /android-change-review/)
+  assert.match(extensionActivation.prompt[0].text, /BASE-REVIEW-MARKER/)
+  assert.match(extensionActivation.prompt[0].text, /lifecycle/)
   // 只读角色边界不变。
   assert.equal(calls.executed.every((entry) => entry.mode === 'read-only'), true)
 })
@@ -1381,7 +1470,7 @@ test('省略 tier 保持节点默认，自定义 role 不暗中继承内置档�
   } })
   const oldCustom = await f.runtime.tool.options.execute({ node: 'implement', task: '旧自定义调用' }, fakeExec())
   assert.deepEqual(oldCustom.selection, { role: 'local-implementation' })
-  assert.match(f.calls.activations[0].request.prompt[0].text, /LOCAL-ROLE/)
+  assert.match(f.calls.activations[0].prompt[0].text, /LOCAL-ROLE/)
   const blocked = await f.runtime.tool.options.execute({ node: 'implement', task: '显式档位', tier: 'light' }, fakeExec())
   assert.equal(blocked.kind, 'blocked')
   assert.equal(f.calls.activations.length, 1)
@@ -1418,7 +1507,7 @@ test('solution/implement/review 三个节点的四档经公开 schema 使用正�
     const value = await f.runtime.tool.execute({ node, task: '一个已确认的有界单元', tier }, fakeExec())
     assert.equal(value.kind, 'completed')
     assert.equal(f.calls.activations.length, 1)
-    const actual = f.calls.activations[0].request
+    const actual = f.calls.activations[0]
     assert.deepEqual(value.selection, { role, tier })
     const packet = JSON.parse(actual.prompt[0].text.split('\n').find((line) => line.startsWith('{"selection":')))
     assert.deepEqual(packet.selection, value.selection, 'child receives the frozen assigned tier as task data')
@@ -1431,7 +1520,7 @@ test('solution/implement/review 三个节点的四档经公开 schema 使用正�
     assert.match(actual.prompt[0].text, new RegExp(`SELECTED:${role}`))
     assert.ok(actual.prompt[0].text.includes(DEFAULT_CONFIG.roles[role].skill))
     const baseRole = baseRoles[node]
-    assert.deepEqual(actual.toolFilter, DEFAULT_CONFIG.roles[baseRole].toolFilter, '档位不提升工具权限')
+    assert.deepEqual(actual.denied, DEFAULT_CONFIG.roles[baseRole].toolFilter.deny, '档位不提升工具权限')
     assert.equal(f.calls.executed[0].mode, DEFAULT_CONFIG.roles[baseRole].sandbox, '档位不提升文件权限')
   }
 })
@@ -1513,8 +1602,8 @@ test('显式 tierRoles 可绑定自定义角色，不开放调用方任意 role 
     node: 'review', task: '专项', tier: 'senior', facts: { role: 'implementation' },
   }, fakeExec())
   assert.equal(value.execution.role, 'specialist')
-  assert.match(f.calls.activations[0].request.prompt[0].text, /SPECIALIST-METHOD/)
-  assert.deepEqual(f.calls.activations[0].request.toolFilter.deny, ['satellite_node', 'edit', 'write', 'bash'])
+  assert.match(f.calls.activations[0].prompt[0].text, /SPECIALIST-METHOD/)
+  assert.deepEqual(f.calls.activations[0].denied, ['satellite_node', 'edit', 'write', 'bash'])
   assert.equal(f.calls.executed[0].mode, 'read-only')
 })
 
@@ -1533,8 +1622,8 @@ test('默认不分级节点仍可通过自定义 tierRoles 选用角色，不硬
     node: 'validate', task: '专项验证', tier: 'critical',
   }, fakeExec())
   assert.deepEqual(value.selection, { role: 'special-validator', tier: 'critical' })
-  assert.match(f.calls.activations[0].request.prompt[0].text, /SPECIAL-VALIDATION-METHOD/)
-  assert.deepEqual(f.calls.activations[0].request.toolFilter, DEFAULT_CONFIG.roles.validation.toolFilter)
+  assert.match(f.calls.activations[0].prompt[0].text, /SPECIAL-VALIDATION-METHOD/)
+  assert.deepEqual(f.calls.activations[0].denied, DEFAULT_CONFIG.roles.validation.toolFilter.deny)
   assert.equal(f.calls.executed[0].mode, DEFAULT_CONFIG.roles.validation.sandbox)
 })
 
@@ -1570,7 +1659,7 @@ test('before 恢复冻结选择并保留身份绑定，省略 tier 继承且未�
   assert.deepEqual(resumed.selection, first.selection)
   assert.equal(resumed.execution.role, 'implementation-light')
   assert.equal(f.calls.activations.length, 1)
-  const packet = JSON.parse(f.calls.activations[0].request.prompt[0].text.split('\n').find((line) => line.startsWith('{"selection":')))
+  const packet = JSON.parse(f.calls.activations[0].prompt[0].text.split('\n').find((line) => line.startsWith('{"selection":')))
   assert.deepEqual(packet.selection, first.selection, 'resume sends the original selection, not the changed request')
 })
 
@@ -1627,4 +1716,231 @@ test('基础启动后 result 拒绝仍保留已启动角色和请求路由证据
   assert.deepEqual(value.execution, { role: 'implementation-light', ...DEFAULT_CONFIG.roles['implementation-light'].agentOptions })
   assert.deepEqual(validateJsonSchemaValue(f.runtime.tool.output.schema, value), [])
   assert.match(f.runtime.tool.output.render({}, value)[0].text, /已启动基础角色：implementation-light.*请求路由/)
+})
+
+// ---- Delegation record / pre-step barrier (DSH 0.2.2 timing) ----
+
+test('barrier: provisional child cannot reach the model or run any tool before the receipt activates it', async () => {
+  let pending
+  const observed = {}
+  const f = setup({
+    afterCreate: async ({ child }) => {
+      pending = child.step()
+      await new Promise((resolve) => setImmediate(resolve))
+      observed.settledEarly = await Promise.race([pending.then(() => true), Promise.resolve(false)])
+      // First-tool race: every tool, including the child scope's own, is denied while provisional.
+      observed.denied = PROBE_TOOLS.filter((name) => child.guards.some((guard) => guard({ name, agent: child }) !== undefined))
+    },
+  })
+  const value = await f.runtime.tool.options.execute({ node: 'implement', task: '单元' }, fakeExec())
+  assert.equal(value.kind, 'completed')
+  assert.equal(observed.settledEarly, false, 'pre-step waits at the barrier until activation')
+  assert.deepEqual(observed.denied, PROBE_TOOLS)
+  assert.deepEqual(await pending, { kind: 'enter', messages: [] }, 'the parked step enters after activation')
+  const entry = f.calls.activations[0]
+  assert.deepEqual(entry.denied, ['satellite_node'], 'active child keeps only its role restriction')
+  // After completion the record is revoked before disposal: everything is denied again.
+  const child = entry.child
+  assert.ok(PROBE_TOOLS.every((name) => child.guards.some((guard) => guard({ name, agent: child }) !== undefined)))
+  assert.deepEqual(await child.step(), { kind: 'reject' })
+  assert.deepEqual(f.calls.disposed, [entry.childId])
+})
+
+test('barrier: a pending pre-step wakes on its turn signal without a receipt (no deadlock)', async () => {
+  let outcome
+  const f = setup({
+    afterCreate: async ({ child }) => {
+      const turn = new AbortController()
+      const pending = child.step(turn.signal)
+      turn.abort()
+      outcome = await pending
+    },
+  })
+  await f.runtime.tool.options.execute({ node: 'implement', task: '单元' }, fakeExec())
+  assert.deepEqual(outcome, { kind: 'reject' })
+})
+
+test('parent call cancellation during creation revokes, unlocks the barrier and disposes; no result accepted', async () => {
+  const controller = new AbortController()
+  let pending
+  const f = setup({
+    afterCreate: async ({ child }) => {
+      pending = child.step()
+      controller.abort()
+    },
+  })
+  const exec = fakeExec()
+  const value = await f.runtime.tool.options.execute({ node: 'implement', task: '单元' }, { agent: exec.agent, signal: controller.signal })
+  assert.notEqual(value.kind, 'completed')
+  assert.deepEqual(await pending, { kind: 'reject' })
+  const entry = f.calls.activations[0]
+  assert.equal(entry.decision, undefined, 'the result was never awaited')
+  assert.deepEqual(f.calls.disposed, [entry.childId])
+  assert.ok(entry.child.guards.some((guard) => guard({ name: 'read', agent: entry.child }) !== undefined))
+})
+
+test('missing subagent/start runId or a mismatched run identity fails closed', async () => {
+  const missing = setup({ emitRunStart: false })
+  const value = await missing.runtime.tool.options.execute({ node: 'implement', task: '单元' }, fakeExec())
+  assert.equal(value.kind, 'failed')
+  assert.match(value.result, /委派创建边界/)
+  assert.deepEqual(missing.calls.disposed, [missing.calls.activations[0].childId])
+
+  const forged = setup({
+    emitRunStart: false,
+    afterCreate: async ({ child, spec, runListeners }) => {
+      for (const listener of runListeners['subagent/start']) {
+        listener({ runId: 'r', provider: spec.provider, parentSessionId: 'someone-else', id: child.id, local: true })
+      }
+    },
+  })
+  const second = await forged.runtime.tool.options.execute({ node: 'implement', task: '单元' }, fakeExec())
+  assert.equal(second.kind, 'failed')
+})
+
+test('child released before the receipt and a matching subagent/end both revoke; no automatic rebind', async () => {
+  const released = setup({ afterCreate: async ({ child }) => { child.release() } })
+  const first = await released.runtime.tool.options.execute({ node: 'implement', task: '单元' }, fakeExec())
+  assert.equal(first.kind, 'failed')
+
+  let pending
+  const ended = setup({
+    afterCreate: async ({ child, spec, runListeners }) => {
+      pending = child.step()
+      for (const listener of runListeners['subagent/end']) {
+        listener({ runId: `run-${spec.childId}`, provider: spec.provider, parentSessionId: spec.parent.id, id: child.id, local: true, stopReason: 'cancelled' })
+      }
+      // A later lifecycle for the same id is not re-bound.
+      for (const listener of runListeners['subagent/start']) {
+        listener({ runId: 'later', provider: spec.provider, parentSessionId: spec.parent.id, id: child.id, local: true })
+      }
+    },
+  })
+  const second = await ended.runtime.tool.options.execute({ node: 'implement', task: '单元' }, fakeExec())
+  assert.equal(second.kind, 'failed')
+  assert.deepEqual(await pending, { kind: 'reject' })
+})
+
+test('role persona is a child-scoped prompt section, not a legacy request field', async () => {
+  const f = setup()
+  await f.runtime.tool.options.execute({ node: 'implement', task: '单元' }, fakeExec())
+  const entry = f.calls.activations[0]
+  assert.match(entry.persona, /交回/)
+  assert.equal(entry.child.sections.map((section) => section.text({ scope: { id: 'other' } })).join(''), '')
+  assert.equal(Object.hasOwn(entry, 'toolFilter') || Object.hasOwn(entry, 'request'), false, 'no legacy request shape')
+  assert.ok(entry.child.guards.some((guard) => guard({ name: 'read', agent: entry.child }) !== undefined), 'revoked after completion')
+})
+
+test('plugin unload revokes in-flight provisional delegations', async () => {
+  let pending
+  let disposers
+  const f = setup({
+    afterCreate: async ({ child }) => {
+      pending = child.step()
+      for (const dispose of disposers.splice(0)) dispose()
+    },
+  })
+  disposers = f.disposers
+  const value = await f.runtime.tool.options.execute({ node: 'implement', task: '单元' }, fakeExec())
+  assert.notEqual(value.kind, 'completed')
+  assert.deepEqual(await pending, { kind: 'reject' })
+  assert.equal(f.calls.activations[0].decision, undefined)
+})
+
+// ── review P1/P2 regressions: post-receipt shutdown, fixed child baseline ──
+
+test('post-receipt cancel disposes immediately without waiting for a result that never settles', async () => {
+  const { runtime, calls } = setup({ hangResult: true })
+  const exec = fakeExec()
+  const controller = new AbortController()
+  const pending = runtime.tool.options.execute({ node: 'context', task: '长请求' }, { ...exec, signal: controller.signal })
+  while (!calls.hanging) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(calls.disposed, undefined, 'still running before cancel')
+  controller.abort()
+  const value = await pending
+  assert.deepEqual(calls.disposed, [calls.activations[0].childId])
+  assert.notEqual(value.kind, 'completed')
+  // Guards stay in the child scope until release, then deny (revoked).
+  const child = calls.activations[0].child
+  assert.ok(child.guards.every((guard) => guard({ name: 'read', agent: child }) !== undefined))
+})
+
+test('row unload during a post-receipt run disposes the activation, not only revokes it', async () => {
+  const { runtime, calls, disposers } = setup({ hangResult: true })
+  const pending = runtime.tool.options.execute({ node: 'context', task: '长请求' }, fakeExec())
+  while (!calls.hanging) await new Promise((resolve) => setImmediate(resolve))
+  for (const dispose of disposers.splice(0).reverse()) dispose()
+  const value = await pending
+  assert.deepEqual(calls.disposed, [calls.activations[0].childId])
+  assert.notEqual(value.kind, 'completed')
+})
+
+test('cancel recorded before the receipt disposes as soon as the activation exists', async () => {
+  const controller = new AbortController()
+  const { runtime, calls } = setup({ afterCreate: async () => { controller.abort() } })
+  const exec = fakeExec()
+  const value = await runtime.tool.options.execute({ node: 'context', task: '回执前取消' }, { ...exec, signal: controller.signal })
+  assert.deepEqual(calls.disposed, [calls.activations[0].childId])
+  assert.notEqual(value.kind, 'completed')
+})
+
+test('ordinary roles cannot use uncontrolled delegation/communication tools, even when allow lists them', async () => {
+  const orchestration = ['subagent', 'subagent_fork', 'subagent_codex', 'workflow', 'send_message', 'interrupt_agent', 'team_task_create', 'team_task_update']
+  const readOnly = ['list_agents', 'list_subagent_models', 'team_task_list', 'read']
+  const { runtime, calls } = setup({
+    config: { roles: { investigation: { toolFilter: { allow: [...orchestration, ...readOnly] } } } },
+    probeTools: [...orchestration, ...readOnly, 'run_code'],
+  })
+  const value = await runtime.tool.options.execute({ node: 'context', task: '尝试越界' }, fakeExec())
+  assert.equal(value.kind, 'completed')
+  const { reasons } = calls.activations[0]
+  for (const name of orchestration) assert.match(reasons[name] ?? '', /不受控的委派\/通信入口/, name)
+  for (const name of readOnly) assert.equal(reasons[name], undefined, name)
+  assert.match(reasons.run_code, /PTC 工具执行器/)
+})
+
+test('managed role child cannot create any grandchild session, whatever entry name or allow list', async () => {
+  const vetoes = []
+  let fire
+  const { runtime, calls, fireSession } = setup({
+    // An unknown scope-local alias is explicitly allowed and passes the name guard.
+    config: { roles: { investigation: { toolFilter: { allow: ['delegate_task', 'read'] } } } },
+    probeTools: ['delegate_task', 'read'],
+    afterCreate: async ({ child }) => {
+      try { fire({ id: 'grandchild-1', parentSession: child.session.header.id, origin: 'subagent' }) }
+      catch (error) { vetoes.push(String(error.message)) }
+      // Sessions not created by a managed child stay unaffected.
+      fire({ id: 'unrelated-1', parentSession: 'someone-else', origin: 'subagent' })
+    },
+  })
+  fire = fireSession
+  const value = await runtime.tool.options.execute({ node: 'context', task: '别名委派' }, fakeExec())
+  assert.equal(value.kind, 'completed')
+  const { reasons } = calls.activations[0]
+  // The name guard leaves legitimate scope-local tools alone.
+  assert.equal(reasons.delegate_task, undefined)
+  assert.equal(reasons.read, undefined)
+  assert.equal(vetoes.length, 1, JSON.stringify(vetoes))
+  assert.match(vetoes[0], /不能创建下级 Agent/)
+  assert.equal(calls.sessions.find((s) => s.id === 'grandchild-1')?.published, false)
+  assert.equal(calls.sessions.find((s) => s.id === 'unrelated-1')?.published, true)
+})
+
+test('host contract gate: npm 0.2.2-alpha.3 shape (no rootOf) refuses the node row before any registration', async () => {
+  const { missingHostContracts } = await import('../lib/node/lib/wiring.js')
+  const { apply } = await import('../lib/node/index.js')
+  const registered = []
+  const host = (subagents) => ({
+    get: (name) => (name === 'subagents' ? subagents : undefined),
+    tools: { guard: () => () => {}, register: (tool) => { registered.push(tool); return () => {} } },
+    on: () => () => {},
+    effect: () => {}, plugin: () => {},
+  })
+  // Same version label, different API: request-wrapped startActivation, no rootOf.
+  const npmShape = host({ startActivation: async () => ({}) })
+  assert.deepEqual(missingHostContracts(npmShape), ['subagents.rootOf'])
+  assert.throws(() => apply(npmShape, {}), /subagents\.rootOf[\s\S]*npm 0\.2\.2-alpha\.3/)
+  assert.equal(registered.length, 0, 'nothing registered on a refused host')
+  assert.deepEqual(missingHostContracts(host({ startActivation() {}, rootOf() {} })), [])
+  assert.deepEqual(missingHostContracts({ get: () => undefined }), ['subagents.rootOf', 'subagents.startActivation', 'tools.guard', 'ctx.on(agent/created)'])
 })

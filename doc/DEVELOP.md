@@ -40,6 +40,50 @@ npm test           # npm run build && node --test test/*.test.mjs
 
 `node --test <目录>` 不会递归发现用例，所以测试脚本显式使用 `test/*.test.mjs` glob。
 
+### 真实 Loader 集成测试
+
+```bash
+npm run test:loader   # DSH_SOURCE 默认 ../deepseek-harness（已 pnpm install + build 的目标源码 checkout）
+```
+
+`test/loader/` 经公开 `@deepseek-ai/dsh-app-boot`（`loadProfileDirectory` + `createRuntimeResolution` + `PluginPackages` + `boot`）
+装配目标 checkout 的 headless profile（dsh-base + dsh-headless）与临时 profile 内打包后的 Satellite bundle；
+四个 peer 链到安装自身副本，测试断言 Cordis 单实例。agent 注册表/循环、subagent manager、session+JSONL 持久化、
+native 执行器、沙箱策略、sandbox/subprocess/fs 与 user-approval 都是生产行；只有模型回复（`fixtures/scripted-llm.mjs`）
+与回答审批的人（`fixtures/approval-answerer.mjs`，挂在 `approval/request`，审计仍由真实 ApprovalService 写）是确定性输入。
+每次运行在临时目录新建 DSH home、profile 与 git 仓库，不触碰用户仓库或 live profile。
+
+用例与判定（每个用例只有 pass / fail，没有 skip）：
+
+| 用例 | 证明什么 |
+| --- | --- |
+| composition | 目标 checkout 树、Cordis 单实例、Satellite 行在 native 执行器上激活 |
+| ordinary | 六个基础节点 before/base/after、暂停+resume、角色提示/工具过滤、深度 2 委派拒绝 |
+| cancellation | 子 Agent 等模型时父取消，收敛并释放子 Agent |
+| lifecycle | 晚于 Satellite 注册的 `agent/created` 钩子抛错：manager 回滚不死锁、子 Agent 释放、无残留授权（钩子在测试中注册，保证真实监听顺序在 Satellite 之后） |
+| ordinary sandbox | 只读子 Agent：正对照（允许的读成功）、负对照（写被策略拒绝）、零文件副作用 |
+| version-control | 真实 status/diff/log/stage/commit，每次写一次真实审批 |
+| version-control approval | 审批等待中父调用被取消：迟到的 allowed-once 不写入；审批人是 exact live 父身份 |
+
+macOS 原生沙箱（sandbox-exec）不能嵌套：在外层沙箱（如 agent 文件沙箱）里运行时，
+ordinary sandbox、version-control 与 version-control approval 会以 `ENVIRONMENT BLOCKED` **失败**
+（不是跳过，也不是通过）：正对照被外层沙箱挡住时，负对照"文件没写出来"不能证明策略生效。
+这三项须在无外层沙箱的终端运行 `npm run test:loader`，在那之前它们是"未验证"。
+
+注意：npm 上发布的 `@deepseek-ai/*@0.2.2-alpha.3`（release 分支）与目标源码 8bd0733 同号但 API 不同
+（`startActivation` 需 `request` 包装、无 `subagents.rootOf`），Satellite 只对目标源码兼容。
+本仓库的 devDependencies 是 npm 版，只用于类型与单元测试；兼容性结论只来自上面的真实 Loader 测试。
+运行时门禁：`src/node/lib/wiring.ts` 的 `assertHostContracts` 在节点行注册任何东西之前检查
+`subagents.rootOf`/`subagents.startActivation`/`tools.guard`/`ctx.on`，缺失时拒绝该行（Cordis 记录该行失败，不影响宿主其余部分）。
+`rootOf` 是扁平激活契约在公开面上的判别项；执行器种类无公开查询接口，不作为启动门禁（native 由 composition 用例真实核对）。
+
+### 目标宿主与迁移理由
+
+- `engines`：Node `>=24.9.0`、DSH 精确 `0.2.2-alpha.3`；peer/dev 依赖对齐 alpha.3（cordis `4.0.6-alpha.2`、schemastery `3.18.6-alpha.2`）。`npm ls @deepseek-ai/cordis` 必须只有一份。
+- 迁移原因：0.2.2 移除了 subagent 后端的 persona/toolFilter 能力与 `request` 包装，改为 `startActivation` 回执 + `agent/created`/`agent/pre-step`；角色提示与工具限制改由本插件在 exact child scope 用 `systemPrompt.section`/`tools.guard` 施加。旧 App（0.2.1/rc）不可安装，不提供版本豁免。
+- 执行器：只支持 native。`@deepseek-ai/dsh-tool-executor-ptc`（仅测试 devDependency，不进 peer）用于证明 PTC 下 `run_code` 被拒绝且不执行程序；alpha.3 没有公开的"查询作用域执行器"接口（`ToolRuntime.selectExecutor` 私有），因此诊断发生在第一次直接 `run_code`（只有 PTC 执行器会把它送到 guard）。
+- schedule 协调白名单按 alpha.3 `dsh-tool-schedule` 真实注册名：`schedule_create/list/view/edit`。
+
 ## 资源路径约定（构建后最容易出错的一环）
 
 源码在 `src/<组件>/`，入口构建到 `lib/<组件>/`，而 `locale/`、`icon.svg`、`skills/`

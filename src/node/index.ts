@@ -12,7 +12,7 @@ import z from '@deepseek-ai/schemastery'
 
 import { resourceDirFrom } from '../lib/skills.js'
 import { BUILTIN_ROLE_NAMES, BUILTIN_ROUTES } from './lib/config.js'
-import { createNodeRuntime, registerCoordinatorBoundary } from './lib/wiring.js'
+import { assertHostContracts, createNodeRuntime, registerCoordinatorBoundary } from './lib/wiring.js'
 import type { CoordinatorContext } from './lib/wiring.js'
 import { SatelliteRoles } from './lib/role-service.js'
 import type { NodeRuntimeContext } from './lib/wiring.js'
@@ -22,7 +22,7 @@ import { registerSkillScriptTool } from './lib/skill-scripts.js'
 import type { SkillScriptContext } from './lib/skill-scripts.js'
 
 // skills 是硬依赖：节点工具必须能注册并核对方法技能，不能靠装配顺序碰运气。
-export const inject = ['tools', 'satelliteSlots', 'skills', 'agents', 'systemPrompt']
+export const inject = ['tools', 'satelliteSlots', 'skills', 'agents', 'subagents', 'systemPrompt']
 
 const RouteSchema = z.object({
   role: z.string().min(1).required(),
@@ -61,6 +61,8 @@ export const Config = z.object({
 })
 
 export function apply(ctx: Context, config: unknown): void {
+  // Before any registration: an incompatible host gets a refused row, not a half-wired one.
+  assertHostContracts(ctx as unknown as NodeRuntimeContext)
   const runtime = createNodeRuntime({
     // DSH 的原生服务（tools/skills/subagents/llm/...）由各自的原生包声明合并到 Context；
     // 这里按本模块真正读取的能力收窄一次，避免在本包复刻整套 Context 类型。
