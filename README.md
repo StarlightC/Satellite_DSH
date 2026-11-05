@@ -4,8 +4,9 @@ Satellite 是 DeepSeek Harness 插件，帮助 Agent 按**调查 → 方案 → 
 
 ## 使用要求
 
-- Node.js `^22.19.0 || >=24.0.0`。
-- DeepSeek Harness 0.2.1 系列及兼容版本。
+- Node.js `>=24.9.0`。
+- DeepSeek Harness：只支持以 DSH 源码 `8bd073392eef6f54e921a093b95076248eb08cbb` 构建的宿主（版本号标为 `0.2.2-alpha.3`）。`engines.dsh` 只是必要条件、不是充分条件：npm 上同号 `@deepseek-ai/*@0.2.2-alpha.3` 是另一套接口（`startActivation` 需 `request` 包装、没有 `subagents.rootOf`），**不受支持**。节点行在注册任何节点或工具之前检查 `subagents.rootOf`、`subagents.startActivation`（扁平激活）、`tools.guard` 与 `agent/created` 钩子，缺任一项即拒绝该行并给出缺失清单，不做猜测回退。0.2.1 及更早 rc（含旧版 App）同样不能安装，也不要用版本豁免强装：权限边界依赖这些契约。
+- 工具执行器只支持 native（`@deepseek-ai/dsh-tool-executor-native`，默认 preset 即是）。PTC 执行器只允许直接调用 `run_code`，与主会话协调边界及版本管理"禁止脚本/嵌套执行"冲突：在 PTC preset 下主会话的 `run_code` 与角色内的 `run_code` 会被拒绝并提示改用 native preset，不会执行程序。
 - 已配置可用的模型服务；默认角色使用 `deepseek-official`，也可改为自己的模型。
 
 ## 安装
@@ -58,6 +59,8 @@ install_bundle <解压后的 package 目录>
 | `review` | 独立审查当前改动 | 只读 |
 | `signoff` | 根据已有证据给出验收结论 | 只读 |
 | `version-control`（可选，无 tier） | 用户明确请求的本地5操作 | 读取只读，写入需工作区权限和真实逐次批准 |
+
+普通角色子 Agent 有固定、不可由角色配置放宽的基线：拒绝 `subagent`、`subagent_fork`、`subagent_<provider>`、`workflow`、`send_message`、`interrupt_agent`、`team_task_create`、`team_task_update` 等不受控委派/通信入口（委派只能经 `satellite_node`）；`list_agents`、`list_subagent_models`、`team_task_list`/`team_task_get` 等只读入口不受此限。角色 `toolFilter` 必须是只含 `allow`/`deny` 合法工具名数组的对象，非法值在装配时报错；`allow: []` 视为配置错误，未知工具名（作用域局部工具）合法。
 
 七个节点是可用目录，不是默认流水线；`version-control` 不进入任何默认意图路径。每次调用运行一个节点及其适用的前后扩展，不会自动串行执行全部节点。验证可能生成构建或测试产物，但不负责修复源码；验收不会自动修改代码，运行完成也不等于业务验收通过。
 
@@ -182,7 +185,7 @@ routes:
 
 只有 `routes`、没有角色定义的旧条目不会创建角色，UI 标记为未关联并原样保留，直到用户明确清理。角色目录不可用或版本/结构不兼容时，UI 明确提示并停止修改，不能把读取失败当成角色已删除。模型保存仍仅修改 `routes`，不写入角色说明、角色定义或节点绑定。
 
-此只读通道使用宿主原生 Typert Remote 的无参 `src-json` 结果描述符（已按 `0.2.1-alpha.2` 契约实现），UI 校验结果结构；不增加 HTTP 服务或手写传输。旧版主插件没有目录接口时需同步升级两包。这里展示的是重新读取时的快照，不是扩展启停的实时推送。
+此只读通道使用宿主原生 Typert Remote 的无参 `src-json` 结果描述符（按 `0.2.2-alpha.3` 契约实现），UI 校验结果结构；不增加 HTTP 服务或手写传输。旧版主插件没有目录接口时需同步升级两包。这里展示的是重新读取时的快照，不是扩展启停的实时推送。
 
 ## Android（可选）
 

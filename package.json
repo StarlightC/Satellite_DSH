@@ -1,6 +1,6 @@
 {
   "name": "satellite",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "type": "module",
   "description": "Satellite runs a project's base workflow as nodes with pluggable before/after extensions. One install carries three independently toggleable rows: the slot service, the satellite_node tool, and an opt-in Android read-only extension.",
   "license": "MIT",
@@ -36,7 +36,8 @@
     "android/locale/*.json"
   ],
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": ">=24.9.0",
+    "dsh": "0.2.2-alpha.3"
   },
   "dsh": {
     "bundle": {
@@ -46,19 +47,21 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test test/*.test.mjs"
+    "test": "npm run build && node --test test/*.test.mjs",
+    "test:loader": "npm run build && node --test --test-concurrency=1 --test-timeout=240000 test/loader/*.integration.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5-alpha.1",
-    "@deepseek-ai/dsh-tools": ">=0.2.1-alpha.2 <0.3",
-    "@deepseek-ai/dsh-typert-protocol": ">=0.2.1-alpha.2 <0.3",
-    "@deepseek-ai/schemastery": "~3.18.5-alpha.1"
+    "@deepseek-ai/cordis": "~4.0.6-alpha.2",
+    "@deepseek-ai/dsh-tools": ">=0.2.2-alpha.3 <0.3",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.2-alpha.3 <0.3",
+    "@deepseek-ai/schemastery": "~3.18.6-alpha.2"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "4.0.5-alpha.1",
-    "@deepseek-ai/dsh-tools": "0.2.1-alpha.2",
-    "@deepseek-ai/dsh-typert-protocol": "0.2.1-alpha.2",
-    "@deepseek-ai/schemastery": "3.18.5-alpha.1",
+    "@deepseek-ai/cordis": "4.0.6-alpha.2",
+    "@deepseek-ai/dsh-tool-executor-ptc": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-tools": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-alpha.3",
+    "@deepseek-ai/schemastery": "3.18.6-alpha.2",
     "@types/node": "^24.0.0",
     "tsdown": "0.22.2",
     "typescript": "^5.9.0"
