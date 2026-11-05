@@ -96,6 +96,12 @@ test('发布质量门：清单处于可发布形态（private 不得为真）', 
   assert.equal(typeof pkg.version, 'string')
 })
 
+test('宿主安装范围不锁定测试版本，且与锁文件一致', async () => {
+  const lock = JSON.parse(await readFile(new URL('package-lock.json', packageDir), 'utf8'))
+  assert.equal(pkg.engines.dsh, '>=0.2.2-alpha.3 <0.3.0')
+  assert.equal(lock.packages[''].engines.dsh, pkg.engines.dsh)
+})
+
 test('发布质量门：engines、license 与构建/类型检查脚本齐备', () => {
   assert.ok(pkg.license, 'license 是发布模式的必需字段')
   assert.match(pkg.engines.node, /\d/)

@@ -71,7 +71,7 @@ ordinary sandbox、version-control 与 version-control approval 会以 `ENVIRONM
 这三项须在无外层沙箱的终端运行 `npm run test:loader`，在那之前它们是"未验证"。
 
 注意：npm 上发布的 `@deepseek-ai/*@0.2.2-alpha.3`（release 分支）与目标源码 8bd0733 同号但 API 不同
-（`startActivation` 需 `request` 包装、无 `subagents.rootOf`），Satellite 只对目标源码兼容。
+（`startActivation` 需 `request` 包装、无 `subagents.rootOf`），这类缺少必要接口的构建会被运行时能力检查拒绝；不能仅凭版本号判断接口兼容性。
 本仓库的 devDependencies 是 npm 版，只用于类型与单元测试；兼容性结论只来自上面的真实 Loader 测试。
 运行时门禁：`src/node/lib/wiring.ts` 的 `assertHostContracts` 在节点行注册任何东西之前检查
 `subagents.rootOf`/`subagents.startActivation`/`tools.guard`/`ctx.on`，缺失时拒绝该行（Cordis 记录该行失败，不影响宿主其余部分）。
@@ -79,7 +79,7 @@ ordinary sandbox、version-control 与 version-control approval 会以 `ENVIRONM
 
 ### 目标宿主与迁移理由
 
-- `engines`：Node `>=24.9.0`、DSH 精确 `0.2.2-alpha.3`；peer/dev 依赖对齐 alpha.3（cordis `4.0.6-alpha.2`、schemastery `3.18.6-alpha.2`）。`npm ls @deepseek-ai/cordis` 必须只有一份。
+- `engines`：Node `>=24.9.0`、DSH 安装范围 `>=0.2.2-alpha.3 <0.3.0`，包含 `0.2.2-rc.1`，不以验证基线限制安装。peer 保持版本区间，dev 依赖仍固定在已用的类型/测试基线（cordis `4.0.6-alpha.2`、schemastery `3.18.6-alpha.2`）；放宽安装范围不等于所有后续版本已验证。`npm ls @deepseek-ai/cordis` 必须只有一份。
 - 迁移原因：0.2.2 移除了 subagent 后端的 persona/toolFilter 能力与 `request` 包装，改为 `startActivation` 回执 + `agent/created`/`agent/pre-step`；角色提示与工具限制改由本插件在 exact child scope 用 `systemPrompt.section`/`tools.guard` 施加。旧 App（0.2.1/rc）不可安装，不提供版本豁免。
 - 执行器：只支持 native。`@deepseek-ai/dsh-tool-executor-ptc`（仅测试 devDependency，不进 peer）用于证明 PTC 下 `run_code` 被拒绝且不执行程序；alpha.3 没有公开的"查询作用域执行器"接口（`ToolRuntime.selectExecutor` 私有），因此诊断发生在第一次直接 `run_code`（只有 PTC 执行器会把它送到 guard）。
 - schedule 协调白名单按 alpha.3 `dsh-tool-schedule` 真实注册名：`schedule_create/list/view/edit`。

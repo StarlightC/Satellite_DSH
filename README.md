@@ -5,7 +5,7 @@ Satellite 是 DeepSeek Harness 插件，帮助 Agent 按**调查 → 方案 → 
 ## 使用要求
 
 - Node.js `>=24.9.0`。
-- DeepSeek Harness：只支持以 DSH 源码 `8bd073392eef6f54e921a093b95076248eb08cbb` 构建的宿主（版本号标为 `0.2.2-alpha.3`）。`engines.dsh` 只是必要条件、不是充分条件：npm 上同号 `@deepseek-ai/*@0.2.2-alpha.3` 是另一套接口（`startActivation` 需 `request` 包装、没有 `subagents.rootOf`），**不受支持**。节点行在注册任何节点或工具之前检查 `subagents.rootOf`、`subagents.startActivation`（扁平激活）、`tools.guard` 与 `agent/created` 钩子，缺任一项即拒绝该行并给出缺失清单，不做猜测回退。0.2.1 及更早 rc（含旧版 App）同样不能安装，也不要用版本豁免强装：权限边界依赖这些契约。
+- DeepSeek Harness：安装范围为 `>=0.2.2-alpha.3 <0.3.0`，不再锁定单一版本或源码提交；范围包含 `0.2.2-rc.1` 和后续范围内版本。版本范围不代替运行时接口检查：节点行在注册任何节点或工具之前检查 `subagents.rootOf`、`subagents.startActivation`、`tools.guard` 与事件注册能力，缺失时明确报告，不做旧接口猜测回退。0.2.1 等旧宿主不在安装范围内。已完成的真实 Loader 验证基线是源码 `8bd073392eef6f54e921a093b95076248eb08cbb`（`0.2.2-alpha.3`）；这不代表范围内所有版本都已验证。npm 上曾有同号但缺少 `rootOf`、仍使用 `request` 包装的构建，这类接口不兼容的宿主仍会被能力检查拒绝。
 - 工具执行器只支持 native（`@deepseek-ai/dsh-tool-executor-native`，默认 preset 即是）。PTC 执行器只允许直接调用 `run_code`，与主会话协调边界及版本管理"禁止脚本/嵌套执行"冲突：在 PTC preset 下主会话的 `run_code` 与角色内的 `run_code` 会被拒绝并提示改用 native preset，不会执行程序。
 - 已配置可用的模型服务；默认角色使用 `deepseek-official`，也可改为自己的模型。
 

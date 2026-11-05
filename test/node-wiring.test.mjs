@@ -1939,7 +1939,7 @@ test('host contract gate: npm 0.2.2-alpha.3 shape (no rootOf) refuses the node r
   // Same version label, different API: request-wrapped startActivation, no rootOf.
   const npmShape = host({ startActivation: async () => ({}) })
   assert.deepEqual(missingHostContracts(npmShape), ['subagents.rootOf'])
-  assert.throws(() => apply(npmShape, {}), /subagents\.rootOf[\s\S]*npm 0\.2\.2-alpha\.3/)
+  assert.throws(() => apply(npmShape, {}), /缺少必要接口：subagents\.rootOf[\s\S]*不要求特定源码提交/)
   assert.equal(registered.length, 0, 'nothing registered on a refused host')
   assert.deepEqual(missingHostContracts(host({ startActivation() {}, rootOf() {} })), [])
   assert.deepEqual(missingHostContracts({ get: () => undefined }), ['subagents.rootOf', 'subagents.startActivation', 'tools.guard', 'ctx.on(agent/created)'])
