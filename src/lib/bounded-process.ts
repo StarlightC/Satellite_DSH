@@ -21,6 +21,8 @@ export interface BoundedRunRequest {
   readonly mode: 'read-only' | 'workspace-write' | 'danger-full-access'
   readonly workspaceRoot: string
   readonly sessionId?: string
+  /** Exact extra writable directories for this one workspace-write call; omitted = none (unchanged policy). */
+  readonly additionalWritableRoots?: readonly string[]
   readonly timeoutMs: number
   readonly outputMaxBytes: number
   readonly env?: Record<string, string | undefined>
@@ -119,6 +121,9 @@ export async function runBounded(
     return { ok: false, failure: { kind: 'unavailable', message: 'invalid output limit' } }
   }
 
+  if (request.additionalWritableRoots !== undefined && request.mode !== 'workspace-write') {
+    return { ok: false, failure: { kind: 'unavailable', message: 'additionalWritableRoots require workspace-write' } }
+  }
   // danger-full-access 只允许在**逐次获得宿主批准**后使用（调用方负责），
   // 且沙箱服务的 confine 不接受这个模式（ConfinedSandboxMode 排除它）：
   // 这里直接放行 argv，并在结果里标出 unconfined，让上层如实记录。
@@ -133,6 +138,7 @@ export async function runBounded(
           mode: request.mode,
           workspaceRoot: request.workspaceRoot,
           ...(request.sessionId !== undefined ? { sessionId: request.sessionId } : {}),
+          ...(request.additionalWritableRoots !== undefined ? { additionalWritableRoots: [...request.additionalWritableRoots] } : {}),
         },
         signal,
       )

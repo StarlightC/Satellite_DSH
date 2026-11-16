@@ -163,12 +163,16 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
           // Native fs contract: mapping promises SAME host file in subprocess execution world.
           // Identity mapping is required because the kernel observes via node:fs and spawns
           // fixed POSIX host paths. Containers/remapped/non-shared providers fail closed.
-          for (const path of [p.workspaceRoot, cwd, '/usr/bin/env', '/usr/bin/git']) {
-            if (s.fs.processPathFromHostPath(path) !== path
-              || s.fs.processPath(await s.fs.resolve(path, { signal: exec.signal })) !== path) deny(`host-shared identity mapping unavailable: ${path}`)
+          const verifyHostPaths = async (paths: readonly string[], signal: AbortSignal = exec.signal): Promise<void> => {
+            for (const path of paths) {
+              if (s.fs.processPathFromHostPath(path) !== path
+                || s.fs.processPath(await s.fs.resolve(path, { signal })) !== path) deny(`host-shared identity mapping unavailable: ${path}`)
+            }
+            policy() // the same agent's services/policy still hold after the async mapping
           }
+          await verifyHostPaths([p.workspaceRoot, cwd, '/usr/bin/env', '/usr/bin/git'])
           const adapters = {
-            policy,
+            policy, verifyHostPaths,
             sandbox: { async confine(argv: readonly string[], requested: Parameters<Services['sandbox']['confine']>[1], signal?: AbortSignal) {
               policy()
               const confined = await s.sandbox.confine(argv, requested, signal)
@@ -192,7 +196,7 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
           // The child kernel is read-only: its native approval is pinned to never.
           member.kernel = createLocalVersionControl({
             workspaceRoot: p.workspaceRoot, sessionId: agent.id, agent, readOnly: true,
-            policy: adapters.policy, sandbox: adapters.sandbox, subprocess: adapters.subprocess,
+            policy: adapters.policy, sandbox: adapters.sandbox, subprocess: adapters.subprocess, verifyHostPaths: adapters.verifyHostPaths,
           })
         }
         const repository = resolve(cwd, request.repo)
@@ -212,6 +216,7 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
           workspaceRoot: p.workspaceRoot, sessionId: parent.id, agent: parent,
           policy: parentPrepared.adapters.policy, sandbox: parentPrepared.adapters.sandbox,
           subprocess: parentPrepared.adapters.subprocess, approval: parentPrepared.adapters.approval,
+          verifyHostPaths: parentPrepared.adapters.verifyHostPaths,
           handoff: { owner: childKernel.owner, take: token => childKernel.take(token) },
         })
         const result = await parentKernel.execute({ ...request, repo }, exec.signal, member.parentCallId)

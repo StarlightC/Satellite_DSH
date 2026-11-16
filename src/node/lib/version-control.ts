@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { runBounded, type BoundedRunResult } from '../../lib/bounded-process.ts'
 import type { SandboxLike, SubprocessLike } from '../../lib/process-contracts.ts'
 import { deny, literalPath, parseGitRequest, validateAttributes, type GitRequest } from './version-control-input.ts'
-import { observeRepository, type RepositoryState } from './version-control-repository.ts'
+import { inside, observeRepository, type RepositoryState } from './version-control-repository.ts'
 
 export interface LocalGitDependencies {
   readonly workspaceRoot: string
@@ -29,6 +29,11 @@ export interface LocalGitDependencies {
    * The snapshot must match THIS kernel's own (parent-scope) observation.
    */
   readonly handoff?: { take(token: string): FrozenSnapshot | undefined; owner: string }
+  /**
+   * Trusted seam: prove the same host-shared fs mapping for repository layout
+   * directories (gitdir/commondir). Required when any of them is outside the workspace.
+   */
+  readonly verifyHostPaths?: (paths: readonly string[], signal: AbortSignal) => Promise<void>
 }
 export interface FrozenSnapshot { readonly state: RepositoryState; readonly head: string | null; readonly policy: string; readonly workspaceRoot: string; readonly expiresAt: number; readonly deadline: number; readonly owner: string }
 export interface LocalGitResult {
@@ -122,11 +127,22 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           const initialPolicy = policy(false), executable = await executableIdentity()
           const state = await observeRepository(deps.workspaceRoot, r.repo)
           if (state.identity !== queuedState.identity) deny('repository identity changed while queued')
+          // Layout directories outside the workspace need a proven host-shared mapping.
+          const layoutPaths = [state.layout.gitDir, state.layout.commonDir]
+          const hostPaths = async (): Promise<void> => {
+            if (layoutPaths.every(path => inside(deps.workspaceRoot, path))) return
+            if (!deps.verifyHostPaths) deny('host-shared mapping for external git directory unavailable')
+            await deps.verifyHostPaths(layoutPaths, signal)
+          }
+          await hostPaths()
+          // Exactly the validated common directory, only when it is outside the workspace.
+          const writableRoots = inside(deps.workspaceRoot, state.layout.commonDir) ? undefined : [state.layout.commonDir] as const
           let writeSnapshot: Snapshot | undefined
           const check = async (write = false): Promise<void> => {
             signal.throwIfAborted()
             if (await executableIdentity() !== executable) deny('executable changed')
             const current = await observeRepository(deps.workspaceRoot, r.repo)
+            await hostPaths()
             // Synchronous tail AFTER the last await: policy/expiry/cancellation are
             // re-read with no further async gap before the caller's next step.
             if (current.identity !== state.identity || current.digest !== state.digest) deny('repository changed; observe again')
@@ -149,7 +165,7 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
               const result = await runBounded({ sandbox: deps.sandbox, subprocess }, {
                 executable: argv[0]!, args: argv.slice(1), cwd: state.root,
                 mode: write ? 'workspace-write' : 'read-only', workspaceRoot: deps.workspaceRoot,
-                sessionId: deps.sessionId, timeoutMs: 30_000, outputMaxBytes: 128 * 1024,
+                sessionId: deps.sessionId, ...(write && writableRoots ? { additionalWritableRoots: writableRoots } : {}), timeoutMs: 30_000, outputMaxBytes: 128 * 1024,
                 // Final freeze AFTER the last confinement await; spawn follows synchronously.
                 beforeSpawn: () => check(write),
               }, signal)
@@ -233,16 +249,17 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           }
           const argv = fullArgv(args)
           const plan = {
-            action: r.action, repository: state.root, identity: state.identity, head, indexDigest: state.indexDigest,
+            action: r.action, repository: state.root, layout: state.layout, ...(writableRoots ? { additionalWritableRoots: writableRoots } : {}), identity: state.identity, head, indexDigest: state.indexDigest,
             treeDigest: state.digest, configDigest: state.configDigest, attributesDigest: state.attributesDigest,
             argv, owner, policy: initialPolicy,
             ...(r.action === 'stage' ? { targets: r.paths.map(path => ({ path, digest: state.files.get(path) ?? null })) } : { entireIndex: index, indexPatch }),
           }
-          const reason = `Local Git exact one-shot write; no remote operation. Commit covers the ENTIRE actual index.\n${JSON.stringify(plan)}`
+          const reason = `Local Git exact one-shot write; no remote operation. Commit covers the ENTIRE actual index.${writableRoots ? ` Also grants this one call write access to the linked worktree's shared Git directory ${writableRoots[0]} (outside the workspace).` : ''}\n${JSON.stringify(plan)}`
           if (Buffer.byteLength(reason) > 64 * 1024) deny('approval plan too large; do not truncate')
           await check(true)
           // Capability probe is side-effect free; never ask approval for an unenforceable write.
-          const confinement = await deps.sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: deps.workspaceRoot, sessionId: deps.sessionId }, signal)
+          // Same policy shape as the real write run (incl. the exact external commondir grant).
+          const confinement = await deps.sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: deps.workspaceRoot, sessionId: deps.sessionId, ...(writableRoots ? { additionalWritableRoots: [...writableRoots] } : {}) }, signal)
           if (confinement.enforcement !== 'full' || !confinement.argv.length) deny('full write confinement unavailable')
           if (!deps.approval || typeof deps.approval.request !== 'function') deny('approval service unavailable')
           let granted: string

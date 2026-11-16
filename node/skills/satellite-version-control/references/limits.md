@@ -33,11 +33,27 @@ lost ownership or unknown mapping are blocked. Only stage/commit use the handoff
 it does not widen reads or the child's tools. The main session still has no
 git/shell tool. A file sandbox is not network isolation.
 
-Supported: ordinary .git directory, SHA-1 format 0, bounded strict config and safe
+Supported layouts: an ordinary .git directory (registered linked worktrees under
+`.git/worktrees/` are inert data), or the repository root being a linked worktree:
+an absolute `gitdir:` gitfile naming a canonical `<commondir>/worktrees/<name>`
+whose `commondir` resolves to a canonical, non-bare `.git` and whose `gitdir`
+backlink names exactly this root's `.git`. Relative gitfiles, nested layouts,
+`config.worktree` and `extensions.worktreeConfig` are rejected. The bounded scan
+covers the worktree and the whole common directory (including the private gitdir
+and sibling worktrees' metadata) under the same limits; any lock there blocks
+writes. Snapshots bind the layout; requests on one common directory are serialized.
+The repository root must still be inside the workspace. Only when the validated
+common directory is outside it does a write call add exactly that directory as
+`additionalWritableRoots` (stated in the approval plan; same policy for probe and
+real confinement; gitdir/commondir must pass the host-shared mapping check, which
+is rechecked after approval and final confinement). That directory includes hooks
+and config: this tool revalidates config and disables hooks every time, but other
+host Git invocations are not protected by it.
+SHA-1 format 0, bounded strict config and safe
 attributes. Only `[lfs] repositoryformatversion = 0` is accepted as inert metadata;
 `[filter "lfs"]`, filter attributes/drivers, hooks config, includes, external paths
 and unknown config are rejected before Git. Ordinary inert origin URL is allowed
-but never used. No worktrees, bare repo, submodules, partial clone, alternates,
+but never used. No bare repo, submodules, partial clone, alternates,
 shallow/split index, symlink/hardlink/special paths. Scan includes ignored files:
 20,000 entries, 64 MiB total, 8 MiB/file maximum. Repositories containing dependency
 symlinks/caches can be unsupported; do not silently skip scan or relax limits.

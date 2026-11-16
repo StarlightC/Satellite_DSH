@@ -2,7 +2,7 @@
 export interface SandboxLike {
   confine(
     argv: readonly string[],
-    policy: { mode: 'read-only' | 'workspace-write' | 'danger-full-access'; workspaceRoot: string; sessionId?: string },
+    policy: { mode: 'read-only' | 'workspace-write' | 'danger-full-access'; workspaceRoot: string; sessionId?: string; additionalWritableRoots?: readonly string[] },
     signal?: AbortSignal,
   ): Promise<{ argv: string[]; enforcement: 'full' | 'partial'; denialSignatures: readonly string[] }>
 }
