@@ -19,6 +19,9 @@ change the implementation, test expectations, configuration, or dependencies.
   checks that demonstrate the claim. State what each check covers and excludes.
 - If a command would need a device, network, destructive setup, new dependency or
   additional permission not already allowed, return that prerequisite to the parent.
+  When `satellite_parent_request` is available, it can stage one exact call of an
+  existing parent tool; it is not user consent or a permission grant, and the parent
+  still checks the original tool's own conditions and host approval.
 
 ## Minimum sufficient verification budget
 
