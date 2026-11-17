@@ -54,9 +54,11 @@ attributes. Only `[lfs] repositoryformatversion = 0` is accepted as inert metada
 `[filter "lfs"]`, filter attributes/drivers, hooks config, includes, external paths
 and unknown config are rejected before Git. Ordinary inert origin URL is allowed
 but never used. No bare repo, submodules, partial clone, alternates,
-shallow/split index, symlink/hardlink/special paths. Scan includes ignored files:
-20,000 entries, 64 MiB total, 8 MiB/file maximum. Repositories containing dependency
-symlinks/caches can be unsupported; do not silently skip scan or relax limits.
+shallow/split index, symlink/hardlink/special paths. Scan includes ignored files
+and has no repository entry/byte quota: every regular file is hashed in full by
+streaming (no whole-file buffering except parsed config/attributes). Large trees
+cost proportional time. Repositories containing dependency symlinks can be
+unsupported; the scan is never silently skipped.
 Real commit is exercised only with simulated host services in temporary fixture
 repositories; live-host approval UI has not been demonstrated here.
 
