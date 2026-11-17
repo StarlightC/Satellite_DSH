@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { spawn, execFileSync } from 'node:child_process'
 import { mkdtemp, realpath, lstat, mkdir, writeFile, readFile, rm, symlink, unlink, chmod } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -428,4 +429,35 @@ test('cancellation during write returns effect-unknown and does not retry', asyn
   const result = await h.exec({ action: 'stage', paths: ['x'], expectedSnapshot: await h.snapshot() }, controller.signal)
   assert.equal(result.status, 'effect-unknown', JSON.stringify(result)); assert.equal(h.calls.write, 1)
   assert.equal((await h.exec({ action: 'status' })).status, 'succeeded')
+})
+
+test('no artificial repository quota: >64 MiB total, >8 MiB file and >20k entries observe and bind changes', async t => {
+  const f = await fixture(t), h = host(f), started = Date.now()
+  const big = Buffer.alloc(9 * 1024 * 1024, 0x61)
+  await f.put('.gitignore', 'cache/\n')
+  for (let i = 0; i < 8; i++) await f.put(`cache/big-${i}.bin`, big) // 72 MiB total, each 9 MiB
+  await mkdir(await f.target('cache/many'), { recursive: true })
+  for (let i = 0; i < 20_050; i += 500) await Promise.all(Array.from({ length: Math.min(500, 20_050 - i) }, (_, j) => writeFile(join(f.root, 'cache/many', `f${i + j}`), '')))
+  const setup = Date.now()
+  // expectedSnapshot is a random token; take() exposes the observed tree so the real full-content digest can be checked.
+  const before = await h.exec({ action: 'status' })
+  assert.equal(before.status, 'succeeded', JSON.stringify(before))
+  const observed = Date.now()
+  const first = h.kernel.take(before.expectedSnapshot)
+  assert.ok(first, 'status snapshot must be retrievable through take()')
+  assert.equal(first.state.files.size, 20_059) // .gitignore + 8 big files + 20,050 entries
+  assert.equal(first.state.files.get('cache/many/f20049'), createHash('sha256').update('').digest('hex'))
+  const firstDigest = createHash('sha256').update(big).digest('hex')
+  assert.equal(first.state.files.get('cache/big-7.bin'), firstDigest)
+  big[big.length - 1] = 0x62
+  await f.put('cache/big-7.bin', big) // same size, last byte differs: full-content hash must change
+  const after = await h.exec({ action: 'status' })
+  assert.equal(after.status, 'succeeded', JSON.stringify(after))
+  const second = h.kernel.take(after.expectedSnapshot)
+  assert.ok(second, 'status snapshot must be retrievable through take()')
+  assert.equal(second.state.files.size, 20_059)
+  const secondDigest = createHash('sha256').update(big).digest('hex')
+  assert.notEqual(firstDigest, secondDigest) // independent whole-buffer hashes, not tree digests (mtime/ctime)
+  assert.equal(second.state.files.get('cache/big-7.bin'), secondDigest)
+  t.diagnostic(`setup ${setup - started}ms, observe ${observed - setup}ms, re-observe ${Date.now() - observed}ms`)
 })

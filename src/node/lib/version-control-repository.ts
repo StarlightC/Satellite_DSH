@@ -33,6 +33,26 @@ export async function regularBytes(path: string, maxBytes: number): Promise<Buff
     return bytes.subarray(0, offset)
   } finally { await handle.close() }
 }
+/** Streamed sha256 of a regular single-link file; same identity checks as regularBytes, no size cap. */
+export async function regularDigest(path: string): Promise<string> {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const before = await handle.stat()
+    if (!before.isFile() || before.nlink !== 1) deny('special or hardlinked file')
+    const hash = createHash('sha256'), chunk = Buffer.alloc(Math.min(1024 * 1024, before.size + 1))
+    // Read at most size+1 bytes: growth is detected without unbounded reading.
+    let offset = 0
+    while (offset <= before.size) {
+      const read = await handle.read(chunk, 0, Math.min(chunk.length, before.size + 1 - offset), offset)
+      if (!read.bytesRead) break
+      hash.update(chunk.subarray(0, read.bytesRead))
+      offset += read.bytesRead
+    }
+    const after = await handle.stat()
+    if (offset !== before.size || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) deny('file changed while reading')
+    return hash.digest('hex')
+  } finally { await handle.close() }
+}
 export interface RepositoryLayout {
   /** 'main': ordinary .git directory (may hold registered linked worktrees); 'linked': root/.git gitfile. */
   kind: 'main' | 'linked'
@@ -109,7 +129,6 @@ export async function observeRepository(workspaceRoot: string, repo: string): Pr
   // Private metadata is addressed as `.git/...` in both layouts: for a linked worktree
   // its gitdir is `.git/worktrees/<name>` inside the scanned common directory.
   const privatePrefix = layout.kind === 'main' ? '.git' : `.git/worktrees/${basename(layout.gitDir)}`
-  let entries = 0, bytes = 0
   const records: unknown[] = [['layout', layout.kind, layout.worktreeRoot, layout.gitDir, layout.commonDir, gitfile ?? null]], attributes: unknown[] = [], files = new Map<string, string>(), locks: string[] = []
   let config: string | undefined, indexDigest: string | null = null
   const walk = async (directory: string, prefix: string, metadata: boolean): Promise<void> => {
@@ -117,7 +136,6 @@ export async function observeRepository(workspaceRoot: string, repo: string): Pr
     if (!before.isDirectory() || before.isSymbolicLink()) deny('special directory')
     const names = (await readdir(directory)).sort()
     for (const name of names) {
-      if (++entries > 20_000) deny('repository entry budget exceeded')
       const path = join(directory, name), rel = prefix ? `${prefix}/${name}` : name
       if (!metadata && rel === '.git') {
         if (layout.kind === 'main') { await walk(path, '.git', true); continue }
@@ -138,19 +156,19 @@ export async function observeRepository(workspaceRoot: string, repo: string): Pr
         await walk(path, rel, metadata)
       } else {
         if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1) deny(`special path ${rel}`)
-        bytes += st.size
-        if (bytes > 64 * 1024 * 1024) deny('repository byte budget exceeded')
-        const content = await regularBytes(path, Math.min(8 * 1024 * 1024, 64 * 1024 * 1024 - bytes + st.size))
-        const hash = digest(content)
+        // Only config/attributes are parsed and therefore buffered; everything else is streamed.
+        const parsed = lower === '.git/config' || (!metadata && lowerName === '.gitattributes') || lower === '.git/info/attributes'
+        const content = parsed ? await regularBytes(path, Number.MAX_SAFE_INTEGER) : undefined
+        const hash = content ? digest(content) : await regularDigest(path)
         records.push([rel, st.dev, st.ino, st.mode, st.size, st.mtimeMs, st.ctimeMs, hash])
         if (!metadata) {
           literalPath(rel)
           files.set(rel, hash)
         }
-        if (lower === '.git/config') { config = content.toString('utf8'); validateLocalConfig(config) }
+        if (lower === '.git/config') { config = content!.toString('utf8'); validateLocalConfig(config) }
         if (rel === `${privatePrefix}/index`) indexDigest = hash
         if ((!metadata && lowerName === '.gitattributes') || lower === '.git/info/attributes') {
-          validateAttributes(content.toString('utf8')); attributes.push([rel, hash])
+          validateAttributes(content!.toString('utf8')); attributes.push([rel, hash])
         }
         if (metadata && lowerName.endsWith('.lock')) locks.push(rel)
       }
@@ -159,7 +177,7 @@ export async function observeRepository(workspaceRoot: string, repo: string): Pr
     if (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) deny('directory changed while observing')
   }
   // Worktree domain, then (linked only) the common directory, which contains the private gitdir.
-  // Both domains share the same entry/byte budgets; nothing is skipped.
+  // Both domains are scanned in full; nothing is skipped.
   await walk(root, '', false)
   if (layout.kind === 'linked') {
     await walk(layout.commonDir, '.git', true)

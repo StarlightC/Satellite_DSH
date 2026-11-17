@@ -318,6 +318,50 @@ test('startEmulator 在缺少可注册 effect 时由调用方拒绝（单元层�
   assert.ok(h)
 })
 
+test('普通非委派 start 保持原实现：不 confine，直接 spawn 原始 argv', async () => {
+  const h = harness()
+  let confines = 0
+  const original = h.services.sandbox.confine
+  h.services.sandbox.confine = async (...args) => { if (args[0].includes('-avd')) confines += 1; return original(...args) }
+  const started = await h.tools[EMULATOR_TOOL].execute({ action: 'start', avd: 'Pixel_6_API_34', startupTimeoutMs: 10000 }, h.exec)
+  assert.equal(started.status, 'succeeded')
+  const emu = h.calls.spawn.find((spec) => spec.argv.includes('-avd'))
+  assert.deepEqual(emu.argv, [EMULATOR, '-avd', 'Pixel_6_API_34'])
+  assert.equal(confines, 0)
+  await h.tools[EMULATOR_TOOL].execute({ action: 'stop', ownedResourceId: started.ownedResourceId }, h.exec)
+})
+
+test('委派 start（受信 confineStart）必须 full confine，并 spawn confine 返回的 argv', async () => {
+  const unit = (enforcement) => {
+    const spawned = []
+    const deps = {
+      services: {
+        sandbox: { async confine(argv) { return { argv: ['/sandbox-exec', ...argv], enforcement, denialSignatures: [] } } },
+        subprocess: { spawn(spec) { spawned.push(spec.argv); throw new Error('stop here') } },
+        approval: { async request() { return 'allowed-once' } },
+      },
+      binding: { root: ROOT, mode: 'workspace-write', workspaceRoot: ROOT, sessionId: 's1' },
+      exec: { agent: { id: 'a', session: {} }, signal: new AbortController().signal },
+      confineStart: true,
+      config: { emulatorPath: EMULATOR, adbPath: ADB, operationTimeoutMs: 1000, outputMaxBytes: 1024, bootPollIntervalMs: 5 },
+    }
+    return { deps, spawned }
+  }
+  const adbOnly = (u) => { const real = u.deps.services.subprocess.spawn; u.deps.services.subprocess.spawn = (spec) => spec.argv.includes(ADB)
+    ? { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {}, async waitForExit() { return true },
+        collected: { stdout: { readFrom: () => ({ text: 'List of devices attached\n', nextOffset: 0, lossy: false }) }, stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) } } }
+    : real(spec) }
+  const full = unit('full'); adbOnly(full)
+  const resources = createOwnedResources()
+  await startEmulator(full.deps, { action: 'start', avd: 'Pixel_6_API_34' }, resources, (r) => resources.adopt(r))
+  assert.deepEqual(full.spawned, [['/sandbox-exec', EMULATOR, '-avd', 'Pixel_6_API_34']])
+  const partial = unit('partial'); adbOnly(partial)
+  const refused = await startEmulator(partial.deps, { action: 'start', avd: 'Pixel_6_API_34' }, resources, (r) => resources.adopt(r))
+  assert.equal(refused.ok, false)
+  assert.equal(refused.outcome.error.code, 'CAPABILITY_UNAVAILABLE')
+  assert.deepEqual(partial.spawned, [])
+})
+
 test('组件卸载会等待关闭已启动的模拟器（A1 回归）', async () => {
   const h = harness()
   const started = await h.tools[EMULATOR_TOOL].execute({ action: 'start', avd: 'Pixel_6_API_34', startupTimeoutMs: 10000 }, h.exec)
@@ -380,10 +424,117 @@ test('start 成功后探测失败时，清理结论如实报告而不是 not-nee
   assert.equal(result.ok, false)
   if (!result.ok) {
     assert.equal(result.outcome.action, 'emulator.start')
+    assert.equal(result.outcome.status, 'failed', 'started process: never a zero-effect blocked')
     assert.equal(result.outcome.cleanup, 'completed')
     assert.notEqual(result.outcome.cleanup, 'not-needed')
   }
   assert.deepEqual(h.calls.effects, ['terminate', 'wait'])
+})
+
+test('委派 start 已 spawn 后同一策略对象变 never：探测被拒报 effect-unknown 而非零效果 blocked（P2 回归）', async () => {
+  // 同一个策略对象：受包装的服务每次都重读它（与委派 gate 的 check 语义一致）。
+  const policy = { value: 'on-request' }
+  const effects = []
+  const spawned = []
+  const gated = (fn) => (...args) => { if (policy.value === 'never') throw new Error('delegated approval refused: parent policy is "never"'); return fn(...args) }
+  const deps = {
+    services: {
+      sandbox: { confine: gated(async (argv) => ({ argv: ['/sandbox-exec', ...argv], enforcement: 'full', denialSignatures: [] })) },
+      subprocess: {
+        async terminalEnvironment() { return { platform: 'posix' } },
+        async resolveExecutable(c) { return c },
+        spawn: gated((spec) => {
+          spawned.push(spec.argv)
+          if (spec.argv.includes('-avd')) {
+            policy.value = 'never' // 父策略在 spawn 成功后切换
+            return {
+              done: new Promise((resolve) => { spec.signal?.addEventListener('abort', () => resolve({ exitCode: null, signal: 'SIGTERM' }), { once: true }) }),
+              terminate() { effects.push('terminate') },
+              async waitForExit() { effects.push('wait'); return true },
+              collected: { stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) }, stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) } },
+            }
+          }
+          // spawn 之前的 adb devices 基线（策略仍允许）
+          const text = 'List of devices attached\n'
+          return { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {}, async waitForExit() { return true },
+            collected: { stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) }, stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) } } }
+        }),
+      },
+      approval: { async request() { return 'allowed-once' } },
+    },
+    binding: { root: ROOT, mode: 'workspace-write', workspaceRoot: ROOT, sessionId: 's1' },
+    exec: { agent: { id: 'a', session: {} }, signal: new AbortController().signal },
+    confineStart: true,
+    config: { emulatorPath: EMULATOR, adbPath: ADB, operationTimeoutMs: 1000, outputMaxBytes: 1024, bootPollIntervalMs: 5 },
+  }
+  const resources = createOwnedResources()
+  const result = await startEmulator(deps, { action: 'start', avd: 'Pixel_6_API_34', startupTimeoutMs: 10000 }, resources, (r) => resources.adopt(r))
+  assert.equal(result.ok, false)
+  assert.equal(result.outcome.status, 'effect-unknown')
+  assert.notEqual(result.outcome.status, 'blocked')
+  assert.equal(result.outcome.action, 'emulator.start')
+  assert.equal(result.outcome.cleanup, 'completed')
+  assert.equal(result.outcome.error.code, 'EFFECT_UNKNOWN')
+  assert.match(result.outcome.error.message, /already started/)
+  assert.match(result.outcome.error.message, /not a rollback/)
+  assert.match(result.outcome.error.message, /Not retried/)
+  assert.equal(spawned.filter((argv) => argv.includes('-avd')).length, 1, 'emulator spawned once, no retry')
+  assert.deepEqual(effects, ['terminate', 'wait'])
+})
+
+test('cleanup failed（terminate 抛错）时 effect-unknown 消息不承诺终止成功且不重试', async () => {
+  // 同一策略对象：探测失败后清理阶段 terminate 抛错，exit 无法确认。
+  const policy = { value: 'on-request' }
+  const effects = []
+  const spawned = []
+  const gated = (fn) => (...args) => { if (policy.value === 'never') throw new Error('delegated approval refused: parent policy is "never"'); return fn(...args) }
+  const deps = {
+    services: {
+      sandbox: { confine: gated(async (argv) => ({ argv: ['/sandbox-exec', ...argv], enforcement: 'full', denialSignatures: [] })) },
+      subprocess: {
+        async terminalEnvironment() { return { platform: 'posix' } },
+        async resolveExecutable(c) { return c },
+        spawn: gated((spec) => {
+          spawned.push(spec.argv)
+          if (spec.argv.includes('-avd')) {
+            policy.value = 'never' // 父策略在 spawn 成功后切换：后续探测被拒
+            return {
+              done: new Promise((resolve) => { spec.signal?.addEventListener('abort', () => resolve({ exitCode: null, signal: 'SIGTERM' }), { once: true }) }),
+              terminate() { effects.push('terminate'); throw new Error('terminate refused') },
+              async waitForExit() { effects.push('wait'); return true },
+              collected: { stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) }, stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) } },
+            }
+          }
+          const text = 'List of devices attached\n'
+          return { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {}, async waitForExit() { return true },
+            collected: { stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) }, stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) } } }
+        }),
+      },
+      approval: { async request() { return 'allowed-once' } },
+    },
+    binding: { root: ROOT, mode: 'workspace-write', workspaceRoot: ROOT, sessionId: 's1' },
+    exec: { agent: { id: 'a', session: {} }, signal: new AbortController().signal },
+    confineStart: true,
+    config: { emulatorPath: EMULATOR, adbPath: ADB, operationTimeoutMs: 1000, outputMaxBytes: 1024, bootPollIntervalMs: 5 },
+  }
+  const resources = createOwnedResources()
+  const result = await startEmulator(deps, { action: 'start', avd: 'Pixel_6_API_34', startupTimeoutMs: 10000 }, resources, (r) => resources.adopt(r))
+  assert.equal(result.ok, false)
+  assert.equal(result.outcome.status, 'effect-unknown')
+  assert.equal(result.outcome.action, 'emulator.start')
+  assert.equal(result.outcome.cleanup, 'failed')
+  assert.equal(result.outcome.error.code, 'CLEANUP_FAILED')
+  const message = result.outcome.error.message
+  // 没有"已终止"的成功承诺：退出未确认、可能仍在运行。
+  assert.doesNotMatch(message, /was terminated/)
+  assert.match(message, /exit is not confirmed/)
+  assert.match(message, /may still be running/)
+  // 保留既有语义：不是回滚、不重试。
+  assert.match(message, /not a rollback/)
+  assert.match(message, /Not retried/)
+  assert.equal(spawned.filter((argv) => argv.includes('-avd')).length, 1, 'emulator spawned once, no retry')
+  // 清理只尝试一次：terminate 抛错后不再重试 terminate/wait。
+  assert.deepEqual(effects, ['terminate'])
 })
 
 test('adopt 拒绝同 id 覆盖，不孤立先前的 handle（A4 回归）', () => {

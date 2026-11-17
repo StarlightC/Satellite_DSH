@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto'
 import type {
   ApprovalLike, OperationOutcome, PolicyLike, SandboxLike, ScopedExecution, SubprocessLike,
 } from './contracts.js'
-import { ArgumentError, blocked, cancelled, failed, outcome, rejectUnknownKeys, requireEnum, requireInteger, requireText } from './contracts.js'
+import { ArgumentError, blocked, cancelled, failed, outcome, outcome as makeOutcome, rejectUnknownKeys, requireEnum, requireInteger, requireText } from './contracts.js'
 import { runBounded, terminateBounded } from './process.js'
 import type { BoundedRunOutcome } from './process.js'
 
@@ -199,6 +199,12 @@ export interface EmulatorDeps {
   }
   readonly binding: { readonly root: string; readonly mode: 'read-only' | 'workspace-write' | 'danger-full-access'; readonly workspaceRoot: string; readonly sessionId?: string }
   readonly exec: ScopedExecution
+  /**
+   * Internal, trusted caller fact (never a model argument): true only for a call that
+   * passed the delegated approval gate. Such a start must be natively confined so the
+   * child never exceeds its sandbox; ordinary calls keep the original direct spawn.
+   */
+  readonly confineStart?: boolean
   readonly config: {
     readonly emulatorPath: string
     readonly avdmanagerPath?: string
@@ -312,9 +318,31 @@ export async function startEmulator(
     return cleaned
   }
   try {
+    // Only a delegated-gate call is confined (its wrapped services re-check the permit
+    // at confine and refuse an unconfined argv at spawn). Ordinary calls keep the
+    // original direct spawn. Nothing here widens the policy.
+    let argv: readonly string[]
+    try {
+      const base = [deps.config.emulatorPath, '-avd', avd]
+      if (deps.confineStart !== true || deps.binding.mode === 'danger-full-access') {
+        argv = base
+      } else {
+        const confined = await deps.services.sandbox.confine(base, {
+          mode: deps.binding.mode,
+          workspaceRoot: deps.binding.workspaceRoot,
+          ...(deps.binding.sessionId !== undefined ? { sessionId: deps.binding.sessionId } : {}),
+        }, deps.exec.signal)
+        if (!confined || !Array.isArray(confined.argv) || confined.argv.length === 0) throw new Error('sandbox confinement returned no argv')
+        if (confined.enforcement !== 'full') throw new Error(`sandbox confinement is ${confined.enforcement}, refusing to run`)
+        argv = confined.argv
+      }
+      if (deps.exec.signal.aborted) return { ok: false, outcome: cancelled('emulator.start', 'not-needed') }
+    } catch (error) {
+      return { ok: false, outcome: blocked('emulator.start', 'CAPABILITY_UNAVAILABLE', error instanceof Error ? error.message : String(error)) }
+    }
     try {
       handle = deps.services.subprocess.spawn({
-        argv: [deps.config.emulatorPath, '-avd', avd],
+        argv: argv as string[],
         cwd: deps.binding.root,
         stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', control: undefined },
         graceMs: 5000,
@@ -345,6 +373,25 @@ export async function startEmulator(
     if (probeFailure !== undefined || !booted || !serial || startupController.signal.aborted) {
       // 失败路径：终止并等待，清理结论如实并入结果（进程确实被启动过）。
       const cleanup = await cleanupOnce()
+      if (probeFailure !== undefined && probeFailure.status === 'blocked') {
+        // 进程已经被受限 spawn 过：此后探测被拒（例如审批策略变为 never）不能再报成零效果的 blocked。
+        // 终止不代表回滚（AVD 可能已写入），也不会自动重试。
+        // 终止文案只按 cleanup 实际结论生成：failed 时不能声称进程已终止。
+        const termination = cleanup === 'completed'
+          ? `the started process was terminated (cleanup: ${cleanup}).`
+          : `termination of the started process was attempted but its exit is not confirmed; the process may still be running (cleanup: ${cleanup}).`
+        return {
+          ok: false,
+          outcome: makeOutcome('effect-unknown', 'emulator.start', {
+            cleanup,
+            error: {
+              code: cleanup === 'failed' ? 'CLEANUP_FAILED' : 'EFFECT_UNKNOWN',
+              message: `AVD ${avd} emulator process was already started, then a follow-up probe was refused (${probeFailure.error?.message ?? 'blocked'}); `
+                + `${termination} Termination is not a rollback: the AVD may have been modified. Not retried.`,
+            },
+          }),
+        }
+      }
       if (probeFailure !== undefined) {
         return {
           ok: false,

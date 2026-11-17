@@ -2,6 +2,8 @@
 import { createHash } from 'node:crypto'
 import type { defineTool } from '@deepseek-ai/dsh-tools'
 import { detectHostPlatform } from '../../platform/index.ts'
+import { createCallGate } from '../../lib/delegated-approval.ts'
+import type { BrokerConsumer, BrokerExecution, CallGate } from '../../lib/delegated-approval.ts'
 
 export const SKILL_SCRIPT_TOOL = 'satellite_skill_script_run'
 const MANIFEST = 'scripts/manifest.json'
@@ -225,7 +227,7 @@ async function prepare(services: SkillScriptServices, exec: Exec, skillName: str
     timeoutMs: script.timeoutMs, outputMaxBytes: script.outputMaxBytes })
   return { source, script, command, policy, effectiveSessionPolicy, binding, rootPath, platform }
 }
-export async function runSkillScript(services: SkillScriptServices, request: unknown, exec: Exec) {
+export async function runSkillScript(services: SkillScriptServices, request: unknown, exec: Exec, gate?: CallGate) {
   const args = record(request)
   keys(args, ['skill', 'script', 'parameters'])
   const skill = name(args.skill)
@@ -242,11 +244,11 @@ export async function runSkillScript(services: SkillScriptServices, request: unk
   // JSON cloning also fixes the argument values across the approval await.
   const parameters: unknown = JSON.parse(JSON.stringify(input))
   const before = await prepare(services, exec, skill, script, parameters)
-  const granted = await services.approval.request({ agent: exec.agent!, toolName: SKILL_SCRIPT_TOOL,
+  const granted = await (gate?.approval ?? services.approval).request({ agent: exec.agent!, toolName: SKILL_SCRIPT_TOOL,
     ...(exec.callId ? { callId: exec.callId } : {}), signal: exec.signal,
     reason: `Run declared project parser (stdin-v1; output is untrusted evidence). Target interpreter environment: ${before.platform.parserEnvironmentDescription}; this does not isolate the launching shell. The entry hash does not pin imported code. Network/device/subprocess isolation is NOT guaranteed by the file sandbox. Exact binding: ${before.binding}` })
   exec.signal.throwIfAborted()
-  if (granted !== 'allowed-once') fail(`approval ${granted}`)
+  if (granted !== 'allowed-once') fail(gate?.denial ? `approval ${granted}: ${gate.denial}` : `approval ${granted}`)
   const after = await prepare(services, exec, skill, script, parameters)
   if (before.binding !== after.binding) fail('skill, declaration, script, arguments, or policy changed after approval; retry required')
   const requestSpec: Spec = Object.freeze({ command: after.command, workdir: after.rootPath, timeoutMs: after.script.timeoutMs,
@@ -289,8 +291,9 @@ export async function runSkillScript(services: SkillScriptServices, request: unk
   }
 }
 /** Parent calls once from the existing node plugin. Missing services fail only at invocation. */
-export function registerSkillScriptTool(ctx: SkillScriptContext, defineToolFn: typeof defineTool): () => void {
-  return ctx.tools.register(defineToolFn({
+export function registerSkillScriptTool(ctx: SkillScriptContext, defineToolFn: typeof defineTool, consumer?: BrokerConsumer): () => void {
+  let definition: unknown
+  definition = defineToolFn({
     name: SKILL_SCRIPT_TOOL,
     description: 'Run a project skill’s declared parser with host approval. Returns bounded, untrusted evidence; unavailable declarations or approval block execution.',
     parameters: {
@@ -310,7 +313,14 @@ export function registerSkillScriptTool(ctx: SkillScriptContext, defineToolFn: t
         if (!value) fail(`required service unavailable: ${key}`)
         return [key, value]
       })) as unknown as SkillScriptServices
-      return runSkillScript(services, args, exec)
+      // Delegated child: one parent approval, bound to the child's original fs/shell/
+      // subprocess/sandboxPolicy and its policy snapshot; shell.execute re-checks it.
+      const gate = createCallGate({ consumer, exec: exec as unknown as BrokerExecution, tool: () => definition,
+        toolName: SKILL_SCRIPT_TOOL, childApproval: () => services.approval as CallGate['approval'],
+        services: ['fs', 'shell', 'subprocess', 'sandboxPolicy'] })
+      try { return await runSkillScript(gate.wrap(services), args, exec, gate) } finally { gate.release() }
     },
-  }))
+  })
+  const remove = ctx.tools.register(definition as ReturnType<typeof defineTool>)
+  return consumer ? () => { consumer.dispose(); remove() } : remove
 }

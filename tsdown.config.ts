@@ -33,6 +33,7 @@ export default defineConfig([
   entry('satellite/lib/notify', 'lib', 'src/lib/notify.ts', 'notify.js'),
   entry('satellite/lib/registry', 'lib', 'src/lib/registry.ts', 'registry.js'),
   entry('satellite/lib/skills', 'lib', 'src/lib/skills.ts', 'skills.js'),
+  entry('satellite/lib/delegated-approval', 'lib', 'src/lib/delegated-approval.ts', 'delegated-approval.js'),
   // 宿主平台策略（共享模块：node 与 android 都引用，也供测试单独导入）
   entry('satellite/platform/index', 'lib/platform', 'src/platform/index.ts', 'index.js'),
   entry('satellite/platform/contracts', 'lib/platform', 'src/platform/contracts.ts', 'contracts.js'),
@@ -46,6 +47,7 @@ export default defineConfig([
   entry('satellite/node/lib/config', 'lib/node/lib', 'src/node/lib/config.ts', 'config.js'),
   entry('satellite/node/lib/role-catalog', 'lib/node/lib', 'src/node/lib/role-catalog.ts', 'role-catalog.js'),
   entry('satellite/node/lib/role-service', 'lib/node/lib', 'src/node/lib/role-service.ts', 'role-service.js'),
+  entry('satellite/node/lib/approval-service', 'lib/node/lib', 'src/node/lib/approval-service.ts', 'approval-service.js'),
   entry('satellite/node/lib/extensions', 'lib/node/lib', 'src/node/lib/extensions.ts', 'extensions.js'),
   entry('satellite/node/lib/nodes', 'lib/node/lib', 'src/node/lib/nodes.ts', 'nodes.js'),
   entry('satellite/node/lib/routes', 'lib/node/lib', 'src/node/lib/routes.ts', 'routes.js'),
@@ -67,6 +69,7 @@ export default defineConfig([
   entry('satellite/android/lib/execution/emulator', 'lib/android/lib/execution', 'src/android/lib/execution/emulator.ts', 'emulator.js'),
   entry('satellite/android/lib/execution/journey', 'lib/android/lib/execution', 'src/android/lib/execution/journey.ts', 'journey.js'),
   entry('satellite/android/lib/execution/capture', 'lib/android/lib/execution', 'src/android/lib/execution/capture.ts', 'capture.js'),
+  entry('satellite/android/lib/execution/cleanup', 'lib/android/lib/execution', 'src/android/lib/execution/cleanup.ts', 'cleanup.js'),
   entry('satellite/android/lib/execution/tools', 'lib/android/lib/execution', 'src/android/lib/execution/tools.ts', 'tools.js'),
   entry('satellite/android/lib/registration', 'lib/android/lib', 'src/android/lib/registration.ts', 'registration.js'),
   entry('satellite/android/lib/reuse-source', 'lib/android/lib', 'src/android/lib/reuse-source.ts', 'reuse-source.js'),

@@ -23,6 +23,8 @@ import { readLiveConfigValue } from '../node/lib/config.js'
 import { registerReuseMaintenance } from '../node/lib/reuse-tools.js'
 import type { ReuseToolContext } from '../node/lib/reuse-tools.js'
 import { extractAndroidReuseSource, ANDROID_REUSE_SOURCE_REVISION } from './lib/reuse-source.js'
+import { DELEGATED_APPROVAL_SERVICE } from '../lib/delegated-approval.js'
+import type { BrokerConsumer } from '../lib/delegated-approval.js'
 
 // `tools` 必须是**声明的**依赖：Cordis 只在 inject 里声明过的服务才安装成
 // `ctx.tools` 属性；只用 ctx.get('tools') 取到的服务不能当属性用，
@@ -122,11 +124,28 @@ export function apply(ctx: Context, config?: unknown): void {
     const logger = ctx.get('logger') as { error?: (message: string) => void } | undefined
     logger?.error?.(`satellite/android: tool registration failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}`)
   }
+  // Optional inject of the node row's internal (non-Remote) consumer service. Only a
+  // consumer is ever obtained here — never an issuer. It is dropped (and disposed)
+  // when the node row unloads; without it a role child keeps its own `never` policy
+  // and nothing falls back to the root approval service.
+  let approvalConsumer: BrokerConsumer | undefined
+  const consumerOf = (): BrokerConsumer | undefined => approvalConsumer
+  ;(ctx as unknown as AndroidContext).inject([DELEGATED_APPROVAL_SERVICE], (serviceCtx) => {
+    serviceCtx.effect(() => {
+      const service = (serviceCtx as unknown as Record<string, { consumer?: () => BrokerConsumer } | undefined>)[DELEGATED_APPROVAL_SERVICE]
+      const consumer = service && typeof service.consumer === 'function' ? service.consumer() : undefined
+      approvalConsumer = consumer
+      return () => {
+        consumer?.dispose()
+        if (approvalConsumer === consumer) approvalConsumer = undefined
+      }
+    })
+  })
   try {
     registerReuseMaintenance(toolCtx, {
       revision: ANDROID_REUSE_SOURCE_REVISION, extract: extractAndroidReuseSource,
-    })
-    ctx.effect(() => registerAndroidExecutionTools(toolCtx, getExecutionConfig))
+    }, consumerOf)
+    ctx.effect(() => registerAndroidExecutionTools(toolCtx, getExecutionConfig, consumerOf))
   } catch (error) {
     // 不再静默：注册失败要能在宿主日志里看到，而不是"行 active、工具全缺"。
     report(error)

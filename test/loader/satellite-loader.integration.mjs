@@ -15,6 +15,7 @@ import assert from 'node:assert/strict'
 import { existsSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { bootSatellite, createWorld, DSH_SOURCE, dshPackageDir, importDsh, INSTALL_ANCHOR } from './boot.mjs'
 import { resetState, state } from './fixtures/script-state.mjs'
@@ -387,4 +388,235 @@ test('version-control approval: revoking the delegation while the real approval 
   const registry = ctx.get('agents')
   assert.equal(registry.list().filter((agent) => agent.session.header.origin === 'subagent').length, 0, 'child released')
   rmSync(join(world.repo, 'pending.txt'))
+})
+
+test('delegated approval: role child (policy never) asks the exact parent once; only allowed-once writes the reuse index', async () => {
+  const { writeFileSync } = await import('node:fs')
+  writeFileSync(join(world.repo, 'App.kt'), 'class App\n')
+  const index = join(world.repo, '.satellite-reuse-index.json')
+  // Enable the Android row (registers satellite_reuse_maintain) for this case only.
+  const androidEntry = [...ctx.loader.entries()].find((e) => e.options.id === 'satellite-android')
+  await androidEntry.update({ ...androidEntry.options, disabled: false })
+  for (let i = 0; i < 200 && !ctx.get('tools').get('satellite_reuse_maintain'); i++) await new Promise((r) => setTimeout(r, 25))
+  assert.ok(ctx.get('tools').get('satellite_reuse_maintain'), 'android row active')
+  const childAgents = []
+  const off = ctx.on('agent/created', ({ agent }) => { if (agent.session.header.origin === 'subagent') childAgents.push(agent) })
+  const runOnce = async (answer) => {
+    let base
+    resetState()
+    state.approvalAnswer = answer
+    const texts = []
+    state.script = (req) => {
+      if (req.kind === 'main') {
+        base ??= req.toolResults
+        return req.toolResults === base
+          ? { tool: 'satellite_node', args: { node: 'implement', task: '[node=implement] reuse' } }
+          : { text: 'MAIN DONE' }
+      }
+      if (req.last?.role === 'tool') texts.push(req.last.text)
+      if (req.toolResults === 0) return { tool: 'satellite_reuse_maintain', args: { action: 'initialize', paths: ['App.kt'] } }
+      return { text: 'CHILD DONE' }
+    }
+    await runTurn('reuse via child')
+    return texts
+  }
+  try {
+    const root = await mainAgent()
+    const rejected = await runOnce('rejected')
+    assert.equal(state.approvals.length, 1, JSON.stringify({ approvals: state.approvals, rejected }))
+    assert.equal(state.approvals[0].agentId, root.id)
+    assert.equal(state.approvals[0].live, true)
+    assert.equal(existsSync(index), false, 'rejection leaves no index')
+    assert.match(rejected[0] ?? '', /REUSE_APPROVAL_DENIED/, rejected[0])
+    const allowed = await runOnce('allowed-once')
+    assert.equal(state.approvals.length, 1, JSON.stringify({ approvals: state.approvals, allowed }))
+    assert.equal(state.approvals[0].agentId, root.id, 'answerer saw the exact parent')
+    assert.equal(state.approvals[0].toolName, 'satellite_reuse_maintain')
+    assert.match(state.approvals[0].reason, /Delegated child approval/)
+    assert.ok(existsSync(index), `allowed-once wrote the index: ${allowed[0]}`)
+    // Child policy stays never; the audit pair is written to the parent session only.
+    const approval = ctx.get('approval')
+    const child = childAgents.at(-1)
+    assert.equal(approval.effectivePolicy(child.session), 'never')
+    const audit = (id) => (events.get(id) ?? []).filter((e) => e.type === 'approval/asked' || e.type === 'approval/decided')
+    assert.ok(audit(root.id).some((e) => e.type === 'approval/decided' && e.data.outcome === 'allowed-once'))
+    assert.ok(audit(root.id).some((e) => e.type === 'approval/decided' && e.data.outcome === 'rejected'))
+    assert.equal(audit(child.id).length, 0)
+  } finally {
+    off?.()
+    rmSync(index, { force: true })
+    rmSync(join(world.repo, 'App.kt'), { force: true })
+  }
+})
+
+/* --------- delegated approval through the real ToolRuntime: Android discover + skill script --------- */
+// Only the execution methods of the child's real sandbox/subprocess/shell services are
+// replaced (in place, so service identity is unchanged) by deterministic recorders: no
+// device, adb or native sandbox is needed. Approval, delegation, policy and audit are real.
+async function withFakeExecution(run) {
+  const { symbols } = await import(pathToFileURL(createRequire(join(world.staged, 'package.json')).resolve('@deepseek-ai/cordis')).href)
+  const target = (name) => { const s = ctx.get(name); return s?.[symbols.original] ?? s }
+  const effects = []
+  const sandbox = target('sandbox'), subprocess = target('subprocess'), shell = target('shell')
+  const reader = (text) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+  sandbox.confine = async (argv) => ({ argv: [...argv], enforcement: 'full', denialSignatures: [] })
+  subprocess.spawn = (spec) => {
+    const line = spec.argv.join(' ')
+    effects.push(line)
+    const out = /devices -l/.test(line)
+      ? 'List of devices attached\nemulator-5554 device product:sdk model:sdk device:emu transport_id:1\n'
+      : /getprop/.test(line) ? '[ro.boot.serialno]: [emulator-5554]\n' : ''
+    return { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {}, async waitForExit() { return true },
+      collected: { stdout: reader(out), stderr: reader('') } }
+  }
+  shell.execute = async (spec) => {
+    effects.push(`shell ${spec.command}`)
+    return { kill() { return true }, done: Promise.resolve(), async result() {
+      return { exitCode: 0, signal: null, timedOut: false, aborted: false, timeoutMs: spec.timeoutMs,
+        stdout: { text: 'PARSED', truncated: false }, stderr: { text: '', truncated: false },
+        sandbox: { mode: 'read-only', denied: false, enforcement: 'full' } }
+    } }
+  }
+  try { return await run(effects) } finally {
+    delete sandbox.confine; delete subprocess.spawn; delete shell.execute
+  }
+}
+
+async function enableAndroidExecution() {
+  const entry = [...ctx.loader.entries()].find((e) => e.options.id === 'satellite-android')
+  await entry.update({ ...entry.options, disabled: false, config: { ...(entry.options.config ?? {}), execution: { enabled: true, adbPath: '/usr/bin/adb' } } })
+  for (let i = 0; i < 200 && !ctx.get('tools').get('satellite_android_device'); i++) await new Promise((r) => setTimeout(r, 25))
+  assert.ok(ctx.get('tools').get('satellite_android_device'), 'android execution tools registered')
+}
+
+async function delegatedChildCall(tool, args, answer) {
+  let base
+  resetState()
+  state.approvalAnswer = answer
+  const texts = []
+  state.script = (req) => {
+    if (req.kind === 'main') {
+      base ??= req.toolResults
+      return req.toolResults === base ? { tool: 'satellite_node', args: { node: 'implement', task: `[node=implement] ${tool}` } } : { text: 'MAIN DONE' }
+    }
+    if (req.last?.role === 'tool') texts.push(req.last.text)
+    if (req.toolResults === 0) return { tool, args }
+    return { text: 'CHILD DONE' }
+  }
+  await runTurn(`delegated ${tool}`)
+  return texts
+}
+
+test('delegated approval: Android device discover through the real Loader (allowed-once / rejected / parent never)', async () => {
+  await enableAndroidExecution()
+  const root = await mainAgent()
+  const approval = ctx.get('approval')
+  const childAgents = []
+  const off = ctx.on('agent/created', ({ agent }) => { if (agent.session.header.origin === 'subagent') childAgents.push(agent) })
+  const discover = { action: 'discover', serial: 'emulator-5554' }
+  try {
+    await withFakeExecution(async (effects) => {
+      const rejected = await delegatedChildCall('satellite_android_device', discover, 'rejected')
+      assert.equal(state.approvals.length, 1)
+      assert.equal(state.approvals[0].agentId, root.id)
+      assert.equal(effects.length, 0, `rejected: zero effects ${rejected[0]}`)
+      assert.match(rejected[0] ?? '', /APPROVAL_REJECTED|parent user rejected/, rejected[0])
+
+      const allowed = await delegatedChildCall('satellite_android_device', discover, 'allowed-once')
+      assert.equal(state.approvals.length, 1)
+      assert.match(state.approvals[0].reason, /Delegated child approval/)
+      assert.match(allowed[0] ?? '', /"status":"succeeded"/, allowed[0])
+      assert.ok(effects.some((e) => /devices -l/.test(e)) && effects.some((e) => /getprop/.test(e)), JSON.stringify(effects))
+      const afterAllowed = effects.length
+
+      approval.setPolicy(root, 'never')
+      try {
+        const never = await delegatedChildCall('satellite_android_device', discover, 'allowed-once')
+        assert.equal(state.approvals.length, 0, 'parent never: no prompt')
+        assert.equal(effects.length, afterAllowed, 'parent never: zero new effects')
+        assert.match(never[0] ?? '', /never/, never[0])
+      } finally { approval.setPolicy(root, 'ask') }
+
+      const unavailable = await delegatedChildCall('satellite_android_device', discover, 'unavailable')
+      assert.equal(effects.length, afterAllowed, `unavailable: zero new effects ${unavailable[0]}`)
+    })
+    for (const child of childAgents) assert.equal(approval.effectivePolicy(child.session), 'never', 'child policy unchanged')
+    const decided = (events.get(root.id) ?? []).filter((e) => e.type === 'approval/decided').map((e) => e.data.outcome)
+    assert.ok(decided.includes('allowed-once') && decided.includes('rejected'), JSON.stringify(decided))
+    for (const child of childAgents) assert.equal((events.get(child.id) ?? []).filter((e) => e.type === 'approval/asked').length, 0)
+  } finally { off?.() }
+})
+
+test('delegated approval: skill script run through the real Loader (allowed-once runs once, rejected runs nothing)', async () => {
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  const dir = join(world.repo, '.dsh', 'skills', 'parser-skill')
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  writeFileSync(join(dir, 'SKILL.md'), '---\nname: parser-skill\ndescription: test parser\n---\nParse.\n')
+  writeFileSync(join(dir, 'scripts', 'manifest.json'), JSON.stringify({ schemaVersion: 1, scripts: [{
+    id: 'parse', path: 'scripts/parse.mjs', runtime: 'node', execution: 'stdin-v1', parameters: [], timeoutMs: 1000, outputMaxBytes: 1024 }] }))
+  writeFileSync(join(dir, 'scripts', 'parse.mjs'), 'console.log("x")\n')
+  const args = { skill: 'parser-skill', script: 'parse', parameters: {} }
+  try {
+    await withFakeExecution(async (effects) => {
+      const rejected = await delegatedChildCall('satellite_skill_script_run', args, 'rejected')
+      assert.equal(effects.filter((e) => e.startsWith('shell')).length, 0, `rejected: ${rejected[0]}`)
+      assert.match(rejected[0] ?? '', /approval rejected/, rejected[0])
+      const allowed = await delegatedChildCall('satellite_skill_script_run', args, 'allowed-once')
+      assert.equal(state.approvals.length, 1)
+      assert.match(state.approvals[0].reason, /Delegated child approval/)
+      assert.equal(effects.filter((e) => e.startsWith('shell')).length, 1, `allowed: ${allowed[0]}`)
+      assert.match(allowed[0] ?? '', /PARSED/, allowed[0])
+    })
+  } finally { rmSync(join(world.repo, '.dsh'), { recursive: true, force: true }) }
+})
+
+test('delegated approval: managed emulator.start through the real Loader (allowed-once spawns once confined, rejected zero, owned handle released)', async () => {
+  const entry = [...ctx.loader.entries()].find((e) => e.options.id === 'satellite-android')
+  await entry.update({ ...entry.options, disabled: false, config: { ...(entry.options.config ?? {}),
+    execution: { enabled: true, adbPath: '/usr/bin/adb', emulatorPath: '/opt/sdk/emulator/emulator', bootPollIntervalMs: 10 } } })
+  for (let i = 0; i < 200 && !ctx.get('tools').get('satellite_android_emulator'); i++) await new Promise((r) => setTimeout(r, 25))
+  const { symbols } = await import(pathToFileURL(createRequire(join(world.staged, 'package.json')).resolve('@deepseek-ai/cordis')).href)
+  const target = (name) => { const s = ctx.get(name); return s?.[symbols.original] ?? s }
+  const sandbox = target('sandbox'), subprocess = target('subprocess')
+  const reader = (text) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+  const effects = [], confined = [], terminated = []
+  let running = false
+  sandbox.confine = async (argv, policy) => { confined.push(`${policy.mode} ${argv.join(' ')}`); return { argv: ['/sandbox-exec', ...argv], enforcement: 'full', denialSignatures: [] } }
+  subprocess.spawn = (spec) => {
+    const line = spec.argv.join(' ')
+    effects.push(line)
+    if (/ -avd /.test(line)) {
+      running = true
+      let exit
+      const done = new Promise((resolve) => { exit = resolve })
+      return { done, terminate() { terminated.push(line); running = false; exit({ exitCode: 0, signal: null }) },
+        async waitForExit() { await done; return true }, collected: { stdout: reader(''), stderr: reader('') } }
+    }
+    const out = / devices$/.test(line)
+      ? `List of devices attached\n${running ? 'emulator-5556\tdevice\n' : ''}`
+      : /sys\.boot_completed/.test(line) ? '1\n' : ''
+    return { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {}, async waitForExit() { return true },
+      collected: { stdout: reader(out), stderr: reader('') } }
+  }
+  const start = { action: 'start', avd: 'Pixel_API_34' }
+  const spawnedEmulators = () => effects.filter((e) => / -avd /.test(e))
+  try {
+    const rejected = await delegatedChildCall('satellite_android_emulator', start, 'rejected')
+    assert.equal(spawnedEmulators().length, 0, `rejected: zero spawn ${rejected[0]}`)
+    assert.match(rejected[0] ?? '', /APPROVAL_REJECTED|parent user rejected/, rejected[0])
+
+    const allowed = await delegatedChildCall('satellite_android_emulator', start, 'allowed-once')
+    assert.equal(state.approvals.length, 1)
+    assert.match(state.approvals[0].reason, /Delegated child approval/)
+    assert.match(allowed[0] ?? '', /"status":"succeeded"/, allowed[0])
+    assert.match(allowed[0] ?? '', /"cleanup":"retained-owned"/, allowed[0])
+    assert.equal(spawnedEmulators().length, 1, JSON.stringify(effects))
+    assert.match(spawnedEmulators()[0], /^\/sandbox-exec \/opt\/sdk\/emulator\/emulator -avd Pixel_API_34$/, 'spawned the confined argv')
+    assert.ok(confined.some((c) => /^workspace-write \/opt\/sdk\/emulator\/emulator -avd Pixel_API_34$/.test(c)), JSON.stringify(confined))
+    // The child scope ended with the delegated turn: its owned emulator was terminated.
+    for (let i = 0; i < 200 && terminated.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.equal(terminated.length, 1, 'owned handle cleaned up with the owner scope')
+  } finally {
+    delete sandbox.confine; delete subprocess.spawn
+  }
 })

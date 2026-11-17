@@ -11,6 +11,7 @@
  * 与 journey 共用设备临时目录约定（同一个常量，避免两处漂移）。
  */
 
+import type { DeviceCleanup } from './cleanup.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import { isAbsoluteHostPathSyntax } from '../../../platform/paths.ts'
 
@@ -67,6 +68,11 @@ export interface CaptureDeps {
   readonly adbPath: string
   readonly operationTimeoutMs: number
   readonly outputMaxBytes: number
+  /**
+   * Bounded cleanup capability (tool layer): removes only this call's registered
+   * device temp files, still working after cancellation or a lost delegated permit.
+   */
+  readonly cleanup?: DeviceCleanup
   /** 收尾预算；默认 `CAPTURE_SETTLE_MS`，部署/测试可收窄，不能放大超过会话预算。 */
   readonly settleMs?: number
 }
@@ -176,6 +182,8 @@ interface RunContext {
   readonly token: string
   readonly devicePaths: Set<string>
   readonly settleMs: number
+  /** Set once an on-device business command (screenrecord/perfetto) actually started. */
+  readonly effect: { started: boolean }
 }
 
 function frozen(status: OperationOutcome['status'], extra: {
@@ -225,7 +233,7 @@ type CommandOutcome =
 async function runCommand(
   context: RunContext,
   args: readonly string[],
-  options: { readonly timeoutMs: number; readonly stdin?: string; readonly outputMaxBytes?: number },
+  options: { readonly timeoutMs: number; readonly stdin?: string; readonly outputMaxBytes?: number; readonly effect?: boolean },
 ): Promise<CommandOutcome> {
   const { deps } = context
   if (deps.exec.signal.aborted) return { ok: false, status: 'cancelled', code: 'CANCELLED', detail: 'cancelled before the command started' }
@@ -244,6 +252,8 @@ async function runCommand(
     },
     deps.exec.signal,
   )
+  // A spawned business command may already have changed the device, whatever happens next.
+  if (run.ok && options.effect === true) context.effect.started = true
   if (!run.ok) {
     return run.failure.kind === 'cancelled'
       ? { ok: false, status: 'cancelled', code: 'CANCELLED', detail: 'cancelled' }
@@ -268,6 +278,7 @@ async function runCommand(
 /** 删除设备临时文件；用独立信号，调用被取消时仍然尝试。 */
 async function removeDeviceFile(context: RunContext, path: string): Promise<boolean> {
   const { deps, request } = context
+  if (deps.cleanup) return deps.cleanup.remove(path)
   const run = await runBounded(
     { sandbox: deps.sandbox, subprocess: deps.subprocess },
     {
@@ -399,6 +410,7 @@ export async function runCapture(deps: CaptureDeps, request: CaptureRequest, now
     // 设备临时文件名用随机不透明 token：不接受调用方提供，也不依赖可预测序号。
     token: `${startedAt.toString(36)}-${randomUUID().slice(0, 8)}`,
     devicePaths: new Set<string>(),
+    effect: { started: false },
   }
   const artifacts: OperationEvidence[] = []
 
@@ -454,6 +466,15 @@ export async function runCapture(deps: CaptureDeps, request: CaptureRequest, now
       cleanup,
       error: { code: 'CLEANUP_FAILED', message: 'a device temporary file could not be removed' },
     })
+  }
+  if (context.effect.started && (failure.status === 'cancelled' || failure.status === 'blocked')) {
+    // The device recording already ran: never report this as "nothing happened" or as a
+    // retryable block. The workspace artifact was not produced/verified.
+    const effectNote = `the ${request.action} command already started on the device (on-device effect occurred); `
+      + `the workspace artifact was not produced or verified; device temp cleanup: ${cleanup}; not retried automatically`
+    return failure.status === 'cancelled'
+      ? frozen('cancelled', { evidence: artifacts, artifacts, cleanup, error: { code: 'CANCELLED', message: `cancelled after start: ${effectNote}` } })
+      : frozen('effect-unknown', { evidence: artifacts, artifacts, cleanup, error: { code: 'EFFECT_UNKNOWN', message: `${failure.detail}; ${effectNote}` } })
   }
   if (failure.status === 'cancelled') return frozen('cancelled', { evidence: artifacts, artifacts, cleanup })
   if (failure.status === 'blocked') {
@@ -550,6 +571,7 @@ async function captureRecording(
     stdin = config.text
   }
   context.devicePaths.add(path)
+  deps.cleanup?.own(path)
 
   // 时窗靠**配置里的 duration_ms**：真机上的 perfetto 不认 `--time-limit`
   // （实测 `perfetto: unrecognized option '--time-limit'`），所以不再传；
@@ -562,6 +584,7 @@ async function captureRecording(
     timeoutMs,
     ...(stdin !== undefined ? { stdin } : {}),
     outputMaxBytes: Math.min(deps.outputMaxBytes, 256 * 1024),
+    effect: true,
   })
   if (!run.ok) return run
   if (run.result.exitCode !== 0) {

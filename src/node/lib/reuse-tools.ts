@@ -1,6 +1,8 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createReuseIndex, REUSE_INDEX_PATH, REUSE_OVERRIDES_PATH, REUSE_LIMITS } from './reuse-index.js'
 import type { ReuseApprovalPlan, ReuseEntryDraft, ReuseFs, ReuseSandboxPolicy } from './reuse-index.js'
+import { createCallGate } from '../../lib/delegated-approval.ts'
+import type { BrokerConsumer, BrokerExecution } from '../../lib/delegated-approval.ts'
 
 /** Host adapter only. Service names/signatures follow the inspected DSH contracts. */
 interface HostFs extends ReuseFs {
@@ -94,7 +96,12 @@ export function registerReuseQuery(ctx: ReuseToolContext): void {
 }
 
 /** Android supplies the sole real recognizer. No recognizer registry or core→Android import. */
-export function registerReuseMaintenance(ctx: ReuseToolContext, source: ReuseSource): void {
+/**
+ * `consumerOf` reads the CURRENT delegated-approval consumer at call time (the Android
+ * row holds it through an optional inject and drops it when the node row unloads).
+ * Without one, a caller keeps its own approval service; a role child stays `never`.
+ */
+export function registerReuseMaintenance(ctx: ReuseToolContext, source: ReuseSource, consumerOf: () => BrokerConsumer | undefined = () => undefined): void {
   const toolName = 'satellite_reuse_maintain'
   const tool = defineTool({
     name: toolName,
@@ -125,6 +132,10 @@ export function registerReuseMaintenance(ctx: ReuseToolContext, source: ReuseSou
       if (!approval || typeof approval.request !== 'function') return json(unavailable('REUSE_APPROVAL_UNAVAILABLE'))
       if (!sandboxPolicy || typeof sandboxPolicy.resolve !== 'function') return json(unavailable('REUSE_SANDBOX_POLICY_UNAVAILABLE'))
       const agent = exec.agent!
+      // A delegated child's one parent approval is re-checked before the index write.
+      const gate = createCallGate({ consumer: consumerOf(), exec: exec as unknown as BrokerExecution, tool: () => tool, toolName,
+        childApproval: () => approval, services: ['fs', 'sandboxPolicy'] })
+      try {
       const policy = () => sandboxPolicy.resolve({ session: agent.session })
       const initialPolicy = policy()
       if (!initialPolicy || !['workspace-write', 'danger-full-access'].includes(initialPolicy.mode)) throw new Error('REUSE_WRITE_DENIED')
@@ -132,18 +143,26 @@ export function registerReuseMaintenance(ctx: ReuseToolContext, source: ReuseSou
       const writeRoot = await bound.fs.resolve(initialPolicy.workspaceRoot, { signal: exec.signal })
       const projectRoot = await bound.fs.resolve(bound.projectRoot, { signal: exec.signal })
       if (!bound.fs.contains(writeRoot, projectRoot)) throw new Error('REUSE_WRITE_ROOT_DENIED')
-      const api = createReuseIndex({ ...bound, sourceRevision: source.revision, extract: source.extract, policy,
+      const api = createReuseIndex({ ...bound, fs: gate.wrap({ fs: bound.fs }).fs, sourceRevision: source.revision, extract: source.extract, policy,
         approve: async (plan: ReuseApprovalPlan, signal: AbortSignal) => {
           const reason = `Reuse index maintenance (explicit files only):\n${JSON.stringify(plan)}`
           // Never truncate an approval plan: if it cannot be shown exactly, split the request.
           if (Buffer.byteLength(reason) > 64 * 1024) throw new Error('REUSE_APPROVAL_PLAN_TOO_LARGE')
           signal.throwIfAborted()
-          return approval.request({ agent, toolName, ...(exec.callId ? { callId: exec.callId } : {}), reason, signal })
+          return gate.approval.request({ agent, toolName, ...(exec.callId ? { callId: exec.callId } : {}), reason, signal })
         },
       })
-      const result = await api.maintain(args, exec.signal)
+      let result
+      try { result = await api.maintain(args, exec.signal) } catch (error) {
+        // Keep the native code; name the delegated-approval reason (policy never, no answerer, rejected).
+        if (gate.denial !== undefined && error instanceof Error && error.message.includes('REUSE_APPROVAL_DENIED')) {
+          throw new Error(`${error.message}: ${gate.denial}`, { cause: error })
+        }
+        throw error
+      }
       if (Buffer.byteLength(JSON.stringify(result)) > REUSE_LIMITS.outputBytes) throw new Error('REUSE_OUTPUT_BUDGET')
       return json(result)
+      } finally { gate.release() }
     },
   })
   ctx.effect(() => ctx.tools.register(tool))

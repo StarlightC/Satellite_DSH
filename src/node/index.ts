@@ -15,6 +15,7 @@ import { BUILTIN_ROLE_NAMES, BUILTIN_ROUTES } from './lib/config.js'
 import { assertHostContracts, createNodeRuntime, registerCoordinatorBoundary } from './lib/wiring.js'
 import type { CoordinatorContext } from './lib/wiring.js'
 import { SatelliteRoles } from './lib/role-service.js'
+import { SatelliteDelegatedApproval } from './lib/approval-service.js'
 import type { NodeRuntimeContext } from './lib/wiring.js'
 import { registerReuseQuery } from './lib/reuse-tools.js'
 import type { ReuseToolContext } from './lib/reuse-tools.js'
@@ -76,7 +77,10 @@ export function apply(ctx: Context, config: unknown): void {
   // A read-only native Remote service, owned by this node row's lifecycle.
   // Ordinary roles/nodes remain deployment configuration, not editable volatile settings.
   ctx.plugin(SatelliteRoles, { describe: () => runtime.describeRoles() })
+  // Internal, non-Remote: other Satellite rows (Android) may only obtain a consumer.
+  ctx.plugin(SatelliteDelegatedApproval, { consumer: () => runtime.approvalConsumer() })
   // Register optional operations only after the node configuration has been validated.
   registerReuseQuery(ctx as unknown as ReuseToolContext)
-  ctx.effect(() => registerSkillScriptTool(ctx as unknown as SkillScriptContext, defineTool))
+  // Same row: the script tool closes over this runtime's consumer directly.
+  ctx.effect(() => registerSkillScriptTool(ctx as unknown as SkillScriptContext, defineTool, runtime.approvalConsumer()))
 }

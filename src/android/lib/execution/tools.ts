@@ -45,6 +45,10 @@ import type { CaptureDeps } from './capture.js'
 import { JOURNEY_KEYS, describeJourneyPlan, parseJourneyRequest, runJourney } from './journey.js'
 import type { JourneyDeps } from './journey.js'
 import { detectHostPlatform, isAbsoluteHostPathSyntax } from '../../../platform/index.js'
+import { approvalMessage, attachGate, createCallGate, detachGate, gateOf } from '../../../lib/delegated-approval.ts'
+import type { BrokerConsumer } from '../../../lib/delegated-approval.ts'
+import { createDeviceCleanup } from './cleanup.js'
+import type { DeviceCleanup } from './cleanup.js'
 import type { SupportedPlatform, HostPlatform } from '../../../platform/index.js'
 
 export const JOURNEY_TOOL = 'satellite_android_journey'
@@ -106,7 +110,16 @@ interface Services {
   readonly subprocess: SubprocessLike
   readonly sandboxPolicy: PolicyLike
   readonly approval: ApprovalLike
+  /**
+   * The caller's own (ungated) sandbox/subprocess, reachable ONLY through the bounded
+   * device-cleanup capability: it can remove this call's registered device temp files
+   * and nothing else, even after cancellation or a lost delegated permit.
+   */
+  readonly cleanupRunner: { readonly sandbox: SandboxLike; readonly subprocess: SubprocessLike }
 }
+
+/** Execution services a delegated call binds by original identity (shell is unused here). */
+const GATED_SERVICES = ['fs', 'sandbox', 'subprocess', 'sandboxPolicy'] as const
 
 const toolOutput = {
   schema: { type: 'object', additionalProperties: true, properties: { status: { type: 'string', required: true } } },
@@ -118,7 +131,15 @@ const json = (value: object) => JSON.parse(JSON.stringify(value)) as Record<stri
 function servicesFor(root: ServiceScope, exec: ScopedExecution): Services | OperationOutcome {
   const scoped = scopedServices(root, exec, SERVICE_NAMES)
   if (!scoped.ok) return blocked('services', scoped.code, scoped.message)
-  return scoped.services as unknown as Services
+  const own = scoped.services as unknown as Omit<Services, 'cleanupRunner'>
+  const gate = gateOf(exec)
+  const cleanupRunner = { sandbox: own.sandbox, subprocess: own.subprocess }
+  if (!gate) return { ...own, cleanupRunner }
+  // A delegated child's single parent approval, the bound original services and its
+  // policy snapshot are re-validated before every confine (and after its await),
+  // spawn and artifact write; requested modes are capped at the child's policy.
+  const wrapped = gate.wrap({ fs: own.fs, sandbox: own.sandbox, subprocess: own.subprocess })
+  return { ...own, ...wrapped, approval: gate.approval, cleanupRunner }
 }
 
 function isOutcome<T extends object>(value: T | OperationOutcome): value is OperationOutcome {
@@ -313,7 +334,7 @@ async function askApproval(
   exec.signal.throwIfAborted()
   if (granted === 'allowed-once') return recheckPlatform(services, exec, toolName, platform)
   if (granted === 'cancelled') return cancelled(toolName, 'not-needed')
-  return blocked(toolName, granted === 'unavailable' ? 'APPROVAL_UNAVAILABLE' : 'APPROVAL_REJECTED', `approval ${granted}`)
+  return blocked(toolName, granted === 'unavailable' ? 'APPROVAL_UNAVAILABLE' : 'APPROVAL_REJECTED', approvalMessage(exec, granted))
 }
 
 /** 运行结果到结果码的统一映射；清理失败与效果未知都不伪装成成功。 */
@@ -360,6 +381,7 @@ function mapRun(
 export function registerAndroidExecutionTools(
   ctx: AndroidToolContext,
   getConfig: () => AndroidExecutionConfig,
+  consumerOf: () => BrokerConsumer | undefined = () => undefined,
 ): () => void {
   // 观测表与互斥锁属于这一行插件实例：卸载即失效，不跨组件复用，也不放模块级单例。
   const observations = createObservationStore(() => Date.now(), () => randomUUID())
@@ -373,7 +395,33 @@ export function registerAndroidExecutionTools(
   // 规格对象用的是作者 DSL（宽类型）：通过宽松别名调用 defineTool，
   // 既保留运行时的 DSL 归一化，又不触发泛型深度展开的类型错误。
   const authorTool = defineTool as unknown as (spec: object) => unknown
-  const register = (spec: object): () => void => ctx.tools.register(authorTool(spec))
+  // Delegated children ask the exact live parent through the node row's consumer
+  // (read per call: it disappears with the node row, never replaced by the root).
+  const register = (spec: { name: string; execute(args: Record<string, unknown>, exec: unknown): Promise<unknown> }): () => void => {
+    let definition: unknown
+    const run = spec.execute
+    definition = authorTool({
+      ...spec,
+      async execute(args: Record<string, unknown>, nativeExec: unknown) {
+        const exec = nativeExec as ScopedExecution
+        const gate = createCallGate({
+          consumer: consumerOf(), exec, tool: () => definition, toolName: spec.name,
+          childApproval: () => (exec.agent?.ctx ?? ctx).get('approval') as ApprovalLike | undefined,
+          services: GATED_SERVICES,
+        })
+        // A delegated role can never widen its sandbox: explicit escalation fails closed
+        // before any approval (automatic unconfined runs are refused at spawn).
+        if (gate.delegated && args && (args.sandboxPermissions !== undefined || args.justification !== undefined)) {
+          gate.release()
+          return json(blocked(spec.name, 'CAPABILITY_UNAVAILABLE',
+            'a delegated role cannot request sandboxPermissions/escalation; its sandbox is capped at the child policy. Nothing ran.'))
+        }
+        attachGate(exec, gate)
+        try { return await run.call(spec, args, nativeExec) } finally { detachGate(exec) }
+      },
+    })
+    return ctx.tools.register(definition)
+  }
   const disposers = [
     register(createProjectTool(ctx, getConfig, observations)),
     register(createBuildTool(ctx, getConfig, observations)),
@@ -495,6 +543,7 @@ function createEmulatorTool(
             ...(binding.sessionId !== undefined ? { sessionId: binding.sessionId } : {}),
           },
           exec,
+          confineStart: gateOf(exec)?.delegated === true,
           config: {
             emulatorPath: config.emulatorPath as string,
             ...(config.avdmanagerPath !== undefined ? { avdmanagerPath: config.avdmanagerPath } : {}),
@@ -600,7 +649,7 @@ function createDeviceTool(
 ) {
   return {
     name: DEVICE_TOOL,
-    description: 'Observe and operate one explicitly named Android device over adb. discover is read-only; install, launch and foreground change or read device state and require host approval. It never falls back to a default device and never provides arbitrary adb arguments.',
+    description: 'Observe and operate one explicitly named Android device over adb. Every action, discover included, requires host approval (a delegated role asks its delegating parent session); discover only reads device identity, install, launch and foreground change or read device state. It never falls back to a default device and never provides arbitrary adb arguments.',
     parameters: {
       action: { type: 'string', enum: ['discover', 'install', 'launch', 'foreground'], required: true, description: 'discover: observe one serial and return an observation id. install: install a workspace APK. launch: start the app launcher. foreground: read the current foreground package.' },
       serial: { type: 'string', description: 'Exact device serial, required for discover and every other action.' },
@@ -1169,8 +1218,17 @@ function deviceLikeDeps(
   binding: ProjectBinding,
   exec: ScopedExecution,
   config: AndroidExecutionConfig,
+  serial: string,
 ): JourneyDeps & CaptureDeps {
+  const cleanup: DeviceCleanup = createDeviceCleanup({
+    runner: services.cleanupRunner, adbPath: config.adbPath as string, serial,
+    binding: {
+      root: binding.root, mode: binding.mode, workspaceRoot: binding.workspaceRoot,
+      ...(binding.sessionId !== undefined ? { sessionId: binding.sessionId } : {}),
+    },
+  })
   return {
+    cleanup,
     // JourneyFs 是 CaptureFs 的子集；这里给出完整适配器，两个模块共用一份。
     fs: binding.fs as unknown as CaptureDeps['fs'],
     sandbox: services.sandbox,
@@ -1249,7 +1307,7 @@ function createJourneyTool(
         if (!after || policyKey(after) !== policyKey(binding)) {
           return json(blocked('journey', 'POLICY_CHANGED', 'session policy changed after approval; retry required'))
         }
-        const deps = deviceLikeDeps(services, binding, exec, config)
+        const deps = deviceLikeDeps(services, binding, exec, config, request.serial)
         const deviceDeps = deviceDepsFor(services, binding, exec, config)
         if (isOutcome(deviceDeps)) return json(deviceDeps)
         const prepared = await prepareObservedTarget(deviceDeps, lock, observations, {
@@ -1316,7 +1374,7 @@ function createCaptureTool(
         if (!after || policyKey(after) !== policyKey(binding)) {
           return json(blocked('capture', 'POLICY_CHANGED', 'session policy changed after approval; retry required'))
         }
-        const deps: CaptureDeps = { ...deviceLikeDeps(services, binding, exec, config) }
+        const deps: CaptureDeps = { ...deviceLikeDeps(services, binding, exec, config, request.serial) }
         const deviceDeps = deviceDepsFor(services, binding, exec, config)
         if (isOutcome(deviceDeps)) return json(deviceDeps)
         const prepared = await prepareObservedTarget(deviceDeps, lock, observations, {

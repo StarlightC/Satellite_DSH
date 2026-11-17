@@ -9,6 +9,7 @@
  * - 只操作明确指定的 serial；绝不退回"默认第一台设备"。
  */
 
+import { approvalMessage } from '../../../lib/delegated-approval.ts'
 import type {
   ApprovalLike, OperationOutcome, PolicyLike, SandboxLike, ScopedExecution, SubprocessLike,
 } from './contracts.js'
@@ -240,7 +241,7 @@ async function approvalOutcome(
   }
   if (granted === 'allowed-once') return undefined
   if (granted === 'cancelled') return cancelled(action, 'not-needed')
-  return blocked(action, granted === 'unavailable' ? 'APPROVAL_UNAVAILABLE' : 'APPROVAL_REJECTED', `approval ${granted}`)
+  return blocked(action, granted === 'unavailable' ? 'APPROVAL_UNAVAILABLE' : 'APPROVAL_REJECTED', approvalMessage(exec, granted))
 }
 
 function runFailure(action: string, run: BoundedRunOutcome): OperationOutcome | undefined {

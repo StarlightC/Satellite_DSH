@@ -74,7 +74,9 @@ install_bundle <解压后的 package 目录>
 
 只支持 host-shared POSIX：child fs 必须证明 workspace/cwd 与固定 `/usr/bin/env`、`/usr/bin/git` 为同一宿主文件且进程路径不变，subprocess 与其共享执行世界；不明确、容器重映射或 Windows 拒绝。每进程强制 full 原生 confinement（读 read-only，写 workspace-write），不超过父权限；clean `env -i`，禁 hooks/filter/signing/extdiff/lazy fetch。普通惰性 origin 配置可读；仅 `[lfs] repositoryformatversion = 0` 可接受，filter lfs/attributes 驱动仍拒绝。
 
-**DSH child 固定 approval=never，本插件不修改它；stage/commit 改由受信运行时在父会话当前开放的显式 `satellite_node` 调用内另建父拥有操作：审批、沙箱、子进程、cwd 与策略都取自父作用域，父须重新观察并与子快照一致，取得宿主逐次 `allowed-once` 后、最终 confine 之后再次复核才执行。父为只读/never/无应答者即拒绝。** 主会话仍无 git/shell 工具；读操作仍用 child 服务。仓库扫描包括 ignored 文件，限2万项/64 MiB/单文件8 MiB，拒绝 symlink/hardlink、submodule/partial-clone/alternates/shallow、`config.worktree`/`extensions.worktreeConfig` 等。支持普通主树（含已注册 linked worktree）及 workspace 内的 linked worktree：须为绝对 gitfile、`commondir/worktrees/<name>` 登记、commondir 与反向 gitdir 一致且规范无 symlink；扫描同时覆盖 worktree 与 common 目录（含私有 gitdir），快照绑定布局，按 common 目录串行。仅当 common 目录在 workspace 外时，写入本次调用以 `additionalWritableRoots` 精确授权该目录（审批计划写明，探测与实际 confine 一致，并须证明 host-shared 映射）；该目录含 hooks/config，本工具每次重新校验并禁用 hooks，但其他宿主 Git 调用不受此保护；含依赖/缓存的项目可能受限。真实 commit 仅在临时 fixture 仓库以模拟服务测试；不等于 live-host 批准或隔离实测。完整限制见 [服务条件](<node/skills/satellite-version-control/references/limits.md>)。不承诺恶意宿主或外部最后瞬间竞态的完全隔离。
+**DSH child 固定 approval=never，本插件不修改它；stage/commit 改由受信运行时在父会话当前开放的显式 `satellite_node` 调用内另建父拥有操作：审批、沙箱、子进程、cwd 与策略都取自父作用域，父须重新观察并与子快照一致，取得宿主逐次 `allowed-once` 后、最终 confine 之后再次复核才执行。父为只读/never/无应答者即拒绝。** 主会话仍无 git/shell 工具；读操作仍用 child 服务。仓库扫描包括 ignored 文件，不设条目/总量/单文件配额（普通文件流式完整计算摘要，大仓库耗时相应增加），拒绝 symlink/hardlink、submodule/partial-clone/alternates/shallow、`config.worktree`/`extensions.worktreeConfig` 等。支持普通主树（含已注册 linked worktree）及 workspace 内的 linked worktree：须为绝对 gitfile、`commondir/worktrees/<name>` 登记、commondir 与反向 gitdir 一致且规范无 symlink；扫描同时覆盖 worktree 与 common 目录（含私有 gitdir），快照绑定布局，按 common 目录串行。仅当 common 目录在 workspace 外时，写入本次调用以 `additionalWritableRoots` 精确授权该目录（审批计划写明，探测与实际 confine 一致，并须证明 host-shared 映射）；该目录含 hooks/config，本工具每次重新校验并禁用 hooks，但其他宿主 Git 调用不受此保护；含依赖 symlink 的项目可能被拒绝。真实 commit 仅在临时 fixture 仓库以模拟服务测试；不等于 live-host 批准或隔离实测。完整限制见 [服务条件](<node/skills/satellite-version-control/references/limits.md>)。不承诺恶意宿主或外部最后瞬间竞态的完全隔离。
+
+**委派子 Agent 的其他审批工具（Android 全部审批动作、`satellite_reuse_maintain`、`satellite_skill_script_run`）同样不让 child 弹窗：** child 仍为 never，执行仍用 child 自己的 fs/沙箱/子进程；每次子调用由受信运行时把一次审批转给 exact live 父会话（标注父 `satellite_node` callId、子 callId 与完整计划），仅 `allowed-once` 放行本次调用，不缓存、不重放，批准后到每次 confine/spawn/写入前复核委派、会话、服务与工具定义。父为 never、无应答者、拒绝或取消时失败关闭并说明原因；不新增任何沙箱权限。device `discover` 也需要审批。委派调用绑定 child 原始 fs/sandbox/subprocess/shell/sandboxPolicy 与其策略快照：任何选定模式不得宽于 child 当前上限，委派路径的 `sandboxPermissions`/升级请求一律失败关闭，未经 confine 的自动 danger 运行在 spawn 处被拒；父策略在每次复核时重新读取（变为 never 或读不到即拒）。旅程/采集在取消或许可失效后仅通过有界清理能力删除本次登记的设备临时文件（精确 serial/路径/`rm -f`），不做 pull 或其他动作。审批 broker 由 node 行在本地创建，发证方不出该闭包；Android 只经可选注入的内部（非 Remote）服务取得消费者，node 卸载即作废，无 node 时 child 保持 never，不回落根会话。**信任域说明：** 同进程的 Host 插件属受信代码，本机制不对恶意进程内插件提供隔离；它保证的是模型与客户端没有可伪造发证/身份的入口。
 
 ### 等待确认与恢复
 
@@ -224,6 +226,8 @@ routes:
 
 设备操作应先发现目标并取得观测 id；安装、启动、旅程和采集会使用该 id 复核设备，不接受仅凭 serial 执行。
 工具复用 Harness 的批准机制，遇到拒绝或权限不足时不会绕过。
+
+模拟器 `start`：普通（非委派）调用保持原实现直接启动；只有经委派审批门的调用才对保留进程做原生 confine（full enforcement，否则拒绝），并保留 argv 绑定与 owned 清理。是否 confine 由受信运行时的调用信息决定，不是模型可传参数。真实受限沙箱可能不允许外部 AVD/SDK 目录写入而导致委派启动失败；父会话批准不等于扩大 child 沙箱权限。这里承诺的是授权路由可用，而不是任意外部设备资源在任何沙箱下都可用。
 
 ### 专项技能（按需）
 

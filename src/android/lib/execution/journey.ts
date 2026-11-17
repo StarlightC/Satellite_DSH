@@ -15,6 +15,7 @@
  * `describeJourneyPlan()` 供批准理由使用，并负责执行与结果映射。
  */
 
+import type { DeviceCleanup } from './cleanup.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import { isAbsoluteHostPathSyntax } from '../../../platform/paths.ts'
 
@@ -90,6 +91,11 @@ export interface JourneyDeps {
   readonly adbPath: string
   readonly operationTimeoutMs: number
   readonly outputMaxBytes: number
+  /**
+   * Bounded cleanup capability (tool layer): removes only this call's registered
+   * device temp files, still working after cancellation or a lost delegated permit.
+   */
+  readonly cleanup?: DeviceCleanup
 }
 
 /** 本模块实际使用的文件系统能力（与 DSH fs 服务的对应方法一致）。 */
@@ -280,6 +286,8 @@ interface RunContext {
   readonly token: string
   readonly deadline: number
   readonly cleanupPaths: Set<string>
+  /** Set once a device-changing command (input/screencap/uiautomator dump) actually started. */
+  readonly effect: { started: boolean }
 }
 
 const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex')
@@ -312,7 +320,7 @@ interface StepOutcome {
 async function runCommand(
   context: RunContext,
   args: readonly string[],
-  options: { readonly timeoutMs?: number; readonly stdin?: string; readonly outputMaxBytes?: number } = {},
+  options: { readonly timeoutMs?: number; readonly stdin?: string; readonly outputMaxBytes?: number; readonly effect?: boolean } = {},
 ): Promise<{ ok: true; stdout: string; stderr: string; truncated: boolean } | { ok: false; outcome: StepOutcome }> {
   const { deps, request } = context
   if (deps.exec.signal.aborted) {
@@ -338,6 +346,7 @@ async function runCommand(
     },
     deps.exec.signal,
   )
+  if (run.ok && options.effect === true) context.effect.started = true
   if (!run.ok) {
     return run.failure.kind === 'cancelled'
       ? { ok: false, outcome: { ok: false, status: 'cancelled', code: 'CANCELLED', detail: 'cancelled' } }
@@ -359,6 +368,7 @@ async function runCommand(
 /** 删除一个设备临时文件；失败只记清理状态，不掩盖主结果。 */
 async function removeDeviceFile(context: RunContext, path: string): Promise<boolean> {
   const { deps, request } = context
+  if (deps.cleanup) return deps.cleanup.remove(path)
   const run = await runBounded(
     { sandbox: deps.sandbox, subprocess: deps.subprocess },
     {
@@ -421,7 +431,8 @@ async function runScreenshot(context: RunContext, step: Extract<JourneyStep, { a
 
   const devicePath = deviceTempPath('png', context.token)
   context.cleanupPaths.add(devicePath)
-  const capture = await runCommand(context, adb(context.deps, context.request.serial, ['shell', 'screencap', '-p', devicePath]))
+  context.deps.cleanup?.own(devicePath)
+  const capture = await runCommand(context, adb(context.deps, context.request.serial, ['shell', 'screencap', '-p', devicePath]), { effect: true })
   if (!capture.ok) return capture.outcome
   if (capture.truncated) {
     // screencap 到设备文件不应产生大量 stdout；被截断说明形状不符，不能当作成功。
@@ -459,7 +470,8 @@ async function runAssertForeground(context: RunContext, step: Extract<JourneySte
 async function runAssertUiText(context: RunContext, step: Extract<JourneyStep, { action: 'assert-ui-text' }>): Promise<StepOutcome> {
   const devicePath = deviceTempPath('xml', context.token)
   context.cleanupPaths.add(devicePath)
-  const dump = await runCommand(context, adb(context.deps, context.request.serial, ['shell', 'uiautomator', 'dump', devicePath]))
+  context.deps.cleanup?.own(devicePath)
+  const dump = await runCommand(context, adb(context.deps, context.request.serial, ['shell', 'uiautomator', 'dump', devicePath]), { effect: true })
   if (!dump.ok) return dump.outcome
 
   const read = await runCommand(
@@ -495,6 +507,7 @@ export async function runJourney(deps: JourneyDeps, request: JourneyRequest, now
     token: `${startedAt.toString(36)}-${randomUUID().slice(0, 8)}`,
     deadline: startedAt + deps.operationTimeoutMs,
     cleanupPaths: new Set<string>(),
+    effect: { started: false },
   }
   const steps: JourneyStepResult[] = []
   const collected: OperationEvidence[] = []
@@ -551,8 +564,15 @@ export async function runJourney(deps: JourneyDeps, request: JourneyRequest, now
       error: { code: 'CLEANUP_FAILED', message: 'some device temporary files could not be removed' },
     })
   }
-  if (failure.status === 'cancelled') return frozen('cancelled', 'journey', { evidence: collected, cleanup, steps })
-  const alreadyChangedDevice = steps.some((entry) => entry.status === 'succeeded')
+  const alreadyChangedDevice = context.effect.started || steps.some((entry) => entry.status === 'succeeded')
+  if (failure.status === 'cancelled') {
+    return frozen('cancelled', 'journey', {
+      evidence: collected, cleanup, steps,
+      ...(alreadyChangedDevice
+        ? { error: { code: 'CANCELLED' as const, message: `cancelled after device commands already ran (device state may have changed; not retried automatically; device temp cleanup: ${cleanup})` } }
+        : {}),
+    })
+  }
   if (failure.status === 'blocked' && !alreadyChangedDevice) {
     return frozen('blocked', 'journey', {
       evidence: collected,
@@ -589,18 +609,18 @@ async function executeStep(context: RunContext, step: JourneyStep): Promise<Step
   const signal = deps.exec.signal
   switch (step.action) {
     case 'tap': {
-      const run = await runCommand(context, adb(deps, request.serial, ['shell', 'input', 'tap', String(step.x), String(step.y)]))
+      const run = await runCommand(context, adb(deps, request.serial, ['shell', 'input', 'tap', String(step.x), String(step.y)]), { effect: true })
       if (!run.ok) return run.outcome
       return { ok: true, evidence: [{ kind: 'device-action', source: `tap ${step.x},${step.y}` }] }
     }
     case 'text': {
       const encoded = encodeInputText(step.text)
-      const run = await runCommand(context, adb(deps, request.serial, ['shell', 'input', 'text', encoded]))
+      const run = await runCommand(context, adb(deps, request.serial, ['shell', 'input', 'text', encoded]), { effect: true })
       if (!run.ok) return run.outcome
       return { ok: true, evidence: [{ kind: 'device-action', source: `input text (${encoded.length} chars)` }] }
     }
     case 'key': {
-      const run = await runCommand(context, adb(deps, request.serial, ['shell', 'input', 'keyevent', step.key]))
+      const run = await runCommand(context, adb(deps, request.serial, ['shell', 'input', 'keyevent', step.key]), { effect: true })
       if (!run.ok) return run.outcome
       return { ok: true, evidence: [{ kind: 'device-action', source: `keyevent ${step.key}` }] }
     }

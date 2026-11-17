@@ -33,6 +33,8 @@ import { createCallStore, runNode } from './nodes.js'
 import type { BaseExecution, BaseOutcome, CallStore, ExtensionResult, NodeCallRecord, NodeRunResult } from './nodes.js'
 import { OUTPUT_SCHEMA, PARAMETERS_SCHEMA } from './tool-schema.js'
 import { createVersionControlBoundary } from './version-control-runtime.ts'
+import { createDelegatedApprovalBroker } from '../../lib/delegated-approval.ts'
+import type { BrokerAgent, BrokerConsumer } from '../../lib/delegated-approval.ts'
 import type { VersionAgent } from './version-control-runtime.ts'
 
 type RuntimeAgent = NonNullable<ToolExecution['agent']>
@@ -330,6 +332,8 @@ interface DelegationRecord {
   child?: RuntimeAgent
   runId?: string
   removeVersionControl?: () => void
+  /** Parent-approval bridge binding for this exact child; revoked with the record. */
+  removeApprovalBridge?: () => void
 }
 
 /**
@@ -504,6 +508,8 @@ export interface NodeRuntime {
   readonly registeredSkills: ReadonlySet<string>
   /** Effective configuration and currently registered bindings; no execution or model call. */
   describeRoles(): RoleCatalog
+  /** A narrow delegated-approval consumer of this node row (never the issuer). */
+  approvalConsumer(): BrokerConsumer
   checkRoleAndSkill(
     roleName: string,
     skillName?: string,
@@ -626,7 +632,7 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
   function delegationLive(record: DelegationRecord): boolean {
     return record.state === 'active' && !record.callSignal.aborted && record.child !== undefined
       && liveAgent(record.childId) === record.child && childSession(record.child) === record.session
-      && liveAgent(record.parent.id) === record.parent
+      && liveAgent(record.parent.id) === record.parent && record.parent.session === record.parentSession
   }
 
   /**
@@ -638,11 +644,17 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     if (record.state === 'revoked') return
     record.state = 'revoked'
     if (delegations.get(record.childId) === record) delegations.delete(record.childId)
+    try { record.removeApprovalBridge?.() } catch { /* revocation continues */ }
     try { record.removeVersionControl?.() }
     finally { record.gate.resolve() }
   }
   /** Per-call idempotent shutdowns; unload runs them so activations are disposed, not only revoked. */
   const shutdowns = new Set<() => void>()
+  // Parent-approval broker owned by THIS node row: the issuer never leaves this
+  // closure; tool rows only receive consumers. Unload kills every binding.
+  const approvalBroker = createDelegatedApprovalBroker()
+  const approvalIssuer = approvalBroker.issuer
+  ctx.effect(() => () => approvalIssuer.release())
   ctx.effect(() => () => {
     for (const shutdown of [...shutdowns]) shutdown()
     for (const record of [...delegations.values()]) revoke(record)
@@ -840,6 +852,8 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
     explicitVersionControl?: boolean
     /** Trusted satellite_node callId of the parent's open invocation (wrapper closure). */
     parentCallId?: string
+    /** Same trusted callId, used for parent-approval routing of every role child. */
+    approvalCallId?: string
     onStarted?: (execution: BaseExecution) => void
   }): Promise<
     { ok: true; result: SubagentResult | undefined; sandbox: SandboxReport } | { ok: false; error: string }
@@ -1007,6 +1021,18 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
           params.parentCallId, () => delegationLive(record),
         )
       }
+      // A bind failure rejects the start (never swallowed). Without a parent call id the
+      // child stays unbound: its own approval policy (never) keeps rejecting, no root fallback.
+      if (params.approvalCallId !== undefined) {
+        const child = record.child!
+        record.removeApprovalBridge = approvalIssuer.bind({
+          child: child as unknown as BrokerAgent, childSession: record.session,
+          parent: exec.agent as unknown as BrokerAgent, parentSession: record.parentSession,
+          runId: record.runId!, parentCallId: params.approvalCallId, signal: exec.signal,
+          live: () => delegationLive(record),
+          toolOf: (name) => ctx.tools.get?.(name, child),
+        })
+      }
       // …and again after it, then activate synchronously and release the barrier.
       assertReceipt()
       record.state = 'active'
@@ -1081,6 +1107,7 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
           const outcome = await startRole({
             roleName: call.selection!.role,
             ...(nodeId === 'version-control' ? { explicitVersionControl: true, ...(exec.callId !== undefined ? { parentCallId: exec.callId } : {}) } : {}),
+            ...(exec.callId !== undefined ? { approvalCallId: exec.callId } : {}),
             label,
             task: [
               String(args.task ?? ''),
@@ -1130,6 +1157,7 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
               roleName,
               label,
               ...(requestedSkill !== undefined ? { skill: requestedSkill } : {}),
+              ...(exec.callId !== undefined ? { approvalCallId: exec.callId } : {}),
               task: [
                 `原始节点任务：${String(args.task ?? '')}`,
                 `本扩展目标：${task.objective ?? ''}`,
@@ -1208,5 +1236,6 @@ export function createNodeRuntime(options: CreateNodeRuntimeOptions): NodeRuntim
   return {
     tool, nodeIds, registeredSkills, checkRoleAndSkill,
     describeRoles: () => buildRoleCatalog(resolved, slots.snapshot()),
+    approvalConsumer: () => approvalBroker.consumer(),
   }
 }
