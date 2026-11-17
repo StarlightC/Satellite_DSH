@@ -28,6 +28,17 @@ When the change spans several kinds of surface — code, configuration or schema
 skills and public assets, tests — or when it is unclear what a surface has to prove,
 read [the review scopes reference](references/review-scopes.md).
 
+## Minimum sufficient verification budget
+
+A sufficient case names a real production path or reproduction and the unique
+regression it protects; do not ask for combinatorial variants, coverage a higher
+level already holds, or production changes made only for tests. Test count and line
+count are not quality. Check a doubt's reachability and actual impact before asking
+for more checks; report what stays unknown as unknown. After a fix, the affected set
+is enough; one final necessary run replaces a full suite per review. Stop at the
+stated stop condition. Necessary safety checks are not dropped for a ratio, and light
+documentation needs no strongly coupled string test.
+
 ## Role tier responsibilities
 
 The tier changes the depth and scope of the same read-only review method. It does

@@ -61,6 +61,12 @@ any agreed necessary review, forced slots and approval: duplicate execution and 
 outstanding obligation are different things. Check tool/service/route/permission
 availability without side effects before planning an execution that depends on it.
 
+Tests follow the same minimum sufficient verification budget: a new case names the
+real production path or reproduction and the unique regression it protects;
+combinations are not a default reason, higher-level coverage is not copied, and test
+count or line count is not a goal. Do not reshape production code for tests or fakes;
+a light documentation edit needs no strongly coupled string test.
+
 Reuse evidence only with its source, revision or digest, covered scope, exact
 command, relevant environment and untested items recorded, and only while all
 relevant inputs are unchanged. Changed inputs invalidate the affected coverage,
@@ -102,6 +108,22 @@ checks come from the applicable project/domain skill, not a generic high-tier
 Agent. For Android, load `android-change-review` and its linked Android risk
 reference when platform risks affect planning or reassessment; if that skill is
 unavailable, report the missing method instead of inventing an Android specialist.
+
+## Option scoring is not task difficulty
+
+The rubric above classifies the whole task for role and check selection. The
+solution method's option scores (`N/D/C/E`, `T`, `U`) judge a candidate option and
+are not a task-difficulty, risk, or role-tier input. A high option total does not
+raise execution difficulty, and a Critical task can have a cheap, low-total option.
+Do not derive a tier from `T`, and do not treat a recommendation as user approval or
+host approval.
+
+A score, total, or threshold is decision support, not program enforcement. Apply the
+option gates before its total; when a decision is pending, use the existing
+`acceptance.required` pause rather than a new mandatory extension. The lightweight
+one-line path applies only to already authorized pure value/text edits, never to
+technical, permission, or dependency work. See
+[the option scoring reference](../../satellite-solution/references/option-scoring.md).
 
 ## Dispatch through the existing node
 

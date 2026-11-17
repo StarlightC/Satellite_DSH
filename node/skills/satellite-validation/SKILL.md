@@ -20,6 +20,18 @@ change the implementation, test expectations, configuration, or dependencies.
 - If a command would need a device, network, destructive setup, new dependency or
   additional permission not already allowed, return that prerequisite to the parent.
 
+## Minimum sufficient verification budget
+
+A check earns its place by naming the real production path or reproduction it
+exercises and the unique regression it can catch; combining existing paths is not a
+default reason, and coverage a higher-level check already holds is not copied. Do not
+reshape production code for a check or a fake, and do not treat test count or line
+count as a quota. Probe a suspicion's reachability and actual impact before adding
+work; unknown stays unknown. After a fix, run only the affected set and reuse
+unchanged evidence; the final round is one necessary run, not a full suite per
+review. Stop at the stated stop condition. Necessary safety checks stay, and a light
+documentation edit needs no strongly coupled string test.
+
 ## Run and return
 
 Execute the selected checks and retain the command, exit status, actual result and

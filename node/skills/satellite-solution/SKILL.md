@@ -44,17 +44,45 @@ never initialize or refresh an index in this read-only node. Explicit-file cover
 is partial: no matches does not establish that the entire project lacks a reusable
 surface. Do not load the complete index or override files into model context.
 
-## Weigh options
+## Score the options
 
-For each option that is genuinely on the table:
+Before presenting an option, read
+[the option scoring and confidence reference](references/option-scoring.md). Every
+option actually evaluated carries `N`, `D`, `C`, `E` (0–4 with anchored basis, or
+explicit `U`), `T = N + D + C + E`, and a verdict. Apply the hard gates before the
+total: an option that crosses the authorization boundary or changes the goal, `D <=
+1`, `N <= 1`, a key unknown, or `E <= 1` cannot be recommended; `C <= 1` must be
+simplified/split or shown unavoidable and never auto-passes by total; `C = U` is not
+implementable. Recommend only with `N, D, C, E >= 3` and `T >= 12`; a conditional
+candidate (`min(N, D, E) >= 2` and `T >= 9`) is discussion input, not approval.
+`C = 2` can only stay conditional until trimmed and re-scored, so a high total with
+`C = 2` is not a recommendation; `E = 1` goes to investigation. Keep `N <= E + 1`,
+and require exclusivity evidence for `N = 4`.
+
+For each option that is genuinely on the table, also state:
 
 - what it changes, and which consumers or existing tests it touches;
 - what it reuses (existing helpers, conventions, configuration) instead of adding;
 - its cost and how reversible it is;
 - the evidence for the claim — "this should work" is not evidence.
 
+Consider no change, the minimal satisfaction, and a larger change; state an
+infeasible category in one line instead of inventing an option. For each option,
+run the counterexample check: if it were unnecessary or wrong, what would be
+observable, and what did you check or leave unchecked? Do not write "only" or "must"
+before the alternatives are eliminated.
+
 Prefer the smallest change that satisfies the goal. Reject an option you cannot
 judge instead of presenting invented confidence.
+
+A score does not replace the user's decision or host approval, and a recommendation
+or suggestion is not consent. Re-score only on new evidence; a different model or
+role is not evidence.
+
+An already authorized, pure numeric/text/value edit with no technical choice needs
+one line saying so — no fabricated options and no extra solution pass. That
+lightweight path does not cover technical, permission, dependency, script, schema,
+or public-contract changes.
 
 ## Name the decisions
 

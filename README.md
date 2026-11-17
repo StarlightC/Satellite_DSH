@@ -78,6 +78,8 @@ install_bundle <解压后的 package 目录>
 
 **委派子 Agent 的其他审批工具（Android 全部审批动作、`satellite_reuse_maintain`、`satellite_skill_script_run`）同样不让 child 弹窗：** child 仍为 never，执行仍用 child 自己的 fs/沙箱/子进程；每次子调用由受信运行时把一次审批转给 exact live 父会话（标注父 `satellite_node` callId、子 callId 与完整计划），仅 `allowed-once` 放行本次调用，不缓存、不重放，批准后到每次 confine/spawn/写入前复核委派、会话、服务与工具定义。父为 never、无应答者、拒绝或取消时失败关闭并说明原因；不新增任何沙箱权限。device `discover` 也需要审批。委派调用绑定 child 原始 fs/sandbox/subprocess/shell/sandboxPolicy 与其策略快照：任何选定模式不得宽于 child 当前上限，委派路径的 `sandboxPermissions`/升级请求一律失败关闭，未经 confine 的自动 danger 运行在 spawn 处被拒；父策略在每次复核时重新读取（变为 never 或读不到即拒）。旅程/采集在取消或许可失效后仅通过有界清理能力删除本次登记的设备临时文件（精确 serial/路径/`rm -f`），不做 pull 或其他动作。审批 broker 由 node 行在本地创建，发证方不出该闭包；Android 只经可选注入的内部（非 Remote）服务取得消费者，node 卸载即作废，无 node 时 child 保持 never，不回落根会话。**信任域说明：** 同进程的 Host 插件属受信代码，本机制不对恶意进程内插件提供隔离；它保证的是模型与客户端没有可伪造发证/身份的入口。
 
+**implement 节点的一次父请求交回（`satellite_parent_request`）：** 只有 `implement` 基础 child 的真实作用域会注册该工具；其它节点、扩展角色与主会话都看不到、也不能调用它。child 只能把一条封闭的 `plugin_manager` 请求暂存给主 Agent：动作仅限 `list_plugins`、`list_bundles`、`set_plugin`、`set_bundle`、`install_bundle`、`remove_bundle`，参数仅限 `action`/`target`/`enabled`/`registry`/`offset`/`limit`（分页 1–100，offset 非负），版本豁免、`approvedBuilds`、未知字段、错误类型、访问器与非无损 JSON 均失败关闭；每次节点调用（含 resume）最多一条。只有该节点真正完成（base `completed` 且父调用未取消、父仍解析到同一 `plugin_manager` 定义）才发布一张待确认票（`parentAction.status=ready`）：运行时行级 guard 在任何 `tools/execute` wrapper 之前为本行真实 `satellite_node` 记录宿主执行 token、Agent、callId 与原始 signal，只有同一执行的冻结最终 `tools/result` 是成功且规范值未被 wrapper/post-execute 改写时才开放该票，最终失败、取消、阻断或改写都撤销它；未经宿主管线的调用不获得该能力；暂停也只有在该次暂停结果原样交付后才保留到同一 token/调用方/unit 恢复（暂存该请求的原父调用若已取消，恢复也保守作废、不发布），票据自请求起 10 分钟过期且恢复不刷新；失败/取消/错误丢弃，父 dispose/行卸载/工具定义替换撤销，正常 child end 不丢已暂存请求。该能力是可选的：父作用域看不到 `plugin_manager`（未挂载或被过滤）时不注册 child 请求工具、不发票，普通 implement 照常完成，child 任务中会写明本次不可用。主会话协调 guard 仍是默认闭集：只有该 exact 父、未替换的定义、按规范键排序后完全相同的参数、未过期且未消费的票据才放行一次，并在 guard 内原子消费（后续其它 guard 或宿主拒绝不退还）；参数不同则不进入 `plugin_manager` 工具主体（因此也没有主体内审批）、不执行；但宿主的执行前策略审批（pre-execute ask）先于 guard，仍可能先弹出，本插件不改变宿主审批。结果里的 `parentAction` 与票据只是审计数据（tool/args/source node/run/expiry），不是批准、不是权限提升、不可重放；`plugin_manager` 自己的宿主批准仍独立，list 许可不包含 install。child 不能自声明用户已批准，主会话也不能调用该 child 工具或凭 facts/文本/resume token 造票；`run_code`/PTC、脚本、fs、bash、web 等原有 guard 不变。
+
 ### 等待确认与恢复
 
 如需节点完成后等待处理决定，可传入扁平事实键 `acceptance.required`：
@@ -94,6 +96,21 @@ install_bundle <解压后的 package 目录>
 
 该行为由 `builtinExtensions.acceptanceDecision` 控制，默认开启。普通决定不能替代宿主的权限批准。
 
+## 方案评分与决策支持
+
+`solution` 与父会话自己提出的方案都按[方案评分参考](<node/skills/satellite-solution/references/option-scoring.md>)给出最小评分内容：必要性 N、目标方向一致性 D、复杂度适配 C、证据充分性 E（各 0–4，或以显式 U 表示未知），`T = N + D + C + E`。T 是决策支持指数与置信度计算，不是成功概率，也不宣称客观确定或经统计校准；算术可复算，评分判断不可。
+
+先执行硬否决/暂停，再看得分：
+
+- 越权或改变目标、`D <= 1`、`N <= 1` 不能推荐；关键未知或 `E <= 1` 先调查。
+- `C <= 1` 必须简化/拆分，或有证据说明该规模不可避免，且不得靠总分自动放行；`C = U` 不能当作可实施。
+- `N <= E + 1`：技术必要性不能比证据多走一步；`N = 4` 需要排他性依据，用户要求“有方案”不等于某个具体技术方案必要。
+- 推荐需 `N, D, C, E >= 3` 且 `T >= 12`；有条件候选（`min(N, D, E) >= 2` 且 `T >= 9`）只用于待补证据或决定讨论，不等于可执行或已批准；`C = 2` 只能作为候选，裁剪并重评后才可进入推荐；`E = 1` 先调查。
+
+每个实际被评估的选项要给出分数、逐维依据/缺口和判定，并至少考虑不改、最小满足、更大改动（不可行者简述，不硬造选项）；同时写明反例挑战：若不必要会看见什么、已查/未查什么。未排除替代不得写“只能/必须”。父节点必须传用户原目标和授权边界，转述不得抬高证据；建议不能当作同意。只有新证据才重评分，不靠换模型或换档位刷分。
+
+分数门槛不替代用户决定或宿主审批；有待决定时复用现有 `acceptance.required` 暂停并恢复，不新增强制扩展，也不宣称程序强制。已授权、无技术选择的纯数值/文字修改可用一行说明，不虚构比较、不额外跑 solution；该轻量例外不覆盖技术、权限、依赖、脚本、schema 或公开契约改动。这是 Agent 方法，不是运行时评分器；文档契约测试只检查存在、链接与锚点/门槛结构，不验证语义执行。
+
 ## 难度评级与升降级
 
 这里有两个**独立**选择：
@@ -103,7 +120,7 @@ install_bundle <解压后的 package 目录>
 
 两者即使同名也不绑定：Critical 任务不自动选 Senior 或 Critical 角色，独立且安全的单元仍可用 Light；Critical 角色也可以处理一个 Standard 任务里反复失败的顽固问题。档位只改变职责深度，不提升工具、沙箱、父会话权限或其他审批权限。
 
-评级、失败预算与降级理由是技能指导下的判断和报告，不是自动评分器、持久计数器或任务调度服务。主 Agent 应读取基础流程技能链接的[评级与升降级方法](<node/skills/satellite-base-flow/references/difficulty-and-escalation.md>)，再分别选择方案、实施和审查角色。Android 的[平台风险补充](<android/skills/android-change-review/references/task-risk.md>)保留在领域技能中。
+评级、失败预算、方案评分与降级理由是技能指导下的判断和报告，不是自动评分器、持久计数器或任务调度服务；方案评分（N/D/C/E/T）不参与任务难度或角色档位推导。主 Agent 应读取基础流程技能链接的[评级与升降级方法](<node/skills/satellite-base-flow/references/difficulty-and-escalation.md>)，再分别选择方案、实施和审查角色。Android 的[平台风险补充](<android/skills/android-change-review/references/task-risk.md>)保留在领域技能中。
 
 ### 选择节点角色档位
 
