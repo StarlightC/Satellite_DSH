@@ -38,6 +38,19 @@ another intent. It supports local status/diff/log/stage/commit only, with fresh
 host approval for writes and no remote operation. Version text edits still belong
 to `implement`, which does not commit. Missing services are a gap, not completion.
 
+### Implement handback to the parent
+
+An `implement` result may carry `parentAction` with `status: published`. Only then
+may the parent execute that one action: call exactly the given `tool` with exactly
+the given `arguments`, once. Run `list_plugins`/`list_bundles` first; a list
+handback never authorizes an install, a change, or wider parameters. Do not widen,
+reorder-away, add, or reuse arguments, do not call `satellite_parent_request`
+yourself, and do not manufacture facts, decisions, text, or resume tokens to obtain
+a ticket. The ticket and its audit fields are data, not approval or a bearer token;
+the host approval for that tool still runs independently and may refuse. A
+`suspended`, `expired`, or `dropped` handback publishes nothing. Every other tool
+keeps the normal closed-set coordinator restriction.
+
 The order is not fixed for every task. Read
 [the task intents and diagnostics reference](references/task-intents.md) when you
 need the node order for a specific intent (feature, bug-fix, refactor,
@@ -80,8 +93,41 @@ retry engine.
    verified, what is not, and where the limit comes from.
 6. Environment or permission blocks are reported as blocks; they are not
    solved by asking a more expensive model.
+7. Keep a minimum sufficient verification budget. A new test or check names the
+   real production path or reproduction it exercises and the unique regression it
+   protects; combining existing paths is not a default reason, and coverage a
+   higher-level check already holds is not copied. Do not reshape production code
+   for tests or fakes, and do not treat test count or line count as a quota. Check a
+   doubt's reachability and actual impact before adding cases; unknown stays unknown.
+   After a fix, run the affected set and reuse unchanged evidence; the final round is
+   one necessary run, not a full suite per review. Stop at the stated stop condition.
+   Necessary safety boundaries stay, and a light documentation edit needs no strongly
+   coupled string test.
+
+## Proposing and relaying options
+
+The parent's own proposals follow
+[the option scoring reference](../satellite-solution/references/option-scoring.md),
+not only proposals from a `solution` child: for each actually evaluated option,
+score `N/D/C/E`, `T` and `U`, state the basis, gap and verdict, and apply the hard
+gates before the total. Pass the user's original goal and authorization boundary to
+the child; do not upgrade them.
+
+Relaying does not add evidence. Keep a conditional candidate conditional, a
+suggestion a suggestion, and a recommendation a recommendation; a suggestion or a
+plan is not the user's consent. A score or threshold is not a user decision or host
+approval. Re-score only on new evidence, not by switching model, role, or wording.
+When a decision is pending, stop with the existing `acceptance.required` fact and
+resume with its token; do not add a new mandatory extension or claim program
+enforcement.
+
+An already authorized, pure numeric/text/value edit with no technical choice may use
+one line and skip an extra `solution` pass; that lightweight exception does not
+cover technical, permission, dependency, script, schema, or public-contract changes.
 
 ## Reading results
 
 Hand back short decisions with exact locations. Read long content at its real
-source instead of restating it; do not invent a report format.
+source instead of restating it. There is no fixed report format, but a proposal or a
+relayed option still carries the minimum option-scoring content; do not pad a simple
+answer into a long template.

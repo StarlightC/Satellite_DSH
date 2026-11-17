@@ -215,7 +215,7 @@ test('real coordinator/node creation boundary: provisional child is fully denied
   let child, started = 0
   const stages = []
   Object.assign(f.ctx.get('subagents'), {
-    list: () => ['spawn'], getProvider: () => ({ prepareContinuable() {}, capabilities: { agentOptions: true, agentPreset: false, depthLimit: true, outputSchema: true } }),
+    getProvider: () => ({ prepareContinuable() {}, capabilities: { agentOptions: true, agentPreset: false, depthLimit: true, outputSchema: true } }),
     resolveMaxDepth: value => value,
     async startActivation(spec) {
       started++
@@ -254,7 +254,7 @@ test('real coordinator/node creation boundary: provisional child is fully denied
       }
     },
   })
-  const adapter = { get: name => f.ctx.get(name), tools: f.ctx.tools, satelliteSlots: f.ctx.get('satelliteSlots'), effect: fn => f.ctx.effect(fn), on: (name, fn) => { listeners[name].push(fn); return () => {} } }
+  const adapter = { get: name => f.ctx.get(name), tools: f.ctx.tools, satelliteSlots: f.ctx.get('satelliteSlots'), effect: fn => f.ctx.effect(fn), on: (name, fn) => { if (name.startsWith('tools/')) return f.ctx.on(name, fn); listeners[name].push(fn); return () => {} } }
   const runtime = createNodeRuntime({ ctx: adapter, defineTool, config: { roles: { 'version-control': { agentOptions: DEFAULT_CONFIG.roles['version-control'].agentOptions } } }, resourceDir: resourceDirFrom(new URL('../lib/node/index.js', import.meta.url).href, 'node') })
   for (const phase of ['before', 'after']) registry.register({
     id: `test.version-${phase}`, slot: `version-control.${phase}`, slotVersion: 1,

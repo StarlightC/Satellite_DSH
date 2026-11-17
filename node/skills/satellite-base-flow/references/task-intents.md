@@ -13,6 +13,10 @@ Agreed necessary review, mandatory slots and approval cannot be skipped; avoidin
 repeat execution is not removing an obligation. An executor completes its assigned
 node and stops; it never re-orders this flow or calls a node on its own.
 
+A proposal — from a `solution` node or from the parent itself — carries the minimum
+[option scoring](../../satellite-solution/references/option-scoring.md) content. A
+suggestion is not consent, and a conditional candidate is not approval.
+
 ## The ten intents
 
 | Intent | Node order | Required inputs / evidence | Explicit stop |
@@ -30,8 +34,9 @@ node and stops; it never re-orders this flow or calls a node on its own.
 
 Per-intent notes:
 
-- **feature** — the plan states the decision needed before implementation; a missing
-  decision stops the flow instead of being answered by code.
+- **feature** — the plan scores each actually evaluated option and states the
+  decision needed before implementation; a missing decision stops the flow instead
+  of being answered by code.
 - **bug-fix** — "it should be broken here" is not evidence. Without a failure
   observation or a reachable path, the task stays in investigation.
 - **refactor** — verification compares behaviour before and after; a passing build
@@ -44,8 +49,8 @@ Per-intent notes:
   and hands decisions on rather than repairing them.
 - **current-change-analysis** — reads what exists now, including uncommitted work;
   it does not stage or commit anything to make the change easier to read.
-- **review-and-plan** — ends at a reviewable plan. The user decides whether it is
-  implemented.
+- **review-and-plan** — ends at a scored, reviewable plan. The user decides whether
+  it is implemented; a suggestion in the plan is not approval.
 - **commit / version-control** — an optional local node, not a default tail of any
   intent. Only an explicit user request selects it; method text does not make an
   unavailable node callable. Exact scope and fresh host approval are required for

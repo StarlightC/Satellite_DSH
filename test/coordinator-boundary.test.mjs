@@ -3,8 +3,16 @@ import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import { registerCoordinatorBoundary } from '../lib/node/lib/wiring.js'
+import { createParentGrantBroker, PARENT_REQUEST_TOOL } from '../lib/node/lib/parent-grant.js'
 import { apply as applyNode, inject } from '../lib/node/index.js'
 import { executeTool } from './tool-call-helper.mjs'
+
+/** Private test issuer: stands in for the runtime confirmation of the final tools/result. */
+function openTicket(broker, ...args) {
+  const audit = broker.publish(...args)
+  if (audit?.ticket) broker.confirm(audit.ticket)
+  return audit
+}
 
 const WORK = ['read', 'write', 'bash', 'subagent', 'subagent_fork', 'workflow', 'send_message',
   // Pre-alpha.3 schedule names are not coordination tools.
@@ -12,7 +20,7 @@ const WORK = ['read', 'write', 'bash', 'subagent', 'subagent_fork', 'workflow', 
 const COORDINATION = ['satellite_node', 'skill', 'ask_user_question', 'todo_write', 'list_agents', 'interrupt_agent',
   'schedule_create', 'schedule_list', 'schedule_view', 'schedule_edit']
 
-async function fixture({ register = [...WORK, ...COORDINATION] } = {}) {
+async function fixture({ register = [...WORK, ...COORDINATION], bodies = {} } = {}) {
   const ctx = new Context()
   const sections = []
   const roots = []
@@ -38,6 +46,7 @@ async function fixture({ register = [...WORK, ...COORDINATION] } = {}) {
   ctx.provide('subagents', {
     // Target-source flat activation contract (only probed by the node row's host gate here).
     startActivation: async () => { throw new Error('not used by this fixture') },
+    getProvider: () => undefined,
     rootOf(caller) {
       if (live.get(caller.id) !== caller) throw new Error('UNAUTHORIZED')
       if (unowned.has(caller)) throw new Error('agent has no active runtime owner')
@@ -52,6 +61,7 @@ async function fixture({ register = [...WORK, ...COORDINATION] } = {}) {
     output: { schema: { type: 'string' }, render: (_, value) => [{ type: 'text', text: value }] },
     execute(args, exec) {
       executions.push({ name, agent: exec.agent })
+      if (bodies[name]) return bodies[name](args, exec)
       return name
     },
   }))
@@ -61,14 +71,17 @@ async function fixture({ register = [...WORK, ...COORDINATION] } = {}) {
     live.set(id, value)
     return value
   }
-  const call = (name, target) => executeTool(ctx, {
-    name, arguments: {}, callId: `call-${++calls}`,
+  const call = (name, target, args = {}) => executeTool(ctx, {
+    name, arguments: args, callId: `call-${++calls}`,
     signal: new AbortController().signal,
     ...(target ? { agent: target } : {}),
   })
-  const mount = () => ctx.plugin({ inject: ['tools', 'agents', 'systemPrompt'], apply: registerCoordinatorBoundary })
+  const mount = (options) => ctx.plugin({
+    inject: ['tools', 'agents', 'systemPrompt'],
+    apply: (ctx) => registerCoordinatorBoundary(ctx, options),
+  })
   const promptFor = scope => sections.map(section => section.text({ scope })).filter(Boolean).join('\n')
-  return { ctx, agent, call, mount, promptFor, roots, executions, live, unowned, owners }
+  return { ctx, agent, call, mount, promptFor, roots, executions, live, unowned, owners, bodies }
 }
 
 test('a live root coordinates but cannot run work tools itself', async () => {
@@ -167,7 +180,7 @@ test('unknown tree identity is denied for work tools, never treated as a member'
     const stale = { id: 'root' } // same id, not the exact live object
     for (const target of [orphan, stale, { id: 'never-registered' }]) {
       // Identity is decided before the coordination allow-list: no name bypasses unknown.
-      for (const name of ['read', 'satellite_node', 'skill', 'list_agents']) {
+      for (const name of ['read', 'satellite_node', 'skill', 'list_agents', 'plugin_manager']) {
         const result = await f.call(name, target)
         assert.equal(result.isError, true, name)
         assert.match(result.error.message, /无法确认/)
@@ -210,5 +223,91 @@ test('real PTC executor: coordinator run_code gets the native-only diagnostic an
     const member = await batch(child, 'run_code', { code: '1' })
     assert.doesNotMatch(member.isError ? member.error.message : '', /PTC 工具执行器/)
     assert.deepEqual(f.executions, [])
+  } finally { await f.ctx.fiber.dispose() }
+})
+
+test('root guard: one published ticket gates exactly the handed-back call; everything else stays closed', async () => {
+  let asks = 0
+  const f = await fixture({ register: [...WORK, ...COORDINATION, 'plugin_manager'] })
+  try {
+    const parent = f.agent('root')
+    const parentSession = { id: 'root-session' }
+    parent.session = parentSession
+    f.roots.push(parent)
+
+    // Exact implement base child scope: its own tool registry, no model input involved.
+    const childDefs = new Map()
+    const child = { id: 'implement-child', session: { id: 'child-session' }, ctx: {} }
+    child.ctx.get = (name) => (name === 'tools' ? {
+      guard: () => () => {},
+      register(definition) { childDefs.set(definition.name, definition); return () => childDefs.delete(definition.name) },
+      get(name) { return childDefs.get(name) },
+    } : undefined)
+    const realTools = f.ctx.tools
+    const broker = createParentGrantBroker({
+      defineTool,
+      root: {
+        get(name) {
+          if (name === 'tools') return { get: (toolName, scope) => (scope === child ? childDefs.get(toolName) : realTools.get(toolName, scope)) }
+          if (name === 'agents') return { get: (id) => f.live.get(id) }
+          return undefined
+        },
+      },
+    })
+    const controller = new AbortController()
+    const bind = (callToken) => broker.issuer.bind({
+      child, parent, parentSession, nodeId: 'implement', runId: 'run-1', callToken,
+      parentCallId: 'node-call-1', signal: controller.signal, live: () => true,
+    })
+    const stageAndPublish = async (callToken) => {
+      const tool = childDefs.get(PARENT_REQUEST_TOOL)
+      const staged = await tool.execute(
+        { reason: '列出 bundle', arguments: { action: 'list_bundles', limit: 10 } },
+        { agent: child, callId: 'child-call-1', signal: controller.signal },
+      )
+      assert.equal(staged.status, 'proposed')
+      assert.equal(openTicket(broker, callToken, controller.signal).status, 'ready')
+    }
+    await f.mount({ parentGrants: broker.guard })
+    assert.match(f.promptFor(parent), /parentAction/, 'the main prompt names the handback when available')
+
+    // No ticket yet: plugin_manager stays denied by the closed set, body never runs.
+    const before = await f.call('plugin_manager', parent, { action: 'list_bundles', limit: 10 })
+    assert.equal(before.isError, true)
+    assert.deepEqual(f.executions, [])
+
+    let unbind = bind('token-1')
+    await stageAndPublish('token-1')
+    // A variant is denied before the body; it does not spend the exact ticket.
+    const variant = await f.call('plugin_manager', parent, { action: 'list_bundles' })
+    assert.equal(variant.isError, true)
+    assert.equal(f.executions.filter((entry) => entry.name === 'plugin_manager').length, 0)
+    // The exact call reaches the body exactly once; the second is denied as consumed.
+    const exact = await f.call('plugin_manager', parent, { limit: 10, action: 'list_bundles' })
+    assert.equal(exact.isError, false)
+    assert.deepEqual(f.executions.map((entry) => entry.name), ['plugin_manager'])
+    const replay = await f.call('plugin_manager', parent, { action: 'list_bundles', limit: 10 })
+    assert.equal(replay.isError, true)
+    assert.match(replay.error.message, /已使用/)
+    assert.equal(f.executions.filter((entry) => entry.name === 'plugin_manager').length, 1)
+    unbind()
+
+    // A host/body rejection after the broker claimed the ticket still consumes it.
+    f.bodies.plugin_manager = async () => {
+      // Stand-in for plugin_manager's own approval escalation inside its body.
+      asks += 1
+      throw new Error('host approval rejected')
+    }
+    unbind = bind('token-2')
+    await stageAndPublish('token-2')
+    const rejected = await f.call('plugin_manager', parent, { action: 'list_bundles', limit: 10 })
+    assert.equal(rejected.isError, true)
+    assert.match(rejected.error.message, /host approval rejected/)
+    assert.equal(asks, 1, 'the body was reached exactly once')
+    const after = await f.call('plugin_manager', parent, { action: 'list_bundles', limit: 10 })
+    assert.equal(after.isError, true)
+    assert.match(after.error.message, /已使用/)
+    assert.equal(asks, 1, 'a consumed ticket is not refunded after the host/body rejection')
+    unbind()
   } finally { await f.ctx.fiber.dispose() }
 })

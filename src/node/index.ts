@@ -73,7 +73,11 @@ export function apply(ctx: Context, config: unknown): void {
     // 资源（locale/icon/skills）不参与构建，构建后入口在 lib/node/，资源仍在包根的 node/。
     resourceDir: resourceDirFrom(import.meta.url, 'node'),
   })
-  registerCoordinatorBoundary(ctx as unknown as CoordinatorContext)
+  registerCoordinatorBoundary(
+    ctx as unknown as CoordinatorContext,
+    // Same row instance: the guard gets only a claim view, never the issuer.
+    { parentGrants: runtime.parentGrants },
+  )
   // A read-only native Remote service, owned by this node row's lifecycle.
   // Ordinary roles/nodes remain deployment configuration, not editable volatile settings.
   ctx.plugin(SatelliteRoles, { describe: () => runtime.describeRoles() })

@@ -57,6 +57,31 @@ keeps the same permission posture and parent-imposed limits.
 If the change turns out to need a wider goal, a new permission, or a decision that
 was never approved, stop and hand back the decision instead of taking it.
 
+## Minimum sufficient verification budget
+
+A new test names the real production path or reproduction it covers and the unique
+regression it prevents; combining existing paths is not a default reason, and
+coverage a higher-level test already holds is not copied. Do not change production
+structure to suit tests or fakes, and do not chase a test count or line-count ratio.
+After a fix, run only the affected set and reuse unchanged evidence; the last round
+is the necessary check, not a full suite. Unknown doubts stay reported as unknown.
+Keep necessary safety boundaries, and do not add strongly coupled string tests for
+light documentation.
+
+## Handing one request back to the parent
+
+An `implement` base child may also have `satellite_parent_request` (when the task says it is unavailable, only report the pending action in your result). Use it only for a
+real, already-agreed pending tool action and pass the exact `plugin_manager`
+arguments you would otherwise call; list first, and never treat a list handback as
+permission to install or change. It supports only `list_plugins`, `list_bundles`,
+`set_plugin`, `set_bundle`, `install_bundle`, and `remove_bundle` with
+`action`/`target`/`enabled`/`registry`/`offset`/`limit`; version-exemption fields,
+build approvals, unknown fields and widened parameters are rejected. The request is
+staged, not executed: it is delivered only if this node completes. It is not an
+approval, not a permission grant, and cannot be used for other tools, scripts or
+commands; never claim user approval for it. If the task needs anything outside this
+closed request, stop and hand the decision back instead.
+
 ## Reuse index maintenance
 
 After a successful implementation, if an index already exists and this unit changed

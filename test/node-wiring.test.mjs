@@ -27,10 +27,18 @@ const PROBE_TOOLS = ['satellite_node', 'edit', 'write', 'bash', 'read', 'skill']
  * pre-step barrier and scope effects exactly where the runtime installs them.
  */
 function makeChild(id, session) {
-  const child = { id, session, guards: [], sections: [], preSteps: [], effects: [] }
+  const child = { id, session, guards: [], sections: [], preSteps: [], effects: [], tools: new Map() }
+  const tools = {
+    guard(fn) { child.guards.push(fn); return () => {} },
+    register(definition) {
+      child.tools.set(definition.name, definition)
+      return () => { if (child.tools.get(definition.name) === definition) child.tools.delete(definition.name) }
+    },
+    get(name) { return child.tools.get(name) },
+  }
   child.ctx = {
     get(name) {
-      if (name === 'tools') return { guard(fn) { child.guards.push(fn); return () => {} } }
+      if (name === 'tools') return tools
       if (name === 'systemPrompt') return { section(section) { child.sections.push(section); return () => {} } }
       return undefined
     },
@@ -100,16 +108,28 @@ function setup({
   workspace = '/fake/project',
   // F1 回归：允许测试替换 skills.snapshot 的实现。
   skillsSnapshot,
+  // 子 Agent 进入 active 后、本次运行结果返回前执行：用于真实地调用 child 作用域工具。
+  childRun,
   defineToolImpl = fakeDefineTool,
+  // Root `tools.guard` + `tools/result` hooks (host pipeline stand-in); false = an old host shape.
+  withHostGuard = true,
+  // A real cordis Context with ToolRuntime: root tools/guards/events go through the real pipeline.
+  realHost,
 } = {}) {
   const catalog = createNodeCatalog()
   const registry = createSlotRegistry(catalog)
-  const calls = { activations: [], tools: [], skills: [], nodes: [], sessions: [], sandboxEvents: [] }
+  const calls = {
+    activations: [], tools: [], skills: [], nodes: [], sessions: [], sandboxEvents: [],
+    children: [],
+    // 父作用域可见的 plugin_manager 稳定定义（测试替身，绝不执行真实安装/审批）。
+    pluginManager: fakeDefineTool({ name: 'plugin_manager', description: 'fixture plugin_manager', parameters: {} }),
+  }
   const disposers = []
   const skillNames = new Set()
   const sessionListeners = []
   const agentListeners = [...earlierAgentListeners]
-  const runListeners = { 'subagent/start': [], 'subagent/end': [] }
+  const runListeners = { 'subagent/start': [], 'subagent/end': [], 'tools/result': [] }
+  const hostGuards = []
   let sessionSequence = 0
 
   // 模拟官方 fold：最后一条 sandbox/mode 事件就是该会话的覆盖；没有事件时是部署默认。
@@ -179,7 +199,6 @@ function setup({
       }
       if (name === 'subagents' && withSubagents) {
         return {
-          list: () => ['spawn'],
           getProvider: () => ({
             ...(external ? {} : { prepareContinuable: async () => ({}) }),
             capabilities: { agentOptions: true, persona: true, toolFilter: true, depthLimit: true, outputSchema: true },
@@ -197,6 +216,7 @@ function setup({
               child = makeChild(spec.childId, session)
               entry.child = child
               LIVE.set(child.id, child)
+              calls.children.push(child)
               for (const listener of agentListeners) await listener({ agent: child, source: { kind: 'new' } })
               if (emitRunStart) for (const listener of runListeners['subagent/start']) {
                 listener({ runId: `run-${spec.childId}`, provider: spec.provider, parentSessionId: spec.parent.id, id: spec.childId, local: true })
@@ -216,6 +236,7 @@ function setup({
                     entry.denied = PROBE_TOOLS.filter((name) => child.guards.some((guard) => guard({ name, agent: child }) !== undefined))
                     entry.reasons = Object.fromEntries(probeTools.map((name) => [name, child.guards.map((guard) => guard({ name, agent: child })).find(Boolean)]))
                     entry.persona = child.sections.map((section) => section.text({ scope: child })).filter(Boolean).join('\n') || undefined
+                    if (childRun) await childRun({ child, entry, spec })
                   }
                   if (resultError) throw resultError
                   if (hangResult) { calls.hanging = true; await new Promise(() => {}) }
@@ -244,6 +265,17 @@ function setup({
         calls.tools.push(definition)
         return () => {}
       },
+      guard: !withHostGuard ? undefined : (fn) => {
+        hostGuards.push(fn)
+        return () => { const index = hostGuards.indexOf(fn); if (index >= 0) hostGuards.splice(index, 1) }
+      },
+      get(name, scope) {
+        // Scoped registration (child agent scope) is visible only to that scope.
+        if (scope && typeof scope === 'object' && scope.tools instanceof Map) return scope.tools.get(name)
+        if (name === 'satellite_node') return calls.tools.find((tool) => tool.name === name)
+        if (name === 'plugin_manager') return calls.pluginManager
+        return undefined
+      },
     },
     effect(fn) {
       const disposer = fn()
@@ -251,8 +283,19 @@ function setup({
       return disposer
     },
   }
+  if (realHost) {
+    ctx.tools = {
+      register: (definition) => { calls.tools.push(definition); return realHost.tools.register(definition) },
+      guard: (fn) => realHost.tools.guard(fn),
+      // Fake child scopes keep their own map; every other lookup is the real registry.
+      get: (name, scope) => (scope && typeof scope === 'object' && scope.tools instanceof Map
+        ? scope.tools.get(name)
+        : realHost.tools.get(name, scope)),
+    }
+  }
   if (withSandbox) {
     ctx.on = (name, listener) => {
+      if (realHost && name.startsWith('tools/')) return realHost.on(name, listener)
       const listeners = name === 'session/created' ? sessionListeners : runListeners[name] ?? agentListeners
       listeners.push(listener)
       return () => {
@@ -268,7 +311,29 @@ function setup({
   // 晚于本插件注册的监听器：用来验证"我们之后还有写入者"时仍然失败关闭。
   for (const listener of afterListeners) sessionListeners.push(listener)
   for (const listener of laterAgentListeners) agentListeners.push(listener)
-  return { ctx, calls, registry, runtime, disposers, skillNames, fireSession, runListeners }
+  /**
+   * Host-pipeline stand-in for the fake ctx: guards see the pre-wrapper execution with
+   * an executor token, the body runs, then `tools/result` gets the frozen final
+   * outcome. `finalize` may replace the final result (wrapper/post-execute change).
+   */
+  async function hostCall(args, exec, { finalize } = {}) {
+    const full = { name: 'satellite_node', arguments: args, callId: 'call-1', ...exec, token: Symbol('tool-execution') }
+    for (const guard of hostGuards) {
+      const reason = guard(full)
+      if (reason !== undefined) throw new Error(reason)
+    }
+    let result
+    try {
+      const value = await runtime.tool.options.execute(args, full)
+      result = { isError: false, value: JSON.parse(JSON.stringify(value)), content: [] }
+    } catch (error) {
+      result = { isError: true, error: { message: String(error) }, content: [] }
+    }
+    if (finalize) result = await finalize(result)
+    for (const listener of [...runListeners['tools/result']]) listener(Object.freeze(full), result)
+    return result.isError ? result : result.value
+  }
+  return { ctx, calls, registry, runtime, disposers, skillNames, fireSession, runListeners, hostCall }
 }
 
 /** F1 回归用台架：记录 skills.snapshot 收到的 view options，并允许改返回。 */
@@ -350,7 +415,7 @@ test('装配：声明节点、注册工具，且只注册本包自带的技能',
 })
 
 test('缺guard只阻塞显式version-control，不影响旧节点；扩展不能取得保留角色身份', async () => {
-  const { runtime, calls, registry } = setup()
+  const { runtime, calls, registry } = setup({ withHostGuard: false })
   assert.equal(calls.activations.length, 0)
   const blocked = await runtime.tool.options.execute({ node: 'version-control', task: '明确请求status' }, fakeExec())
   assert.match(blocked.result, /guard/)
@@ -375,6 +440,37 @@ test('没有技能表或子 Agent 服务时报告阻塞而不是抛错', () => {
   const second = noSubagents.runtime.checkRoleAndSkill('validation', 'satellite-base-flow')
   assert.equal(second.ready, false)
   assert.match(second.reason, /子 Agent 服务/)
+})
+
+test('readiness 只查 getProvider：宿主没有 subagents.list 也能就绪', () => {
+  const { ctx, runtime } = setup()
+  // 真实 DSH 0.2.2-alpha.3 `SubagentRuntime` 没有 list()；这里直接以缺少 list 的宿主形状验证。
+  assert.equal(typeof ctx.get('subagents').list, 'undefined')
+  assert.deepEqual(runtime.checkRoleAndSkill('validation', 'satellite-base-flow'), { ready: true })
+})
+
+test('readiness 用单次 getProvider 保留后端未注册与能力缺失诊断', () => {
+  const unregistered = setup()
+  const originalGet = unregistered.ctx.get.bind(unregistered.ctx)
+  unregistered.ctx.get = (name) => {
+    const value = originalGet(name)
+    return name === 'subagents' ? { ...value, getProvider: () => undefined } : value
+  }
+  const missing = unregistered.runtime.checkRoleAndSkill('validation', 'satellite-base-flow')
+  assert.equal(missing.ready, false)
+  assert.match(missing.reason, /子 Agent 后端未注册：spawn/)
+  assert.deepEqual(missing.missing, ['spawn'])
+
+  const noCapabilities = setup()
+  const get = noCapabilities.ctx.get.bind(noCapabilities.ctx)
+  noCapabilities.ctx.get = (name) => {
+    const value = get(name)
+    return name === 'subagents' ? { ...value, getProvider: () => ({}) } : value
+  }
+  const unsupported = noCapabilities.runtime.checkRoleAndSkill('validation', 'satellite-base-flow')
+  assert.equal(unsupported.ready, false)
+  assert.match(unsupported.reason, /无法读取后端能力：spawn/)
+  assert.deepEqual(unsupported.missing, ['spawn'])
 })
 
 test('before/base/after 全链路：领域扩展先跑，再跑基础节点', async () => {
@@ -1932,15 +2028,313 @@ test('host contract gate: npm 0.2.2-alpha.3 shape (no rootOf) refuses the node r
   const registered = []
   const host = (subagents) => ({
     get: (name) => (name === 'subagents' ? subagents : undefined),
-    tools: { guard: () => () => {}, register: (tool) => { registered.push(tool); return () => {} } },
+    tools: { guard: () => () => {}, register: (tool) => { registered.push(tool); return () => {} }, get: () => undefined },
     on: () => () => {},
     effect: () => {}, plugin: () => {},
   })
   // Same version label, different API: request-wrapped startActivation, no rootOf.
   const npmShape = host({ startActivation: async () => ({}) })
-  assert.deepEqual(missingHostContracts(npmShape), ['subagents.rootOf'])
+  assert.deepEqual(missingHostContracts(npmShape), ['subagents.rootOf', 'subagents.getProvider'])
   assert.throws(() => apply(npmShape, {}), /缺少必要接口：subagents\.rootOf[\s\S]*不要求特定源码提交/)
   assert.equal(registered.length, 0, 'nothing registered on a refused host')
-  assert.deepEqual(missingHostContracts(host({ startActivation() {}, rootOf() {} })), [])
-  assert.deepEqual(missingHostContracts({ get: () => undefined }), ['subagents.rootOf', 'subagents.startActivation', 'tools.guard', 'ctx.on(agent/created)'])
+  // Flat activation without a provider lookup must be refused too: readiness has no list() fallback.
+  const noProvider = host({ startActivation() {}, rootOf() {} })
+  assert.deepEqual(missingHostContracts(noProvider), ['subagents.getProvider'])
+  assert.throws(() => apply(noProvider, {}), /缺少必要接口：subagents\.getProvider/)
+  assert.equal(registered.length, 0, 'nothing registered without getProvider')
+  assert.deepEqual(missingHostContracts(host({ startActivation() {}, rootOf() {}, getProvider() {} })), [])
+  assert.deepEqual(missingHostContracts({ get: () => undefined }), ['subagents.rootOf', 'subagents.startActivation', 'subagents.getProvider', 'tools.guard', 'tools.get', 'ctx.on(agent/created)'])
+})
+
+test('只有 implement 基础 child 获得父请求能力：其它节点与扩展角色都没有', async () => {
+  const seen = {}
+  const h = setup({ childRun: async ({ child, entry }) => { seen[entry.label] = child.tools.has('satellite_parent_request') } })
+  // 扩展角色在 before 阶段运行：同一节点、同一宿主，但扩展 child 不得获得父请求工具。
+  h.registry.register({
+    id: 'test.implement-before', slot: 'implement.before', slotVersion: 1,
+    match: () => MATCH_YES, ready: () => READY,
+    run: async (execution) => { await execution.runConfiguredRole('implementation', { objective: '扩展子任务' }); return { status: 'completed' } },
+  })
+  const parentExec = { ...fakeExec('root-session'), callId: 'call-1' }
+  const value = await h.hostCall({ node: 'implement', task: '实施' }, parentExec)
+  assert.equal(value.kind, 'completed')
+  assert.equal(seen['test.implement-before:implementation'], false, '扩展 role child 没有父请求工具')
+  assert.equal(seen['satellite_node:implement'], true, 'base child 有父请求工具')
+
+  // A non-implement node base child never receives the tool, even with a trusted callId.
+  const other = setup({ childRun: async ({ child }) => { seen.contextHasTool = child.tools.has('satellite_parent_request') } })
+  const contextExec = { ...fakeExec('root-session-2'), callId: 'call-2' }
+  const contextValue = await other.hostCall({ node: 'context', task: '调查' }, contextExec)
+  assert.equal(contextValue.kind, 'completed')
+  assert.equal(seen.contextHasTool, false)
+  assert.equal(contextValue.parentAction, undefined)
+})
+
+test('failed base 不发布父请求', async () => {
+  const h = setup({
+    resultError: new Error('child failed'),
+    childRun: async ({ child }) => {
+      const tool = child.tools.get('satellite_parent_request')
+      if (tool) await tool.options.execute(
+        { reason: 'r', arguments: { action: 'list_plugins' } },
+        { agent: child, callId: 'child-call-1', signal: new AbortController().signal },
+      )
+    },
+  })
+  const parentExec = { ...fakeExec('root-session'), callId: 'call-1' }
+  const value = await h.hostCall({ node: 'implement', task: '实施' }, parentExec)
+  assert.equal(value.kind, 'failed')
+  assert.equal(value.parentAction, undefined, '失败不发布')
+  assert.equal(h.runtime.parentGrants.claim({
+    name: 'plugin_manager', agent: parentExec.agent, arguments: { action: 'list_plugins' }, callId: 'x',
+  }).kind, 'none')
+})
+
+const stageListPlugins = async ({ child }) => {
+  const tool = child.tools.get('satellite_parent_request')
+  if (!tool) return undefined
+  return tool.options.execute(
+    { reason: 'r', arguments: { action: 'list_plugins' } },
+    { agent: child, callId: 'child-call-1', signal: new AbortController().signal },
+  )
+}
+
+test('父作用域缺少或过滤 plugin_manager：普通 implement 照常完成，不注册请求工具、不发票，并如实提示不可用', async () => {
+  for (const variant of ['missing', 'filtered']) {
+    const seen = {}
+    const h = setup({ childRun: async ({ child }) => { seen.hasTool = child.tools.has('satellite_parent_request') } })
+    const parentExec = { ...fakeExec(`root-${variant}`), callId: 'call-1' }
+    if (variant === 'missing') h.calls.pluginManager = undefined
+    else {
+      // Filtered for this exact parent only: the definition exists but is not visible to it.
+      const get = h.ctx.tools.get
+      h.ctx.tools.get = (name, scope) => (scope === parentExec.agent && name === 'plugin_manager' ? undefined : get(name, scope))
+    }
+    const value = await h.hostCall({ node: 'implement', task: '实施' }, parentExec)
+    assert.equal(value.kind, 'completed', `${variant}: 普通 implement 不因可选能力缺失而失败`)
+    assert.equal(seen.hasTool, false, `${variant}: 不注册 child 请求工具`)
+    assert.equal(value.parentAction, undefined)
+    assert.match(JSON.stringify(h.calls.activations[0]), /satellite_parent_request）本次不可用/)
+    assert.equal(h.runtime.parentGrants.claim({
+      name: 'plugin_manager', agent: parentExec.agent, arguments: { action: 'list_plugins' },
+    }).kind, 'none', `${variant}: 无法发票`)
+  }
+})
+
+test('suspend 后原调用 signal 被取消，再用同 token 恢复：保守作废，不复活', async () => {
+  const h = setup({ childRun: stageListPlugins })
+  const agent = fakeExec('root-session').agent
+  const original = new AbortController()
+  const first = await h.hostCall(
+    { node: 'implement', task: '实施', unit: 'u1', facts: { 'acceptance.required': true } },
+    { agent, signal: original.signal, callId: 'call-1' },
+  )
+  assert.equal(first.kind, 'suspended')
+  original.abort()
+  const resumed = await h.hostCall(
+    { node: 'implement', task: '实施', unit: 'u1', resume: first.token, decision: 'accept' },
+    { agent, signal: new AbortController().signal, callId: 'call-2' },
+  )
+  assert.equal(resumed.kind, 'completed')
+  assert.equal(resumed.parentAction?.status, 'dropped')
+  assert.match(resumed.parentAction?.note ?? '', /原父调用已取消|暂存该请求的父调用已取消/)
+  assert.equal(h.runtime.parentGrants.claim({
+    name: 'plugin_manager', agent, arguments: { action: 'list_plugins' },
+  }).kind, 'none')
+})
+
+test('scoped 注册与角色 allow/deny 联合：自定义过滤照常生效，不强行开启父请求', async () => {
+  for (const toolFilter of [{ allow: ['read'] }, { deny: ['satellite_parent_request'] }]) {
+    const seen = {}
+    const h = setup({
+      config: { roles: { implementation: { toolFilter } } },
+      childRun: async ({ child }) => {
+        seen.registered = child.tools.has('satellite_parent_request')
+        seen.reason = child.guards.map((guard) => guard({ name: 'satellite_parent_request', agent: child })).find(Boolean)
+      },
+    })
+    const parentExec = { ...fakeExec('root-filter'), callId: 'call-1' }
+    const value = await h.hostCall({ node: 'implement', task: '实施' }, parentExec)
+    assert.equal(value.kind, 'completed')
+    assert.equal(seen.registered, true, '只在 exact child 作用域注册')
+    assert.equal(h.calls.tools.some((tool) => tool.name === 'satellite_parent_request'), false, 'root 不可见')
+    assert.match(seen.reason ?? '', /角色不允许使用工具 satellite_parent_request/, JSON.stringify(toolFilter))
+    assert.equal(value.parentAction, undefined)
+  }
+})
+
+/* ------------------------------------------------------------------------
+ * Real ToolRuntime/pipeline: the parent ticket follows the frozen final
+ * `tools/result` of the exact satellite_node execution, not the body return.
+ * ---------------------------------------------------------------------- */
+
+const stageReal = async ({ child }) => {
+  const tool = child.tools.get('satellite_parent_request')
+  if (!tool) return undefined
+  return (tool.options ?? tool).execute(
+    { reason: 'r', arguments: { action: 'list_plugins' } },
+    { agent: child, callId: 'child-call-1', signal: new AbortController().signal },
+  )
+}
+
+async function realWorld({ configure, childRun = stageReal } = {}) {
+  const { Context } = await import('@deepseek-ai/cordis')
+  const { default: ToolRuntime } = await import('@deepseek-ai/dsh-tools')
+  const { ToolExecutionPipeline } = await import('@deepseek-ai/dsh-tools/pipeline')
+  const host = new Context()
+  host.provide('systemPrompt', { tools: () => () => {}, getSectionOrder: () => 800, section: () => () => {} })
+  await host.plugin(ToolRuntime)
+  const pmBodies = []
+  host.tools.register(defineTool({
+    name: 'plugin_manager',
+    description: 'fixture plugin_manager (never installs anything)',
+    parameters: { action: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    async execute(args) { pmBodies.push(args); return 'ok' },
+  }))
+  const h = setup({ realHost: host, defineToolImpl: defineTool, childRun })
+  // Same shape as the coordinator boundary: plugin_manager passes only on an allowed claim.
+  host.tools.guard((exec) => {
+    if (exec.name !== 'plugin_manager') return undefined
+    const claim = h.runtime.parentGrants.claim({ name: exec.name, agent: exec.agent, arguments: exec.arguments, callId: exec.callId })
+    return claim.kind === 'allow' ? undefined : (claim.reason ?? 'closed set')
+  })
+  configure?.(host)
+  const pipeline = new ToolExecutionPipeline(host)
+  const parent = fakeExec(`root-real-${Math.random()}`).agent
+  let sequence = 0
+  const run = async (name, args, signal = new AbortController().signal) => {
+    sequence += 1
+    const prepared = await pipeline.prepare({ name, callId: `${name}-${sequence}`, arguments: args, agent: parent, signal })
+    if (prepared.kind !== 'dispatch') return pipeline.complete(prepared.exec, prepared)
+    return pipeline.complete(prepared.exec, await pipeline.dispatch(prepared.exec))
+  }
+  const claimState = () => h.runtime.parentGrants.claim({ name: 'plugin_manager', agent: parent, arguments: { action: 'list_bundles' } }).kind
+  const pm = () => run('plugin_manager', { action: 'list_plugins' })
+  return { host, h, run, pm, pmBodies, parent, claimState }
+}
+
+const IMPLEMENT = { node: 'implement', task: '实施' }
+const gate = () => { let open; const promise = new Promise((resolve) => { open = resolve }); return { promise, open } }
+
+test('真实管线：正常完成的 implement 结果交付后才开票，主 Agent 精确调用一次', async () => {
+  const w = await realWorld()
+  const result = await w.run('satellite_node', IMPLEMENT)
+  assert.equal(result.isError, false)
+  assert.equal(result.value.kind, 'completed')
+  assert.equal(result.value.parentAction.status, 'ready')
+  assert.equal((await w.pm()).isError, false)
+  assert.equal(w.pmBodies.length, 1)
+  assert.equal((await w.pm()).isError, true, '一次性')
+  assert.equal(w.pmBodies.length, 1)
+  // Ordinary node: no capability, no ticket, unchanged completion.
+  const context = await w.run('satellite_node', { node: 'context', task: '调查' })
+  assert.equal(context.value.kind, 'completed')
+  assert.equal(context.value.parentAction, undefined)
+})
+
+test('真实管线：wrapper 换 signal，body 返回后 post-execute 期间原调用取消 => 最终失败且无票', async () => {
+  const post = gate(); const entered = gate()
+  const caller = new AbortController()
+  const w = await realWorld({
+    configure(host) {
+      host.on('tools/execute', async (exec, next) => {
+        if (exec.name !== 'satellite_node') return next()
+        const original = exec.signal
+        exec.signal = new AbortController().signal
+        try { return await next() } finally { exec.signal = original }
+      })
+      host.on('tools/post-execute', async (exec, _result, next) => {
+        if (exec.name === 'satellite_node') { entered.open(); await post.promise }
+        return next()
+      })
+    },
+  })
+  const pending = w.run('satellite_node', IMPLEMENT, caller.signal)
+  await entered.promise
+  assert.equal(w.claimState(), 'deny', '待最终结果期间票据不可用')
+  caller.abort()
+  post.open()
+  const result = await pending
+  assert.equal(result.isError, true)
+  assert.equal((await w.pm()).isError, true)
+  assert.equal(w.pmBodies.length, 0)
+})
+
+test('真实管线：post-execute 等待期间并发父 claim 被拒且不消费，成功交付后只允许一次', async () => {
+  const post = gate(); const entered = gate()
+  const w = await realWorld({
+    configure(host) {
+      host.on('tools/post-execute', async (exec, _result, next) => {
+        if (exec.name === 'satellite_node') { entered.open(); await post.promise }
+        return next()
+      })
+    },
+  })
+  const pending = w.run('satellite_node', IMPLEMENT)
+  await entered.promise
+  const early = await w.pm()
+  assert.equal(early.isError, true)
+  assert.match(JSON.stringify(early), /尚未随节点最终结果确认交付/)
+  assert.equal(w.pmBodies.length, 0)
+  post.open()
+  assert.equal((await pending).isError, false)
+  assert.equal((await w.pm()).isError, false)
+  assert.equal((await w.pm()).isError, true)
+  assert.equal(w.pmBodies.length, 1)
+})
+
+test('真实管线：suspended 最终结果失败后，resume 不能复活请求；正常 suspended 交付后 resume 才开票', async () => {
+  let blockNext = true
+  let leakedToken
+  const w = await realWorld({
+    configure(host) {
+      host.on('tools/post-execute', async (exec, result, next) => {
+        if (exec.name === 'satellite_node' && blockNext) {
+          blockNext = false
+          // Worst case: the token still leaks to the caller although the final result failed.
+          leakedToken = result.value?.token
+          return { kind: 'block', feedback: [{ type: 'text', text: 'blocked suspension' }] }
+        }
+        return next()
+      })
+    },
+  })
+  const args = { ...IMPLEMENT, unit: 'u1', facts: { 'acceptance.required': true } }
+  const blocked = await w.run('satellite_node', args)
+  assert.equal(blocked.isError, true)
+  assert.ok(leakedToken, 'the body did suspend with a resumable token')
+  const revived = await w.run('satellite_node', { ...IMPLEMENT, unit: 'u1', resume: leakedToken, decision: 'accept' })
+  assert.equal(revived.isError, false)
+  assert.equal(revived.value.kind, 'completed')
+  assert.notEqual(revived.value.parentAction?.status, 'ready', '失败的暂停不能被恢复复活')
+  assert.equal((await w.pm()).isError, true)
+  assert.equal(w.pmBodies.length, 0)
+
+  // Positive path: a delivered suspension keeps the proposal; only the resume opens it.
+  const first = await w.run('satellite_node', { ...args, unit: 'u2' })
+  assert.equal(first.isError, false)
+  assert.equal(first.value.kind, 'suspended')
+  assert.equal(first.value.parentAction, undefined)
+  assert.equal(w.claimState(), 'none', '暂停不开票')
+  const resumed = await w.run('satellite_node', { ...IMPLEMENT, unit: 'u2', resume: first.value.token, decision: 'accept' })
+  assert.equal(resumed.value.kind, 'completed')
+  assert.equal(resumed.value.parentAction.status, 'ready')
+  assert.equal((await w.pm()).isError, false)
+  assert.equal(w.pmBodies.length, 1)
+})
+
+test('真实管线：post-execute 改写最终结果 => 不开票', async () => {
+  const w = await realWorld({
+    configure(host) {
+      host.on('tools/post-execute', async (exec, result, next) => {
+        if (exec.name !== 'satellite_node' || result.isError) return next()
+        return { kind: 'accept', value: { ...result.value, result: 'rewritten' } }
+      })
+    },
+  })
+  const result = await w.run('satellite_node', IMPLEMENT)
+  assert.equal(result.isError, false, '改写仍是成功结果')
+  assert.equal((await w.pm()).isError, true)
+  assert.equal(w.pmBodies.length, 0)
 })

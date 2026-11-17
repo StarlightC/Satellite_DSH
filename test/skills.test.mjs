@@ -198,3 +198,62 @@ test('按需参考与 SKILL.md 相对链接双向一致', () => {
     }
   }
 })
+
+// 方案评分参考是文档契约：只检查维度锚点、阈值、强制链接与父流程约束存在，
+// 不验证 Agent 是否按评分做决定（语义行为由 test/tier-scenarios.md 人工验收）。
+test('方案评分参考保留完整维度锚点与初始门槛（文档契约，非语义保证）', () => {
+  const solution = loadSkill(NODE_DIR, 'satellite-solution')
+  const referencePath = `${solution.resourceBase.path}/references/option-scoring.md`
+  assert.ok(existsSync(referencePath), '缺少 option-scoring.md')
+  const content = readFileSync(referencePath, 'utf8')
+  const skillContent = readFileSync(solution.path, 'utf8')
+
+  // 强制引用：加载器只按 SKILL.md 的相对链接发现按需参考。
+  assert.match(skillContent, /references\/option-scoring\.md/)
+
+  // 四个维度各一节，且每节完整给出 0–4 五个锚点。
+  const dimensions = ['N', 'D', 'C', 'E']
+  for (const [index, dimension] of dimensions.entries()) {
+    const start = content.indexOf(`### ${dimension} —`)
+    assert.ok(start >= 0, `${dimension} 缺少维度小节`)
+    const next = dimensions[index + 1]
+    const end = next
+      ? content.indexOf(`### ${next} —`, start + 1)
+      : content.indexOf('\n## ', start + 1)
+    assert.ok(end > start, `${dimension} 小节边界不完整`)
+    const section = content.slice(start, end)
+    for (let score = 0; score <= 4; score += 1) {
+      assert.match(section, new RegExp(`^\\| ${score} \\|`, 'm'), `${dimension} 缺少 ${score} 分锚点`)
+    }
+  }
+
+  // 算术、显式未知和初始政策门槛。
+  assert.match(content, /T = N \+ D \+ C \+ E/)
+  assert.match(content, /`U` contributes `0`/)
+  assert.match(content, /N >= 3, D >= 3, C >= 3, E >= 3, and T >= 12/)
+  assert.match(content, /`min\(N, D, E\) >= 2` and `T >= 9`/)
+  assert.match(content, /`C = 2` never satisfies this gate/)
+  assert.doesNotMatch(content, /at least two of/)
+  assert.match(content, /N <= E \+ 1/)
+  assert.match(content, /C = U/)
+  assert.match(content, /gates\/pauses \*\*before\*\* the total/i)
+
+  // SKILL 摘要与参考使用同一公式，避免两处门槛再次漂移。
+  assert.match(skillContent, /N, D, C, E >= 3/)
+  assert.match(skillContent, /`min\(N, D, E\) >= 2` and `T >= 9`/)
+  assert.match(skillContent, /`C = 2`/)
+
+  // 父流程与 solution 不同：主会话自己的提案和转述也受同一参考约束。
+  const base = loadSkill(NODE_DIR, 'satellite-base-flow')
+  const baseContent = readFileSync(base.path, 'utf8')
+  assert.match(baseContent, /satellite-solution\/references\/option-scoring\.md/)
+  assert.match(baseContent, /own proposals/i)
+  assert.match(baseContent, /not the user's consent/i)
+
+  // README 的公开说明不指向死链，且门槛公式与参考一致。
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+  assert.match(readme, /satellite-solution\/references\/option-scoring\.md/)
+  assert.match(readme, /N, D, C, E >= 3/)
+  assert.match(readme, /`min\(N, D, E\) >= 2` 且 `T >= 9`/)
+  assert.match(readme, /`C = 2` 只能作为候选/)
+})

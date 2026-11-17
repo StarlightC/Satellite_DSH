@@ -185,6 +185,11 @@ export interface RunNodeParams {
   readonly selectRole?: (previous?: NodeRoleSelection) => NodeRoleSelection
   readonly runBase: (call: NodeCallRecord) => Promise<BaseOutcome>
   readonly runExtension: (extension: SlotExtension, context: unknown) => Promise<ExtensionOutcome>
+  /**
+   * Observation only: reports the call record (including resume) so the runtime can
+   * key per-call state by the stable call token. Never authorizes anything.
+   */
+  readonly onBegin?: (record: NodeCallRecord) => void
   readonly cleanup?: () => Promise<void>
 }
 
@@ -341,6 +346,7 @@ export async function runNode(params: RunNodeParams): Promise<NodeRunResult> {
   const begin = store.begin({ nodeId, caller, unit, resumeToken })
   if (begin.error || !begin.record) return { kind: 'blocked', reason: begin.error ?? 'node call rejected' }
   const record = begin.record
+  params.onBegin?.(record)
   record.definitions ??= slots.snapshot().filter((entry) => entry.slot === `${nodeId}.before` || entry.slot === `${nodeId}.after`)
   const evidence = () => ({
     ...(record.baseFinished ? { base: record.baseResult } : {}),

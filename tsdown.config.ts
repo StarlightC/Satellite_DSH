@@ -55,6 +55,7 @@ export default defineConfig([
   entry('satellite/node/lib/reuse-tools', 'lib/node/lib', 'src/node/lib/reuse-tools.ts', 'reuse-tools.js'),
   // Internal kernel test entry; the restricted runtime bridge is wired only by node.
   entry('satellite/node/lib/version-control-runtime', 'lib/node/lib', 'src/node/lib/version-control-runtime.ts', 'version-control-runtime.js'),
+  entry('satellite/node/lib/parent-grant', 'lib/node/lib', 'src/node/lib/parent-grant.ts', 'parent-grant.js'),
   entry('satellite/node/lib/version-control', 'lib/node/lib', 'src/node/lib/version-control.ts', 'version-control.js'),
   entry('satellite/node/lib/tool-schema', 'lib/node/lib', 'src/node/lib/tool-schema.ts', 'tool-schema.js'),
   entry('satellite/node/lib/wiring', 'lib/node/lib', 'src/node/lib/wiring.ts', 'wiring.js'),

@@ -167,8 +167,10 @@ test('policy is resolved again at write time rather than reusing initial permiss
 
 /** Target-source host contracts the node row checks before registering anything. */
 function hostContracts(f) {
-  f.services.subagents = { rootOf: () => undefined, startActivation: async () => ({}) }
+  f.services.subagents = { rootOf: () => undefined, startActivation: async () => ({}), getProvider: () => undefined }
   f.ctx.tools.guard = () => () => {}
+  // The parent-request broker resolves the exact plugin_manager definition via tools.get.
+  f.ctx.tools.get = () => undefined
   f.ctx.on = () => () => {}
 }
 
