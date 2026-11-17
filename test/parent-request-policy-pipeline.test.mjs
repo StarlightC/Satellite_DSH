@@ -1,7 +1,7 @@
 // Real ToolRuntime/pipeline evidence for the parent-request root guard:
 // - a host pre-execute policy `ask` runs BEFORE guards, so a wrong-argument call may
 //   already have been approved by the host; the broker guard still keeps it out of the
-//   `plugin_manager` body (the plugin does not change host approval);
+//   target tool body (the plugin does not change host approval);
 // - concurrent identical calls against one ticket: at most one reaches the body.
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -16,7 +16,9 @@ function openTicket(broker, ...args) {
   return audit
 }
 
-import { createParentGrantBroker, PARENT_REQUEST_TOOL, PARENT_TARGET_TOOL } from '../lib/node/lib/parent-grant.js'
+import { createParentGrantBroker, PARENT_REQUEST_TOOL } from '../lib/node/lib/parent-grant.js'
+
+const PARENT_TARGET_TOOL = 'plugin_manager'
 
 async function world() {
   const ctx = new Context()
@@ -48,7 +50,11 @@ async function world() {
   }
   const definition = ctx.tools.get(PARENT_TARGET_TOOL, parent)
   assert.ok(definition, 'the parent resolves the real registered plugin_manager definition')
-  const rootTools = { get: (name, scope) => (scope === child ? childDefs.get(name) : ctx.tools.get(name, scope)) }
+  // The real registry decides get/executable; the fake child sees the global view.
+  const rootTools = {
+    get: (name, scope) => (scope === child ? childDefs.get(name) ?? ctx.tools.get(name) : ctx.tools.get(name, scope)),
+    executable: (name, scope) => ctx.tools.executable(name, scope),
+  }
   const broker = createParentGrantBroker({
     defineTool,
     root: { get: (name) => name === 'tools' ? rootTools : name === 'agents' ? { get: (id) => (id === parent.id ? parent : undefined) } : undefined },
@@ -61,10 +67,10 @@ async function world() {
   const signal = new AbortController().signal
   broker.issuer.bind({
     child, parent, parentSession, nodeId: 'implement', runId: 'run-1', callToken: 't1',
-    parentCallId: 'p1', signal, live: () => true,
+    parentCallId: 'p1', signal, live: () => true, childMode: 'workspace-write', parentMode: () => 'workspace-write',
   })
   const staged = await childDefs.get(PARENT_REQUEST_TOOL).execute(
-    { reason: 'list first', arguments: { action: 'list_bundles', limit: 10 } },
+    { tool: PARENT_TARGET_TOOL, reason: 'list first', arguments: { action: 'list_bundles', limit: 10 } },
     { agent: child, callId: 'c1', signal },
   )
   assert.equal(staged.status, 'proposed')
@@ -88,7 +94,7 @@ test('real pipeline: policy ask may approve first, but wrong arguments never ent
   assert.notEqual(wrong.kind, 'ran')
   const text = JSON.stringify(wrong.result)
   assert.match(text, /未执行工具主体/)
-  assert.match(text, /未进入 plugin_manager 主体内的审批/)
+  assert.match(text, /未进入目标工具主体内的审批/)
   assert.equal(w.bodies.length, 0, 'the body never ran for wrong arguments')
 
   // The ticket was not consumed by the mismatch: the exact call still runs once.

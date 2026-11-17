@@ -122,7 +122,10 @@ function setup({
     activations: [], tools: [], skills: [], nodes: [], sessions: [], sandboxEvents: [],
     children: [],
     // 父作用域可见的 plugin_manager 稳定定义（测试替身，绝不执行真实安装/审批）。
-    pluginManager: fakeDefineTool({ name: 'plugin_manager', description: 'fixture plugin_manager', parameters: {} }),
+    pluginManager: {
+      ...fakeDefineTool({ name: 'plugin_manager', description: 'fixture plugin_manager', parameters: {} }),
+      parameters: { type: 'object', properties: { action: { type: 'string' } }, required: ['action'] },
+    },
   }
   const disposers = []
   const skillNames = new Set()
@@ -270,12 +273,16 @@ function setup({
         return () => { const index = hostGuards.indexOf(fn); if (index >= 0) hostGuards.splice(index, 1) }
       },
       get(name, scope) {
-        // Scoped registration (child agent scope) is visible only to that scope.
-        if (scope && typeof scope === 'object' && scope.tools instanceof Map) return scope.tools.get(name)
+        // Scoped registration (child agent scope) is visible only to that scope; the
+        // global plugin_manager stays visible to every scope.
+        if (scope && typeof scope === 'object' && scope.tools instanceof Map) {
+          return scope.tools.get(name) ?? (name === 'plugin_manager' ? calls.pluginManager : undefined)
+        }
         if (name === 'satellite_node') return calls.tools.find((tool) => tool.name === name)
         if (name === 'plugin_manager') return calls.pluginManager
         return undefined
       },
+      executable(name, scope) { return ctx.tools.get(name, scope) },
     },
     effect(fn) {
       const disposer = fn()
@@ -289,8 +296,9 @@ function setup({
       guard: (fn) => realHost.tools.guard(fn),
       // Fake child scopes keep their own map; every other lookup is the real registry.
       get: (name, scope) => (scope && typeof scope === 'object' && scope.tools instanceof Map
-        ? scope.tools.get(name)
+        ? scope.tools.get(name) ?? realHost.tools.get(name)
         : realHost.tools.get(name, scope)),
+      executable: (name, scope) => realHost.tools.executable(name, scope),
     }
   }
   if (withSandbox) {
@@ -2046,7 +2054,7 @@ test('host contract gate: npm 0.2.2-alpha.3 shape (no rootOf) refuses the node r
   assert.deepEqual(missingHostContracts({ get: () => undefined }), ['subagents.rootOf', 'subagents.startActivation', 'subagents.getProvider', 'tools.guard', 'tools.get', 'ctx.on(agent/created)'])
 })
 
-test('只有 implement 基础 child 获得父请求能力：其它节点与扩展角色都没有', async () => {
+test('只有非只读的基础 child 获得父请求能力：只读节点与扩展角色都没有', async () => {
   const seen = {}
   const h = setup({ childRun: async ({ child, entry }) => { seen[entry.label] = child.tools.has('satellite_parent_request') } })
   // 扩展角色在 before 阶段运行：同一节点、同一宿主，但扩展 child 不得获得父请求工具。
@@ -2061,13 +2069,25 @@ test('只有 implement 基础 child 获得父请求能力：其它节点与扩�
   assert.equal(seen['test.implement-before:implementation'], false, '扩展 role child 没有父请求工具')
   assert.equal(seen['satellite_node:implement'], true, 'base child 有父请求工具')
 
-  // A non-implement node base child never receives the tool, even with a trusted callId.
+  // A read-only base role (context) never receives the tool, even with a trusted callId.
   const other = setup({ childRun: async ({ child }) => { seen.contextHasTool = child.tools.has('satellite_parent_request') } })
   const contextExec = { ...fakeExec('root-session-2'), callId: 'call-2' }
   const contextValue = await other.hostCall({ node: 'context', task: '调查' }, contextExec)
   assert.equal(contextValue.kind, 'completed')
   assert.equal(seen.contextHasTool, false)
   assert.equal(contextValue.parentAction, undefined)
+  assert.match(JSON.stringify(other.calls.activations[0]), /来源角色为只读/)
+
+  // A workspace-write validate base child may request; a wider parent disables it.
+  const validate = setup({ childRun: async ({ child }) => { seen.validateHasTool = child.tools.has('satellite_parent_request') } })
+  await validate.hostCall({ node: 'validate', task: '验证' }, { ...fakeExec('root-session-3'), callId: 'call-3' })
+  assert.equal(seen.validateHasTool, true)
+  const wider = setup({ childRun: async ({ child }) => { seen.widerHasTool = child.tools.has('satellite_parent_request') } })
+  const widerExec = { ...fakeExec('root-session-4', 'danger-full-access'), callId: 'call-4' }
+  const widerValue = await wider.hostCall({ node: 'implement', task: '实施' }, widerExec)
+  assert.equal(widerValue.kind, 'completed', '父更宽时普通节点照常完成')
+  assert.equal(seen.widerHasTool, false)
+  assert.match(JSON.stringify(wider.calls.activations[0]), /更宽/)
 })
 
 test('failed base 不发布父请求', async () => {
@@ -2076,7 +2096,7 @@ test('failed base 不发布父请求', async () => {
     childRun: async ({ child }) => {
       const tool = child.tools.get('satellite_parent_request')
       if (tool) await tool.options.execute(
-        { reason: 'r', arguments: { action: 'list_plugins' } },
+        { tool: 'plugin_manager', reason: 'r', arguments: { action: 'list_plugins' } },
         { agent: child, callId: 'child-call-1', signal: new AbortController().signal },
       )
     },
@@ -2094,15 +2114,15 @@ const stageListPlugins = async ({ child }) => {
   const tool = child.tools.get('satellite_parent_request')
   if (!tool) return undefined
   return tool.options.execute(
-    { reason: 'r', arguments: { action: 'list_plugins' } },
+    { tool: 'plugin_manager', reason: 'r', arguments: { action: 'list_plugins' } },
     { agent: child, callId: 'child-call-1', signal: new AbortController().signal },
   )
 }
 
-test('父作用域缺少或过滤 plugin_manager：普通 implement 照常完成，不注册请求工具、不发票，并如实提示不可用', async () => {
+test('父作用域缺少或过滤目标工具：普通 implement 照常完成，请求被拒、不发票', async () => {
   for (const variant of ['missing', 'filtered']) {
     const seen = {}
-    const h = setup({ childRun: async ({ child }) => { seen.hasTool = child.tools.has('satellite_parent_request') } })
+    const h = setup({ childRun: async (input) => { seen.staged = await stageListPlugins(input) } })
     const parentExec = { ...fakeExec(`root-${variant}`), callId: 'call-1' }
     if (variant === 'missing') h.calls.pluginManager = undefined
     else {
@@ -2112,9 +2132,9 @@ test('父作用域缺少或过滤 plugin_manager：普通 implement 照常完成
     }
     const value = await h.hostCall({ node: 'implement', task: '实施' }, parentExec)
     assert.equal(value.kind, 'completed', `${variant}: 普通 implement 不因可选能力缺失而失败`)
-    assert.equal(seen.hasTool, false, `${variant}: 不注册 child 请求工具`)
+    assert.equal(seen.staged?.status, 'rejected', `${variant}: 请求被拒`)
+    assert.match(seen.staged?.note ?? '', /父作用域没有可直接执行的 plugin_manager/)
     assert.equal(value.parentAction, undefined)
-    assert.match(JSON.stringify(h.calls.activations[0]), /satellite_parent_request）本次不可用/)
     assert.equal(h.runtime.parentGrants.claim({
       name: 'plugin_manager', agent: parentExec.agent, arguments: { action: 'list_plugins' },
     }).kind, 'none', `${variant}: 无法发票`)
@@ -2172,7 +2192,7 @@ const stageReal = async ({ child }) => {
   const tool = child.tools.get('satellite_parent_request')
   if (!tool) return undefined
   return (tool.options ?? tool).execute(
-    { reason: 'r', arguments: { action: 'list_plugins' } },
+    { tool: 'plugin_manager', reason: 'r', arguments: { action: 'list_plugins' } },
     { agent: child, callId: 'child-call-1', signal: new AbortController().signal },
   )
 }

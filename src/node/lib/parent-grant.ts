@@ -1,10 +1,12 @@
 /**
  * Parent-request broker (internal; not a Remote method).
  *
- * An `implement` base child may ask the main Agent to execute exactly ONE
- * `plugin_manager` call on its behalf. The child cannot execute it, cannot mint an
- * identity, and cannot declare user approval: it can only stage a closed,
- * canonically serialized request inside the private delegation record.
+ * A non-read-only base child may ask the main Agent to execute exactly ONE call of
+ * an existing parent tool on its behalf. The child cannot execute it, cannot mint an
+ * identity, and cannot declare user approval: it can only stage one canonically
+ * serialized `{tool, arguments}` request inside the private delegation record. The
+ * generic layer keeps no per-tool business rules: the target tool's own schema,
+ * description, role allow/deny and host approval still apply unchanged.
  *
  * Trust model:
  * - The broker is created once per node row (never a module singleton); the issuer
@@ -15,8 +17,8 @@
  *   `satellite_node` call. No model-supplied value can create or address a binding.
  * - A proposal is published as a *pending* ticket only when the node runtime reports
  *   the node fully completed (base `completed`, parent signal not aborted) and the
- *   parent still resolves the same `plugin_manager` definition it resolved at request
- *   time. A pending ticket is never claimable: the runtime opens it only after the
+ *   parent still resolves (`get` and `executable`) the same target definition it
+ *   resolved at request time. A pending ticket is never claimable: the runtime opens it only after the
  *   host's frozen final `tools/result` for that exact `satellite_node` execution is a
  *   success whose canonical value still carries this exact ticket (`confirm`); any
  *   other final outcome revokes exactly that ticket (`revoke`).
@@ -25,7 +27,7 @@
  *   later resume never publishes it.
  * - The root guard claims a ticket atomically for the exact parent object and the
  *   exact canonical arguments; a mismatch is denied before the tool body runs (so no
- *   approval inside the `plugin_manager` body), although a host pre-execute policy ask
+ *   approval inside the target tool body), although a host pre-execute policy ask
  *   may already have happened, and it never partially authorizes anything. A consumed ticket is not refunded when
  *   a later guard or the host denies the call.
  * - Tickets expire 10 minutes after the request and are revoked by parent dispose,
@@ -35,27 +37,28 @@
  *   A model token is never a
  *   bearer credential; the audit value is plain data.
  *
- * This module grants no sandbox or approval breadth: `plugin_manager` still runs in
- * the parent's own scope and still asks the host for its own approval.
+ * This module grants no sandbox or approval breadth: the target tool still runs in
+ * the parent's own scope, only when the parent is not wider than the source child,
+ * and still asks the host for its own approval. A ticket is never user consent.
  */
-import type { defineTool } from '@deepseek-ai/dsh-tools'
+import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import type { defineTool, JsonSchemaNode } from '@deepseek-ai/dsh-tools'
+import {
+  COORDINATION_TOOLS, isSandboxMode, roleToolDenial, sandboxModeRank,
+} from './config.ts'
+import type { RoleConfig, SandboxMode } from './config.ts'
 
 export const PARENT_REQUEST_TOOL = 'satellite_parent_request'
-export const PARENT_TARGET_TOOL = 'plugin_manager'
 /** Fixed from request time; a resume never refreshes it. */
 export const PARENT_REQUEST_TTL_MS = 10 * 60 * 1000
 
 const MAX_REASON_CHARS = 4_000
-const MAX_IDENTIFIER_CHARS = 1_024
-const MAX_OFFSET = 1_000_000
-
-/** Actions this feature may hand back. Version-exemption actions stay unavailable. */
-const SUPPORTED_ACTIONS = Object.freeze([
-  'list_plugins', 'list_bundles', 'set_plugin', 'set_bundle', 'install_bundle', 'remove_bundle',
-] as const)
-const SUPPORTED_ACTION_SET: ReadonlySet<string> = new Set(SUPPORTED_ACTIONS)
-const REQUEST_KEYS = new Set(['reason', 'arguments'])
-const ARGUMENT_KEYS = new Set(['action', 'target', 'enabled', 'registry', 'offset', 'limit'])
+/** Upper bound of the canonical arguments text. */
+const MAX_ARGUMENT_CHARS = 64_000
+const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,128}$/
+/** Reserved PTC transport name; never a hand-back target. */
+const RUN_CODE = 'run_code'
+const REQUEST_KEYS = new Set(['tool', 'arguments', 'reason'])
 
 type ToolsScope = {
   register?(tool: unknown): () => void
@@ -67,6 +70,7 @@ type ToolsScope = {
     readonly callId?: string
   }) => string | undefined): () => void
   get?(name: string, scope?: unknown): unknown
+  executable?(name: string, scope?: unknown): unknown
 }
 interface ScopeLike { get(name: string): unknown; effect?(fn: () => void | (() => void)): unknown }
 export interface ParentScopeAgent {
@@ -85,8 +89,14 @@ export interface ParentRequestSpec {
   readonly child: ParentScopeAgent
   readonly parent: ParentScopeAgent
   readonly parentSession: unknown
-  /** Only the `implement` base node may bind this capability. */
+  /** Base node whose child stages the request (audit only). */
   readonly nodeId: string
+  /** Source role tool filter snapshot; still applies to the requested target. */
+  readonly toolFilter?: RoleConfig['toolFilter']
+  /** Source child's applied sandbox mode snapshot (never read from a disposed child). */
+  readonly childMode: SandboxMode
+  /** Live parent sandbox mode (the parent's own policy), re-read at every step. */
+  readonly parentMode: () => unknown
   readonly unit?: string
   /** Native subagent run id of the base child. */
   readonly runId: string
@@ -132,11 +142,11 @@ export interface ParentGrantBroker {
   readonly available: boolean
   readonly issuer: {
     /**
-     * Optional-capability probe for the exact parent. A reason means the request tool
-     * must not be bound (the parent's `plugin_manager` is absent or filtered, or the
-     * host lacks the scoped registry); the node itself still runs normally.
+     * Optional-capability probe. A reason means the request tool must not be bound
+     * (the host lacks the scoped registry, or the parent is wider than the child /
+     * the child is read-only); the node itself still runs normally.
      */
-    unavailableReason(parent: ParentScopeAgent): string | undefined
+    unavailableReason(childMode?: unknown, parentMode?: unknown): string | undefined
     bind(spec: ParentRequestSpec): () => void
   }
   readonly guard: ParentGrantsGuard
@@ -165,7 +175,6 @@ export interface ParentGrantOptions {
 
 interface Member {
   readonly spec: ParentRequestSpec
-  readonly definition: unknown
   active: boolean
   readonly releases: Array<() => void>
 }
@@ -180,11 +189,15 @@ interface Proposal {
   readonly parentCallId: string
   readonly requestedAt: number
   readonly expiresAt: number
+  readonly tool: string
   readonly definition: unknown
+  readonly toolFilter?: RoleConfig['toolFilter']
+  readonly childMode: SandboxMode
+  readonly parentMode: () => unknown
   readonly arguments: ParentArguments
   readonly canonicalArguments: string
-  /** Child-authored task context; plain data shown to the parent, never approval. */
-  readonly reason: string
+  /** Optional child-authored context; plain data shown to the parent, never approval. */
+  readonly reason?: string
   /** Signal of the node call that staged it; aborting it voids the proposal for good. */
   readonly requestSignal: AbortSignal
   readonly execution?: object
@@ -193,7 +206,11 @@ interface Grant {
   readonly ticket: string
   readonly parent: ParentScopeAgent
   readonly parentSession: unknown
+  readonly tool: string
   readonly definition: unknown
+  readonly toolFilter?: RoleConfig['toolFilter']
+  readonly childMode: SandboxMode
+  readonly parentMode: () => unknown
   readonly arguments: ParentArguments
   readonly canonicalArguments: string
   readonly source: ParentActionSource
@@ -282,102 +299,84 @@ function freezeJson<T>(value: T): T {
   return Object.freeze(value)
 }
 
-/** Closed scalar map: exactly the supported `plugin_manager` argument values. */
-export type ParentArguments = Readonly<Record<string, string | number | boolean>>
+/** Lossless JSON object of the target tool's complete arguments (deep-frozen copy). */
+type ParentJson = null | boolean | number | string | ParentJson[] | { [key: string]: ParentJson }
+export type ParentArguments = { [key: string]: ParentJson }
 
 export interface ParentRequest {
-  readonly reason: string
+  readonly tool: string
+  readonly reason?: string
   readonly arguments: ParentArguments
   readonly canonicalArguments: string
 }
 
-/** Strict closed validation of the child request; independent of host schema lint. */
+/**
+ * Tools that are never a hand-back target: the request tool itself, the PTC
+ * transport, the coordinator closed set (already callable, never via a ticket) and
+ * uncontrolled orchestration entries. Reuses the existing structural sets only.
+ */
+export function excludedTargetReason(tool: string): string | undefined {
+  if (tool === PARENT_REQUEST_TOOL || tool === RUN_CODE || COORDINATION_TOOLS.has(tool)) {
+    return `${tool} 不能作为父请求目标（请求自身、run_code 与协调/编排入口不经票据）`
+  }
+  return roleToolDenial(undefined, tool)
+}
+
+/**
+ * Generic request shape only: a legal tool name and a plain lossless JSON object.
+ * No per-tool field rules; the target's own schema is checked against the parent's
+ * real definition at request time.
+ */
 export function parseParentRequest(value: unknown): ParentRequest {
   const request = assertPlainRecord(value, '父请求')
   for (const key of Object.keys(request)) {
     if (!REQUEST_KEYS.has(key)) throw new Error(`父请求含不支持字段：${key}`)
   }
+  const tool = request.tool
+  if (typeof tool !== 'string' || !TOOL_NAME.test(tool)) throw new Error('父请求 tool 必须是合法工具名')
+  const excluded = excludedTargetReason(tool)
+  if (excluded) throw new Error(excluded)
   const reason = request.reason
-  if (typeof reason !== 'string' || reason.trim().length === 0) throw new Error('父请求 reason 必须是非空字符串')
-  if (reason.length > MAX_REASON_CHARS) throw new Error(`父请求 reason 超过 ${MAX_REASON_CHARS} 字符`)
-
-  const raw = assertPlainRecord(request.arguments, '父请求 arguments')
-  const out: Record<string, string | number | boolean> = {}
-  for (const [key, item] of Object.entries(raw)) {
-    if (!ARGUMENT_KEYS.has(key)) throw new Error(`plugin_manager 参数含不支持字段：${key}`)
-    switch (key) {
-      case 'action':
-        if (typeof item !== 'string' || !SUPPORTED_ACTION_SET.has(item)) {
-          throw new Error(`plugin_manager action 只支持：${SUPPORTED_ACTIONS.join('、')}`)
-        }
-        out.action = item
-        break
-      case 'target':
-        if (typeof item !== 'string' || item.length === 0 || item.length > MAX_IDENTIFIER_CHARS) {
-          throw new Error('plugin_manager target 必须是 1–1024 字符的字符串')
-        }
-        out.target = item
-        break
-      case 'enabled':
-        if (typeof item !== 'boolean') throw new Error('plugin_manager enabled 必须是布尔值')
-        out.enabled = item
-        break
-      case 'registry':
-        if (typeof item !== 'string' || item.length === 0 || item.length > MAX_IDENTIFIER_CHARS) {
-          throw new Error('plugin_manager registry 必须是 1–1024 字符的字符串，按原值精确传递')
-        }
-        out.registry = item
-        break
-      case 'offset':
-        if (!Number.isInteger(item) || (item as number) < 0 || (item as number) > MAX_OFFSET) {
-          throw new Error(`plugin_manager offset 必须是 0–${MAX_OFFSET} 的整数`)
-        }
-        out.offset = item as number
-        break
-      case 'limit':
-        if (!Number.isInteger(item) || (item as number) < 1 || (item as number) > 100) {
-          throw new Error('plugin_manager limit 必须是 1–100 的整数')
-        }
-        out.limit = item as number
-        break
-      default:
-        throw new Error(`plugin_manager 参数含不支持字段：${key}`)
-    }
+  if (reason !== undefined && (typeof reason !== 'string' || reason.length > MAX_REASON_CHARS)) {
+    throw new Error(`父请求 reason 必须是不超过 ${MAX_REASON_CHARS} 字符的字符串`)
   }
-  if (!Object.hasOwn(out, 'action')) throw new Error('plugin_manager 参数缺少 action')
-  const frozen = freezeJson(out)
-  return Object.freeze({ reason, arguments: frozen, canonicalArguments: canonicalJson(frozen, 'arguments') })
+  const raw = assertPlainRecord(request.arguments, '父请求 arguments')
+  const canonicalArguments = canonicalJson(raw, 'arguments')
+  if (canonicalArguments.length > MAX_ARGUMENT_CHARS) throw new Error(`父请求 arguments 超过 ${MAX_ARGUMENT_CHARS} 字符`)
+  const copy = freezeJson(JSON.parse(canonicalArguments) as ParentArguments)
+  return Object.freeze({
+    tool,
+    ...(typeof reason === 'string' && reason.length > 0 ? { reason } : {}),
+    arguments: copy,
+    canonicalArguments,
+  })
+}
+
+/** Capability only when the child is not read-only and the parent is not wider. */
+export function modeDenial(childMode: unknown, parentMode: unknown): string | undefined {
+  if (!isSandboxMode(childMode)) return '无法确认来源角色的沙箱模式'
+  if (childMode === 'read-only') return '来源角色为只读，不提供父请求'
+  if (!isSandboxMode(parentMode)) return '无法读取父会话的沙箱模式'
+  if (sandboxModeRank(parentMode) > sandboxModeRank(childMode)) {
+    return `父会话权限（${parentMode}）比来源角色（${childMode}）更宽，父请求不可用`
+  }
+  return undefined
 }
 
 /* ------------------------------------------------------------------- broker */
 
 const TOOL_DESCRIPTION =
-  '请求主 Agent 按精确参数代执行一次 plugin_manager（仅 implement 基础节点绑定）。'
-  + '请求只在本节点完成且父调用未取消后交付一次；参数必须与闭集完全一致，宿主审批仍独立，'
-  + '这不是批准、不是权限提升，也不能用于其它工具、脚本或命令。'
+  '请求主 Agent 按精确参数代调用一次父会话中已有的工具（本节点无法自己完成的单个待办）。'
+  + '只在本节点完成且结果原样交付后可用一次；目标工具自己的参数 schema、说明与前置条件、你的角色工具限制和宿主审批都照常适用。'
+  + '这不是用户同意、批准或权限提升：不要声称用户已同意，原工具需要用户许可时由主 Agent 另行确认。'
 
 const PARAMETERS = Object.freeze({
-  reason: {
-    type: 'string', required: true,
-    description: '交回的真实待办与原因，供主 Agent 判断；不是批准声明，不会成为宿主批准。',
-  },
+  tool: { type: 'string', required: true, description: '父会话中原工具的名称。' },
   arguments: {
-    type: 'object',
-    additionalProperties: false,
-    description: 'plugin_manager 的完整精确参数。只支持 list_plugins、list_bundles、set_plugin、set_bundle、install_bundle、remove_bundle；'
-      + '版本豁免相关字段、approvedBuilds 与其它字段一律拒绝。',
-    properties: {
-      action: {
-        type: 'string', enum: SUPPORTED_ACTIONS, required: true,
-        description: '要交回的动作；list_bundles/list_plugins 是列目录，set/install/remove 是具体改动。',
-      },
-      target: { type: 'string', description: 'plugin_manager target 原值，按精确字符串传递。' },
-      enabled: { type: 'boolean', description: 'set_plugin/set_bundle 使用。' },
-      registry: { type: 'string', description: 'install_bundle 的 npm registry，按原值精确传递。' },
-      offset: { type: 'number', description: 'list 分页起点，0–1000000 的整数。' },
-      limit: { type: 'number', description: 'list 分页大小，1–100 的整数。' },
-    },
+    type: 'json', required: true,
+    description: '该工具的完整精确参数对象（JSON 对象），按原工具 schema 填写；主 Agent 只能原样调用。',
   },
+  reason: { type: 'string', description: '可选：交回原因，仅作数据，不是批准。' },
 } as const)
 
 const OUTPUT = Object.freeze({
@@ -385,7 +384,7 @@ const OUTPUT = Object.freeze({
   additionalProperties: false,
   properties: {
     status: { type: 'string', enum: ['proposed', 'rejected'], required: true },
-    tool: { type: 'string', description: '固定为 plugin_manager' },
+    tool: { type: 'string', description: '目标原工具名' },
     arguments: { type: 'json', description: '通过校验的精确参数；不是执行凭证' },
     source: {
       type: 'object', additionalProperties: false,
@@ -402,6 +401,7 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
   const clock = options.now ?? (() => Date.now())
   const rootTools = options.root.get('tools') as ToolsScope | undefined
   const available = rootTools !== undefined && typeof rootTools.get === 'function'
+    && typeof rootTools.executable === 'function'
   const members = new Map<object, Member>()
   const proposals = new Map<string, Proposal>()
   /** Call tokens whose suspension was confirmed by its final result. */
@@ -411,8 +411,37 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
   let released = false
   let sequence = 0
 
-  function parentToolOf(parent: ParentScopeAgent): unknown {
-    return rootTools?.get?.(PARENT_TARGET_TOOL, parent)
+  /**
+   * The parent's visible AND unconditionally executable definition, only when both
+   * views are the same object (a `when`-conditional registration is not executable
+   * outside a model step, so it stays unavailable).
+   */
+  function parentToolOf(parent: ParentScopeAgent, name: string): unknown {
+    const visible = rootTools?.get?.(name, parent)
+    if (visible === undefined) return undefined
+    return rootTools?.executable?.(name, parent) === visible ? visible : undefined
+  }
+
+  /** Role, mode and definition still hold for this source snapshot (no business rules). */
+  function sourceDenial(
+    entry: { tool: string; toolFilter?: RoleConfig['toolFilter']; childMode: SandboxMode; parentMode: () => unknown },
+  ): string | undefined {
+    const role = roleToolDenial(entry.toolFilter, entry.tool)
+    if (role) return `来源角色不允许 ${entry.tool}`
+    let parentMode: unknown
+    try { parentMode = entry.parentMode() } catch { parentMode = undefined }
+    return modeDenial(entry.childMode, parentMode)
+  }
+
+  /** Target schema pre-check with the host's own validator; any failure is closed. */
+  function schemaViolations(definition: unknown, args: ParentArguments): string[] {
+    const parameters = (definition as { parameters?: unknown } | undefined)?.parameters
+    if (!parameters || typeof parameters !== 'object') return ['目标工具没有可校验的参数 schema']
+    try {
+      return validateJsonSchemaValue(parameters as JsonSchemaNode, args, '')
+    } catch (error) {
+      return [`参数 schema 校验失败：${error instanceof Error ? error.message : String(error)}`]
+    }
   }
 
   function revokeParent(parent: object): void {
@@ -456,8 +485,8 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
         type: 'text' as const,
         text: value.status === 'proposed'
           ? `父请求已暂存（node=${value.source?.node ?? '?'}, run=${value.source?.runId ?? '?'}）：`
-            + `plugin_manager ${JSON.stringify(value.arguments)}；仅在本节点完成且父调用未取消后由主 Agent 执行一次，`
-            + `宿主批准仍独立，票据有效至 ${value.expiresAt ?? '未知'}。这不是批准或权限提升。`
+            + `${value.tool ?? '?'} ${JSON.stringify(value.arguments)}；仅在本节点完成且结果原样交付后，主 Agent 才可能按原工具条件调用一次，`
+            + `宿主批准仍独立，票据有效至 ${value.expiresAt ?? '未知'}。这不是用户同意、批准或权限提升。`
           : `父请求被拒绝：${value.note ?? '未说明原因'}。未暂存任何请求，也不会交给主 Agent。`,
       }],
     },
@@ -476,10 +505,17 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
         if (typeof callId !== 'string' || callId.length === 0) return rejected('缺少子调用标识')
         if (proposals.has(member.spec.callToken)) return rejected('本次节点调用已使用过唯一一次父请求')
         const request = parseParentRequest(args)
-        const definition = parentToolOf(member.spec.parent)
-        if (definition === undefined || definition !== member.definition) {
-          return rejected('父作用域的 plugin_manager 工具定义已变化或不可见')
+        const spec = member.spec
+        const denied = sourceDenial({ tool: request.tool, childMode: spec.childMode, parentMode: spec.parentMode,
+          ...(spec.toolFilter !== undefined ? { toolFilter: spec.toolFilter } : {}) })
+        if (denied) return rejected(denied)
+        const definition = parentToolOf(spec.parent, request.tool)
+        if (definition === undefined) return rejected(`父作用域没有可直接执行的 ${request.tool}（未挂载、被过滤或为条件注册）`)
+        if (rootTools?.get?.(request.tool, spec.child) !== definition) {
+          return rejected(`当前子作用域看到的 ${request.tool} 与父作用域定义不同或不可见，保守拒绝`)
         }
+        const violations = schemaViolations(definition, request.arguments)
+        if (violations.length > 0) return rejected(`参数不符合 ${request.tool} 的 schema：${violations.slice(0, 5).join('；')}`)
         const now = clock()
         const proposal: Proposal = Object.freeze({
           callToken: member.spec.callToken,
@@ -492,25 +528,29 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
           parentCallId: member.spec.parentCallId,
           requestedAt: now,
           expiresAt: now + PARENT_REQUEST_TTL_MS,
+          tool: request.tool,
           definition,
+          ...(spec.toolFilter !== undefined ? { toolFilter: spec.toolFilter } : {}),
+          childMode: spec.childMode,
+          parentMode: spec.parentMode,
           arguments: request.arguments,
           canonicalArguments: request.canonicalArguments,
-          reason: request.reason,
+          ...(request.reason !== undefined ? { reason: request.reason } : {}),
           requestSignal: member.spec.signal,
           ...(member.spec.execution !== undefined ? { execution: member.spec.execution } : {}),
         })
         proposals.set(proposal.callToken, proposal)
         return {
           status: 'proposed' as const,
-          tool: PARENT_TARGET_TOOL,
+          tool: request.tool,
           arguments: request.arguments,
           source: {
             node: proposal.nodeId, runId: proposal.runId,
             ...(proposal.unit !== undefined ? { unit: proposal.unit } : {}),
           },
           expiresAt: new Date(proposal.expiresAt).toISOString(),
-          note: '已暂存。只有本节点完成且父调用未取消时才由主 Agent 按精确参数执行一次；'
-            + '宿主批准仍独立；这不是批准、权限提升或可重放的凭证。',
+          note: '已暂存。只有本节点完成且父调用未取消时，主 Agent 才可能按精确参数调用一次；'
+            + '原工具的用户许可条件与宿主批准仍独立；这不是用户同意、权限提升或可重放的凭证。',
         }
       } catch (error) {
         return rejected(error instanceof Error ? error.message : String(error))
@@ -519,16 +559,19 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
   })
 
   const issuer = {
-    unavailableReason(parent: ParentScopeAgent): string | undefined {
+    unavailableReason(childMode?: unknown, parentMode?: unknown): string | undefined {
       if (released) return '节点行已卸载'
-      if (!available) return '宿主缺少原生工具注册表（tools.get）'
-      if (parentToolOf(parent) === undefined) return '父作用域看不到 plugin_manager（未挂载或被工具过滤）'
+      if (!available) return '宿主缺少原生工具注册表（tools.get/tools.executable）'
+      if (childMode !== undefined || parentMode !== undefined) return modeDenial(childMode, parentMode)
       return undefined
     },
     bind(spec: ParentRequestSpec): () => void {
       if (released) throw new Error('父请求 broker 已卸载')
-      if (!available) throw new Error('父请求需要原生工具注册表（tools.get），当前宿主缺少该接口')
-      if (spec.nodeId !== 'implement') throw new Error('父请求只在 implement 基础节点绑定')
+      if (!available) throw new Error('父请求需要原生工具注册表（tools.get/tools.executable），当前宿主缺少该接口')
+      if (typeof spec.nodeId !== 'string' || spec.nodeId.length === 0) throw new Error('父请求缺少 nodeId')
+      if (typeof spec.parentMode !== 'function') throw new Error('父请求绑定缺少父权限读取')
+      const modeReason = modeDenial(spec.childMode, spec.parentMode())
+      if (modeReason) throw new Error(modeReason)
       if (!spec.child || !spec.parent || spec.child === spec.parent) throw new Error('父请求绑定身份不完整')
       if (spec.parent.session !== spec.parentSession) throw new Error('父会话与绑定不一致')
       for (const [label, value] of [['parentCallId', spec.parentCallId], ['runId', spec.runId], ['callToken', spec.callToken]] as const) {
@@ -536,13 +579,11 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
       }
       if (typeof spec.live !== 'function' || !spec.signal) throw new Error('父请求绑定缺少生命周期')
       if (members.has(spec.child)) throw new Error('该 child 已绑定父请求')
-      const definition = parentToolOf(spec.parent)
-      if (definition === undefined) throw new Error('父作用域没有 plugin_manager 工具，拒绝绑定父请求')
       const childTools = spec.child.ctx.get('tools') as ToolsScope | undefined
       if (!childTools || typeof childTools.register !== 'function' || typeof childTools.guard !== 'function') {
         throw new Error('子作用域缺少工具注册或 guard 能力，拒绝父请求')
       }
-      const member: Member = { spec, definition, active: true, releases: [] }
+      const member: Member = { spec, active: true, releases: [] }
       members.set(spec.child, member)
       try {
         const removeGuard = childTools.guard((exec) => {
@@ -573,11 +614,10 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
 
   const guard: ParentGrantsGuard = {
     claim(exec): ParentClaim {
-      if (exec.name !== PARENT_TARGET_TOOL) return { kind: 'none' }
       const parent = exec.agent as ParentScopeAgent | undefined
       if (!parent || typeof parent !== 'object') return { kind: 'none' }
       const grant = grants.get(parent)
-      if (!grant) return { kind: 'none' }
+      if (!grant || grant.tool !== exec.name) return { kind: 'none' }
       const deny = (reason: string): ParentClaim => ({ kind: 'deny', reason: `Satellite：${reason}` })
       if (grant.state === 'consumed') return deny('该父请求票据已使用过；一次请求只允许一次精确调用')
       if (grant.state === 'revoked') return deny('该父请求票据已作废')
@@ -592,7 +632,7 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
       const now = clock()
       if (now > grant.expiresAt) {
         closeGrant(grant, 'revoked')
-        return deny('父请求票据已超过 10 分钟有效期；未执行工具主体，也未进入 plugin_manager 主体内的审批（宿主执行前策略审批可能已先发生）')
+        return deny('父请求票据已超过 10 分钟有效期；未执行工具主体，也未进入目标工具主体内的审批（宿主执行前策略审批可能已先发生）')
       }
       if (parent.session !== grant.parentSession) {
         closeGrant(grant, 'revoked')
@@ -603,18 +643,23 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
         closeGrant(grant, 'revoked')
         return deny('父 Agent 已失效；父请求票据已作废')
       }
-      if (parentToolOf(parent) !== grant.definition) {
+      if (parentToolOf(parent, grant.tool) !== grant.definition) {
         closeGrant(grant, 'revoked')
-        return deny('父作用域的 plugin_manager 工具定义已替换；父请求票据已作废')
+        return deny(`父作用域的 ${grant.tool} 工具定义已替换或不可直接执行；父请求票据已作废`)
+      }
+      const sourceReason = sourceDenial(grant)
+      if (sourceReason) {
+        closeGrant(grant, 'revoked')
+        return deny(`${sourceReason}；父请求票据已作废`)
       }
       let canonical: string
       try {
         canonical = canonicalJson(exec.arguments, 'arguments')
       } catch {
-        return deny('父请求参数无法规范化为无损 JSON；未执行工具主体，也未进入 plugin_manager 主体内的审批（宿主执行前策略审批可能已先发生）')
+        return deny('父请求参数无法规范化为无损 JSON；未执行工具主体，也未进入目标工具主体内的审批（宿主执行前策略审批可能已先发生）')
       }
       if (canonical !== grant.canonicalArguments) {
-        return deny('参数与节点交回的精确请求不一致；未执行工具主体，也未进入 plugin_manager 主体内的审批（宿主执行前策略审批可能已先发生）')
+        return deny('参数与节点交回的精确请求不一致；未执行工具主体，也未进入目标工具主体内的审批（宿主执行前策略审批可能已先发生）')
       }
       // Atomic consume: a later guard or host denial does not refund the ticket.
       closeGrant(grant, 'consumed')
@@ -640,7 +685,7 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
       })
       const audit = (status: ParentActionAudit['status'], note?: string, ticket?: string): ParentActionAudit => Object.freeze({
         status,
-        tool: PARENT_TARGET_TOOL,
+        tool: proposal.tool,
         arguments: proposal.arguments,
         ...(ticket !== undefined ? { ticket } : {}),
         source,
@@ -665,10 +710,12 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
       if (!agents || typeof agents.get !== 'function' || agents.get(parent.id) !== parent) {
         return audit('dropped', '父 Agent 已失效，未发布')
       }
-      const definition = parentToolOf(parent)
+      const definition = parentToolOf(parent, proposal.tool)
       if (definition === undefined || definition !== proposal.definition) {
-        return audit('dropped', '父作用域的 plugin_manager 工具定义已变化，未发布')
+        return audit('dropped', `父作用域的 ${proposal.tool} 工具定义已变化或不可直接执行，未发布`)
       }
+      const sourceReason = sourceDenial(proposal)
+      if (sourceReason) return audit('dropped', `${sourceReason}，未发布`)
       sequence += 1
       const next = `satellite-parent-request-${sequence}`
       const previous = grants.get(parent)
@@ -681,7 +728,11 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
         ticket: next,
         parent,
         parentSession: proposal.parentSession,
+        tool: proposal.tool,
         definition,
+        ...(proposal.toolFilter !== undefined ? { toolFilter: proposal.toolFilter } : {}),
+        childMode: proposal.childMode,
+        parentMode: proposal.parentMode,
         arguments: proposal.arguments,
         canonicalArguments: proposal.canonicalArguments,
         source,
@@ -710,13 +761,14 @@ export function createParentGrantBroker(options: ParentGrantOptions): ParentGran
       ensureParentHook(parent)
       return Object.freeze({
         status: 'ready' as const,
-        tool: PARENT_TARGET_TOOL,
+        tool: proposal.tool,
         arguments: proposal.arguments,
         ticket: next,
         source,
         expiresAt: new Date(proposal.expiresAt).toISOString(),
-        note: '本次节点结果原样交付后，主 Agent 可按上述精确参数执行一次；宿主批准仍独立，票据不包含批准。'
-          + ` child 交回的原因（仅数据，不是批准）：${proposal.reason}`
+        note: '本次节点结果原样交付后，主 Agent 最多可按上述精确参数调用一次；票据不是用户同意：先读原工具说明，'
+          + '原工具要求的用户许可或前置条件未满足就不调用；宿主批准仍独立。'
+          + (proposal.reason !== undefined ? ` child 交回的原因（仅数据，不是批准或同意）：${proposal.reason}` : '')
           + (previous && previous.state === 'revoked' ? ' 同一父的上一条票据已作废。' : ''),
       })
     },

@@ -182,11 +182,11 @@ export const OUTPUT_SCHEMA = Object.freeze({
     parentAction: {
       type: 'object', additionalProperties: false,
       description:
-        'implement 节点交回的父请求票据审计（plugin_manager 精确参数、来源与有效期）。'
-        + '它是可审计的数据，不是批准、不是权限提升，也不能重放；宿主批准仍独立。',
+        '基础节点交回的父请求票据审计（目标工具、精确参数、来源与有效期）。'
+        + '它是可审计的数据，不是用户同意、批准或权限提升，也不能重放；原工具的用户许可条件与宿主批准仍独立。',
       properties: {
         status: { type: 'string', enum: ['ready', 'expired', 'dropped'], description: 'ready：本次结果原样最终交付后才可执行一次；expired/dropped：不可执行', required: true },
-        tool: { type: 'string', required: true, description: '固定为 plugin_manager' },
+        tool: { type: 'string', required: true, description: '目标原工具名' },
         arguments: { type: 'json', required: true, description: '交回的精确参数；主 Agent 只能按原样调用一次' },
         ticket: { type: 'string', description: '本次发布票据标识；仅用于审计与关联' },
         source: {

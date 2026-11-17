@@ -1,6 +1,7 @@
-// Parent-request broker: the implement base child stages exactly one closed
-// `plugin_manager` request; only a fully completed node publishes it, and the root
-// guard claims it once for the exact parent and exact canonical arguments.
+// Parent-request broker: a non-read-only base child stages exactly one generic
+// `{tool, arguments}` request for an existing parent tool; only a fully completed node
+// publishes it, and the root guard claims it once for the exact parent and exact
+// canonical arguments. Tool fixtures here never execute anything.
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -13,9 +14,30 @@ function openTicket(broker, ...args) {
 }
 
 import {
-  canonicalJson, createParentGrantBroker, PARENT_REQUEST_TOOL, PARENT_REQUEST_TTL_MS, PARENT_TARGET_TOOL,
+  canonicalJson, createParentGrantBroker, PARENT_REQUEST_TOOL, PARENT_REQUEST_TTL_MS,
   parseParentRequest,
 } from '../lib/node/lib/parent-grant.js'
+
+const PARENT_TARGET_TOOL = 'plugin_manager'
+/** Fixture definitions with real JSON Schema parameters; no execute body is ever run. */
+const pmParameters = {
+  type: 'object',
+  properties: {
+    action: { type: 'string' }, target: { type: 'string' }, enabled: { type: 'boolean' },
+    registry: { type: 'string' }, offset: { type: 'number' }, limit: { type: 'number' },
+  },
+  required: ['action'],
+}
+const bashParameters = {
+  type: 'object',
+  properties: {
+    description: { type: 'string' }, command: { type: 'string' },
+    sandbox_permissions: { type: 'string', enum: ['workspace-write', 'danger-full-access'] },
+    justification: { type: 'string' },
+  },
+  required: ['description', 'command'],
+  additionalProperties: false,
+}
 
 const PARENT_CALL = 'parent-call-1'
 
@@ -35,18 +57,19 @@ function world({ now = () => 1_000_000 } = {}) {
     },
   }
   const child = { id: 'child', session: { id: 'child-session' }, ctx: {} }
-  const definition = { name: PARENT_TARGET_TOOL, definition: 1 }
-  const registered = new Map()
+  const definition = { name: PARENT_TARGET_TOOL, definition: 1, parameters: pmParameters }
+  const registered = new Map([['bash', { name: 'bash', parameters: bashParameters }]])
+  const conditional = new Set()
   const childDefs = new Map()
   const agents = new Map([[parent.id, parent]])
   const rootTools = {
     get(name, scope) {
-      if (scope === child) return childDefs.get(name)
-      if (scope === parent) {
-        if (name === PARENT_TARGET_TOOL) return registered.get(PARENT_TARGET_TOOL)
-        return undefined
-      }
+      if (scope === child) return childDefs.get(name) ?? registered.get(name)
+      if (scope === parent) return registered.get(name)
       return undefined
+    },
+    executable(name, scope) {
+      return conditional.has(name) ? undefined : rootTools.get(name, scope)
     },
     register: () => () => {},
   }
@@ -69,10 +92,11 @@ function world({ now = () => 1_000_000 } = {}) {
   }
   const broker = createParentGrantBroker({ defineTool, root, now })
   const controller = new AbortController()
-  const flags = { live: true }
+  const flags = { live: true, parentMode: 'workspace-write' }
   const spec = {
     child, parent, parentSession, nodeId: 'implement', runId: 'run-1', callToken: 'call-token-1',
     parentCallId: PARENT_CALL, signal: controller.signal, live: () => flags.live,
+    childMode: 'workspace-write', parentMode: () => flags.parentMode,
   }
   const bind = (overrides = {}) => broker.issuer.bind({ ...spec, ...overrides })
   const request = (args, execOverrides = {}) => {
@@ -83,12 +107,12 @@ function world({ now = () => 1_000_000 } = {}) {
     name: PARENT_TARGET_TOOL, agent: parent, arguments: args, callId: options.callId ?? 'parent-call-1', ...options,
   })
   return {
-    parent, child, definition, registered, childDefs, agents, guardFns: guards, root, broker, controller,
+    parent, child, definition, registered, conditional, childDefs, agents, guardFns: guards, root, broker, controller,
     flags, bind, request, claim,
   }
 }
 
-const valid = { reason: '安装前先列出可用 bundle', arguments: { action: 'list_bundles', limit: 10 } }
+const valid = { tool: PARENT_TARGET_TOOL, reason: '安装前先列出可用 bundle', arguments: { action: 'list_bundles', limit: 10 } }
 
 test('request stages, publish creates one ticket, and the exact parent claims it once', async () => {
   const w = world()
@@ -130,57 +154,89 @@ test('canonical key order is irrelevant; variant args are denied without consumi
   assert.equal(v.claim(valid.arguments).kind, 'allow', 'the exact request still holds after variants')
 })
 
-test('closed request validation rejects unsupported plugin_manager inputs', async () => {
-  const w = world()
-  w.bind()
-  // Host schema validation happens before the body; these never reach the parser.
-  const schemaRejected = [
-    { reason: 'x', arguments: { action: 'set_version_exemption' } },
-    { reason: 'x', arguments: { action: 'list_plugins', runtimeVersion: '1.0.0' } },
-    { reason: 'x', arguments: { action: 'list_plugins', acceptRisk: true } },
-    { reason: 'x', arguments: { action: 'install_bundle', approvedBuilds: [] } },
-    { reason: 'x', arguments: { action: 'list_plugins', enabled: 'true' } },
-    { reason: 'x', arguments: { action: 'list_plugins', target: 3 } },
-    { reason: 'x', arguments: {} },
-  ]
-  for (const args of schemaRejected) {
-    await assert.rejects(() => w.request(args), /invalid arguments/, JSON.stringify(args))
-  }
-  // The parser independently rejects closed-set violations the host schema cannot
-  // express (or that a non-pipeline caller could supply).
+test('generic request validation: shape, excluded targets, target schema, visibility and role', async () => {
+  // Generic shape only; no plugin_manager business allow-list remains.
   const parserRejected = [
-    [{ reason: '', arguments: { action: 'list_plugins' } }, /reason/],
-    [{ reason: 'x', arguments: { action: 'list_plugins', offset: -1 } }, /offset/],
-    [{ reason: 'x', arguments: { action: 'list_plugins', offset: 1_000_001 } }, /offset/],
-    [{ reason: 'x', arguments: { action: 'list_plugins', registry: '' } }, /registry/],
-    [{ reason: 'x', arguments: {} }, /缺少 action/],
+    [{ arguments: {} }, /tool/],
+    [{ tool: 'bad name', arguments: {} }, /tool/],
+    [{ tool: 'satellite_node', arguments: {} }, /不能作为父请求目标/],
+    [{ tool: 'run_code', arguments: {} }, /不能作为父请求目标/],
+    [{ tool: PARENT_REQUEST_TOOL, arguments: {} }, /不能作为父请求目标/],
+    [{ tool: 'subagent', arguments: {} }, /不受控的委派/],
+    [{ tool: 'bash', arguments: 'ls' }, /普通对象/],
+    [{ tool: 'bash', arguments: { command: 'x'.repeat(70_000) } }, /超过/],
   ]
   for (const [args, pattern] of parserRejected) {
-    assert.throws(() => parseParentRequest(args), pattern, JSON.stringify(args))
+    assert.throws(() => parseParentRequest(args), pattern, JSON.stringify(args).slice(0, 80))
   }
-  const bodyRejected = [
-    { reason: 'x', arguments: { action: 'list_plugins', limit: 0 } },
-    { reason: 'x', arguments: { action: 'list_plugins', limit: 101 } },
-    { reason: 'x', arguments: { action: 'list_plugins', offset: -1 } },
-    { reason: 'x', arguments: { action: 'list_plugins', offset: 1_000_001 } },
-    { reason: 'x', arguments: { action: 'list_plugins', registry: '' } },
-    { reason: '', arguments: { action: 'list_plugins' } },
-  ]
-  for (const args of bodyRejected) {
-    const value = await w.request(args)
-    assert.equal(value.status, 'rejected', JSON.stringify(args))
-  }
-  // Accessor-shaped input is rejected rather than read.
-  const accessor = { reason: 'x', arguments: { action: 'list_plugins' } }
-  Object.defineProperty(accessor.arguments, 'limit', { enumerable: true, get: () => 1 })
+  const accessor = { tool: 'bash', arguments: { command: 'ls' } }
+  Object.defineProperty(accessor.arguments, 'description', { enumerable: true, get: () => 'x' })
   assert.throws(() => parseParentRequest(accessor), /访问器/)
+  // Former plugin_manager business fields are only judged by the target's own schema.
+  assert.equal(parseParentRequest({ tool: 'plugin_manager', arguments: { action: 'set_version_exemption', acceptRisk: true } }).tool, 'plugin_manager')
+
+  const w = world()
+  w.bind()
+  const schema = await w.request({ tool: 'bash', arguments: { command: 'ls', extra: 1 } })
+  assert.equal(schema.status, 'rejected')
+  assert.match(schema.note ?? '', /schema/)
+  const unknown = await w.request({ tool: 'missing_tool', arguments: {} })
+  assert.match(unknown.note ?? '', /父作用域没有可直接执行的 missing_tool/)
+  w.conditional.add('bash')
+  const conditional = await w.request({ tool: 'bash', arguments: { description: 'd', command: 'ls' } })
+  assert.match(conditional.note ?? '', /条件注册/)
+
+  const denied = world()
+  denied.bind({ toolFilter: { deny: ['bash'] } })
+  const role = await denied.request({ tool: 'bash', arguments: { description: 'd', command: 'ls' } })
+  assert.equal(role.status, 'rejected')
+  assert.match(role.note ?? '', /来源角色不允许 bash/)
+})
+
+test('read-only source or a wider parent provides no capability; a later widening revokes the ticket', async () => {
+  const w = world()
+  assert.throws(() => w.bind({ childMode: 'read-only' }), /只读/)
+  w.flags.parentMode = 'danger-full-access'
+  assert.throws(() => w.bind(), /更宽/)
+  assert.match(w.broker.issuer.unavailableReason('workspace-write', 'danger-full-access') ?? '', /更宽/)
+
+  const v = world()
+  v.bind()
+  await v.request(valid)
+  openTicket(v.broker, 'call-token-1', v.controller.signal)
+  v.flags.parentMode = 'danger-full-access'
+  const denied = v.claim(valid.arguments)
+  assert.equal(denied.kind, 'deny')
+  assert.match(denied.reason, /更宽/)
+  v.flags.parentMode = 'workspace-write'
+  assert.equal(v.claim(valid.arguments).kind, 'deny', 'revoked for good')
+})
+
+test('dynamic bash and Gradle command strings use the same exact one-shot mechanism', async () => {
+  const gradle = { description: 'build', command: './gradlew :app:assembleDebug --offline', sandbox_permissions: 'danger-full-access', justification: '需要访问 Gradle 缓存' }
+  for (const args of [{ description: 'list', command: 'ls -la src' }, gradle]) {
+    const w = world()
+    w.bind()
+    const staged = await w.request({ tool: 'bash', arguments: args })
+    assert.equal(staged.status, 'proposed', staged.note)
+    assert.equal(openTicket(w.broker, 'call-token-1', w.controller.signal).tool, 'bash')
+    const claim = (a, name = 'bash') => w.claim(a, { name })
+    assert.equal(claim(args, 'plugin_manager').kind, 'none', 'a ticket covers only its own tool')
+    assert.equal(claim({ ...args, command: `${args.command} ` }).kind, 'deny', 'command text is matched exactly')
+    if (args.sandbox_permissions) {
+      const { sandbox_permissions: _omit, ...without } = args
+      assert.equal(claim(without).kind, 'deny', 'omitted sandbox_permissions differs from the explicit value')
+    }
+    assert.equal(claim(args).kind, 'allow')
+    assert.equal(claim(args).kind, 'deny', 'one exact call only')
+  }
 })
 
 test('one request per node call (including resume), and only from the bound child scope', async () => {
   const w = world()
   w.bind()
   assert.equal((await w.request(valid)).status, 'proposed')
-  const second = await w.request({ reason: 'again', arguments: { action: 'list_plugins' } })
+  const second = await w.request({ tool: PARENT_TARGET_TOOL, reason: 'again', arguments: { action: 'list_plugins' } })
   assert.equal(second.status, 'rejected')
   assert.match(second.note ?? '', /唯一一次/)
   // A non-member agent (even the parent) cannot stage a request.
@@ -195,7 +251,7 @@ test('a replaced parent tool definition blocks publish and revokes an open ticke
   const w = world()
   w.bind()
   await w.request(valid)
-  w.registered.set(PARENT_TARGET_TOOL, { name: PARENT_TARGET_TOOL, definition: 2 })
+  w.registered.set(PARENT_TARGET_TOOL, { name: PARENT_TARGET_TOOL, definition: 2, parameters: pmParameters })
   const dropped = openTicket(w.broker, 'call-token-1', w.controller.signal)
   assert.equal(dropped.status, 'dropped')
   assert.match(dropped.note ?? '', /定义已变化/)
@@ -204,7 +260,7 @@ test('a replaced parent tool definition blocks publish and revokes an open ticke
   v.bind()
   await v.request(valid)
   openTicket(v.broker, 'call-token-1', v.controller.signal)
-  v.registered.set(PARENT_TARGET_TOOL, { name: PARENT_TARGET_TOOL, definition: 2 })
+  v.registered.set(PARENT_TARGET_TOOL, { name: PARENT_TARGET_TOOL, definition: 2, parameters: pmParameters })
   const denied = v.claim(valid.arguments)
   assert.equal(denied.kind, 'deny')
   assert.match(denied.reason, /定义已替换/)
@@ -289,7 +345,7 @@ test('normal child end does not lose a staged request; a new publish voids the o
   // Same parent, a second completed node call publishes a new ticket.
   const second = w.bind({ callToken: 'call-token-2', runId: 'run-2' })
   try {
-    await w.request({ reason: 'second', arguments: { action: 'list_plugins' } })
+    await w.request({ tool: PARENT_TARGET_TOOL, reason: 'second', arguments: { action: 'list_plugins' } })
     const next = openTicket(w.broker, 'call-token-2', w.controller.signal)
     assert.equal(next.status, 'ready')
     assert.notEqual(next.ticket, published.ticket)
@@ -299,9 +355,9 @@ test('normal child end does not lose a staged request; a new publish voids the o
   } finally { second() }
 })
 
-test('binding requires the implement node and a resolvable parent plugin_manager', async () => {
+test('binding needs identity and lifecycle; any base node may bind', async () => {
   const w = world()
-  assert.throws(() => w.bind({ nodeId: 'context' }), /implement/)
+  assert.throws(() => w.bind({ nodeId: '' }), /nodeId/)
   const dead = world()
   const unbind = dead.bind()
   dead.flags.live = false
@@ -309,9 +365,9 @@ test('binding requires the implement node and a resolvable parent plugin_manager
   assert.equal(value.status, 'rejected')
   assert.match(value.note ?? '', /委派已结束/)
   unbind()
-  const missing = world()
-  missing.registered.clear()
-  assert.throws(() => missing.bind(), /plugin_manager/)
+  const validateNode = world()
+  validateNode.bind({ nodeId: 'validate' })
+  assert.equal((await validateNode.request(valid)).status, 'proposed')
   assert.throws(() => w.bind({ runId: '' }), /runId/)
   assert.throws(() => w.bind({ callToken: '' }), /callToken/)
 })
@@ -372,7 +428,7 @@ test('an old ticket source abort does not revoke a newer ticket for the same par
   const second = new AbortController()
   const unbindSecond = w.bind({ callToken: 'call-token-2', runId: 'run-2', signal: second.signal })
   try {
-    const staged = await w.request({ reason: 'second', arguments: { action: 'list_plugins' } }, { signal: second.signal })
+    const staged = await w.request({ tool: PARENT_TARGET_TOOL, reason: 'second', arguments: { action: 'list_plugins' } }, { signal: second.signal })
     assert.equal(staged.status, 'proposed')
     assert.equal(openTicket(w.broker, 'call-token-2', second.signal, 'p-2').status, 'ready')
     first.abort()

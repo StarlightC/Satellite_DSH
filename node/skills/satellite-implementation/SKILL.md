@@ -70,17 +70,16 @@ light documentation.
 
 ## Handing one request back to the parent
 
-An `implement` base child may also have `satellite_parent_request` (when the task says it is unavailable, only report the pending action in your result). Use it only for a
-real, already-agreed pending tool action and pass the exact `plugin_manager`
-arguments you would otherwise call; list first, and never treat a list handback as
-permission to install or change. It supports only `list_plugins`, `list_bundles`,
-`set_plugin`, `set_bundle`, `install_bundle`, and `remove_bundle` with
-`action`/`target`/`enabled`/`registry`/`offset`/`limit`; version-exemption fields,
-build approvals, unknown fields and widened parameters are rejected. The request is
-staged, not executed: it is delivered only if this node completes. It is not an
-approval, not a permission grant, and cannot be used for other tools, scripts or
-commands; never claim user approval for it. If the task needs anything outside this
-closed request, stop and hand the decision back instead.
+A non-read-only base child may also have `satellite_parent_request` (when the task
+says it is unavailable, only report the pending action in your result). Use it only
+for one real pending call of an existing parent tool that this node cannot make
+itself, and pass that tool's complete exact arguments according to its own schema
+and description. The request is staged, not executed: it is delivered only if this
+node completes, and the parent may still decline. It is not user consent, approval,
+or a permission grant: never claim the user agreed, and do not fill approval or
+risk fields the original tool reserves for the user. Your role's tool restrictions
+still apply to the target. If the task needs more than one such call or a missing
+decision, stop and hand the decision back instead.
 
 ## Reuse index maintenance
 

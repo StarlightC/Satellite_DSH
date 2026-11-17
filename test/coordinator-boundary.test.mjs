@@ -248,7 +248,12 @@ test('root guard: one published ticket gates exactly the handed-back call; every
       defineTool,
       root: {
         get(name) {
-          if (name === 'tools') return { get: (toolName, scope) => (scope === child ? childDefs.get(toolName) : realTools.get(toolName, scope)) }
+          if (name === 'tools') {
+            return {
+              get: (toolName, scope) => (scope === child ? childDefs.get(toolName) ?? realTools.get(toolName) : realTools.get(toolName, scope)),
+              executable: (toolName, scope) => realTools.executable(toolName, scope),
+            }
+          }
           if (name === 'agents') return { get: (id) => f.live.get(id) }
           return undefined
         },
@@ -258,11 +263,12 @@ test('root guard: one published ticket gates exactly the handed-back call; every
     const bind = (callToken) => broker.issuer.bind({
       child, parent, parentSession, nodeId: 'implement', runId: 'run-1', callToken,
       parentCallId: 'node-call-1', signal: controller.signal, live: () => true,
+      childMode: 'workspace-write', parentMode: () => 'workspace-write',
     })
     const stageAndPublish = async (callToken) => {
       const tool = childDefs.get(PARENT_REQUEST_TOOL)
       const staged = await tool.execute(
-        { reason: '列出 bundle', arguments: { action: 'list_bundles', limit: 10 } },
+        { tool: 'plugin_manager', reason: '列出 bundle', arguments: { action: 'list_bundles', limit: 10 } },
         { agent: child, callId: 'child-call-1', signal: controller.signal },
       )
       assert.equal(staged.status, 'proposed')

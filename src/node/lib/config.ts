@@ -189,6 +189,32 @@ export function isControlledOrchestrationTool(name: string): boolean {
   return name.startsWith('subagent_') && !READ_ONLY_SUBAGENT_PREFIXED.has(name)
 }
 
+/** Coordinator closed set: tools the main Agent may call directly (never via a ticket). */
+export const COORDINATION_TOOLS: ReadonlySet<string> = new Set([
+  'satellite_node', 'skill', 'ask_user_question', 'exit_plan_mode',
+  'todo_write', 'present', 'get_goal', 'create_goal', 'update_goal',
+  // Listing never resumes agents; interrupt only cancels.
+  'list_agents', 'interrupt_agent',
+  // DSH 0.2.2-alpha.3 @deepseek-ai/dsh-tool-schedule registered names.
+  'schedule_create', 'schedule_list', 'schedule_view', 'schedule_edit',
+])
+
+/**
+ * Role tool restriction for one tool name (fixed orchestration baseline, then the
+ * role's own allow/deny). Shared by the child guard and the parent-request broker.
+ */
+export function roleToolDenial(filter: RoleConfig['toolFilter'] | undefined, name: string): string | undefined {
+  if (isControlledOrchestrationTool(name)) return `Satellite：角色不能使用不受控的委派/通信入口 ${name}；委派只能经 satellite_node`
+  if (filter?.allow && !filter.allow.includes(name)) return `Satellite：角色不允许使用工具 ${name}`
+  if (filter?.deny?.includes(name)) return `Satellite：角色不允许使用工具 ${name}`
+  return undefined
+}
+
+/** Sandbox breadth rank: higher is wider. */
+export function sandboxModeRank(mode: SandboxMode): number {
+  return SANDBOX_MODE_ORDER.indexOf(mode)
+}
+
 const TOOL_NAME = /^[A-Za-z0-9_.:-]{1,128}$/
 
 /**
