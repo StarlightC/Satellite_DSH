@@ -19,9 +19,11 @@ network tools, generic delegation, or another tool under an alias.
 - `status`: `{action:"status", repo:"."}` observes and returns a private, expiring,
   single-use `expectedSnapshot` bound to this execution identity.
 - `diff`: `{action:"diff", repo:".", target:"working"|"staged", paths?:["file"]}`.
-- `log`: `{action:"log", repo:".", count:1}` reads HEAD only, count 1–50.
+- `log`: `{action:"log", repo:".", count:1}` reads HEAD only; count is a positive
+  safe integer. Actual output is bounded, not the requested history length.
 - `stage`: `{action:"stage", repo:".", paths:["exact-file"], expectedSnapshot:"..."}`.
-  Specify 1–100 literal files or actual tracked deletions, not directories/globs.
+  Specify a nonempty list of exact files/symlinks or tracked deletions, not directories.
+  POSIX punctuation (including `[id].tsx`) is literal, never expanded as a glob.
 - `commit`: `{action:"commit", repo:".", message:"one line", expectedSnapshot:"..."}`.
   Commit covers the ENTIRE actual index, including previously staged files. Review
   staged diff/index scope with the user; never equate the last stage list with the

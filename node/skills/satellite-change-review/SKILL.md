@@ -11,6 +11,11 @@ summary someone wrote about the change.
 
 ## Method
 
+Before reviewing, read
+[the shared restriction-design principles](../satellite-base-flow/references/restriction-design.md).
+Challenge each added restriction's evidence, scope, normal-workflow impact, and
+least restrictive alternative; check real scenarios, not only passing refusals.
+
 1. Lock the change first: which files and hunks actually differ, and which
    consumers read them. Name the scope and the stop condition before reading
    widely.

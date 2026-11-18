@@ -11,6 +11,11 @@ does not implement, and it does not widen the goal.
 
 ## Start from the facts
 
+Before shaping options, read
+[the shared restriction-design principles](../satellite-base-flow/references/restriction-design.md).
+For each proposed restriction, supply its risk/impact/alternative evidence and
+include normal-workflow compatibility and real-scenario checks in the plan.
+
 Restate the bounded facts the plan rests on, each with its exact location, and
 say which of them came from `context` and which you checked yourself. A plan built
 on unstated facts cannot be reviewed.
