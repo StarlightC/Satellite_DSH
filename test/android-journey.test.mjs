@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 
 import {
   DEVICE_TMP_DIR, JOURNEY_KEYS, MAX_JOURNEY_STEPS, MAX_WAIT_MS, STEP_TIMEOUT_MS,
@@ -160,8 +161,7 @@ test('未知字段、未知动作与非法值在启动任何进程之前被拒�
     [{ serial: SERIAL, applicationId: 'com.example.app', steps: [{ action: 'wait', ms: 0 }] }, /between 1 and 30000/],
     [{ serial: SERIAL, applicationId: 'com.example.app', steps: [{ action: 'wait', ms: MAX_WAIT_MS + 1 }] }, /between 1 and 30000/],
     [{ serial: SERIAL, applicationId: 'com.example.app', steps: [{ action: 'text', text: 'x'.repeat(1025) }] }, /at most 1024/],
-    // 注入形状的文本在解析期就被拒绝，不会等到设备已经改过状态才发现。
-    [{ serial: SERIAL, applicationId: 'com.example.app', steps: [{ action: 'text', text: 'a; rm -rf /' }] }, /letters, digits, space/],
+    [{ serial: SERIAL, applicationId: 'com.example.app', steps: [{ action: 'text', text: 'literal%s' }] }, /literal %s/],
     [{ serial: SERIAL, applicationId: 'com.example.app', steps: [{ action: 'assert-ui-text', text: 'x'.repeat(513) }] }, /at most 512/],
     [{ serial: SERIAL, applicationId: 'com.example.app', steps: [{ action: 'key', key: 'KEYCODE_REBOOT' }] }, /must be one of/],
     [{ serial: SERIAL, applicationId: 'com.example.app', steps: [{ action: 'screenshot', output: '/etc/passwd' }] }, /project-relative/],
@@ -177,14 +177,13 @@ test('未知字段、未知动作与非法值在启动任何进程之前被拒�
   assert.equal(JOURNEY_KEYS.includes('KEYCODE_HOME'), true)
 })
 
-test('输入文本去掉 shell 元字符，空格编码成 %s', () => {
+test('输入文本允许 ASCII 标点和前导 -，空格编码，明确拒绝 %s 与非 ASCII', () => {
   assert.equal(encodeInputText('hello world'), 'hello%sworld')
-  assert.equal(encodeInputText('a.b_c@d:e+f=g-h/i,j'), 'a.b_c@d:e+f=g-h/i,j')
-  for (const bad of ['a;b', 'a$b', 'a`b`', 'a&b', 'a|b', 'a*b', 'a?b', 'a"b', "a'b", 'a\nb', 'a(b', 'a>b', 'a%b']) {
-    assert.throws(() => encodeInputText(bad), /letters, digits, space/, `应拒绝 ${JSON.stringify(bad)}`)
+  assert.equal(encodeInputText("-a'b!$;()[]%"), "-a'b!$;()[]%")
+  for (const bad of ['a\nb', 'a\tb', 'a\x00b', 'a\x7fb', '中文']) {
+    assert.throws(() => encodeInputText(bad), /printable ASCII|control characters/)
   }
-  // 以 "-" 开头会被设备端 input 当作选项，单独拒绝。
-  assert.throws(() => encodeInputText('-leading'), /must not start with/)
+  for (const bad of ['%s', 'a%sb', '%%s']) assert.throws(() => encodeInputText(bad), /literal %s/)
 })
 
 test('计划描述写明设备临时文件与工作区落点', () => {
@@ -210,11 +209,28 @@ test('每一步都映射成一条精确的 adb argv', async () => {
   assert.equal(value.status, 'succeeded')
   assert.deepEqual(h.calls.spawn.map((entry) => entry.argv), [
     ['/usr/bin/adb', '-s', SERIAL, 'shell', 'input', 'tap', '10', '20'],
-    ['/usr/bin/adb', '-s', SERIAL, 'shell', 'input', 'text', 'hello%sworld'],
+    ['/usr/bin/adb', '-s', SERIAL, 'shell', 'input', 'text', "'hello%sworld'"],
     ['/usr/bin/adb', '-s', SERIAL, 'shell', 'input', 'keyevent', 'KEYCODE_ENTER'],
   ])
   assert.equal(h.calls.spawn.every((entry) => entry.cwd === ROOT), true)
   assert.deepEqual(value.steps.map((step) => step.status), ['succeeded', 'succeeded', 'succeeded'])
+})
+
+test('实际 text argv 经 adb 的 POSIX shell 重拼仍为一个字面参数（非设备验收）', async () => {
+  const texts = ["-a'b!$;()[]%", "x'; printf INJECTED; # $(printf BAD) `printf BAD`", ' a  b% s ', 'a"b\\c']
+  for (const text of texts) {
+    const h = harness()
+    const result = await runJourney(h.deps, request({ steps: [{ action: 'text', text }] }), Date.now())
+    assert.equal(result.status, 'succeeded')
+    const remoteArgs = h.calls.spawn[0].argv.slice(4)
+    assert.deepEqual(remoteArgs.slice(0, 2), ['input', 'text'])
+    assert.equal(remoteArgs.length, 3)
+    // A shell function stands in for input, serializes every received positional arg.
+    const shell = spawnSync('/bin/sh', ['-c', `input() { printf '%s\\0' "$#" "$@"; }; ${remoteArgs.join(' ')}`], { encoding: 'utf8' })
+    assert.equal(shell.status, 0, shell.stderr)
+    assert.equal(shell.stdout, `2\0text\0${encodeInputText(text)}\0`)
+    assert.equal(shell.stderr, '')
+  }
 })
 
 test('断言失败立即停止后续步骤，并如实标记失败', async () => {

@@ -5,9 +5,9 @@
  * - **静态 inspect**：只读工作区内的构建文件，给出"线索"（来源 static-text，`verified: false`），
  *   不启动任何进程，也不声称 Gradle 任务真实存在。
  * - **动态 discover-build**：经真实批准调用用户配置的 Android CLI，
- *   把它的 1.0.x 报告解析成模块/变体/产物事实；版本不支持或报告形状不符即拒绝。
+ *   把报告解析成模块/变体/产物事实；版本仅记录，执行能力由报告形状验证。
  *
- * 解析器只固定"已观测到的报告形状 + 版本门"，不猜其他版本；实现为本项目原创代码，
+ * 解析器固定执行所需的报告形状，不以未知 major/minor 拒绝；实现为本项目原创代码，
  * 不复制旧仓库源码（旧包授权依据仍在待决项 D3）。
  */
 
@@ -24,6 +24,10 @@ export interface StaticProjectFacts {
   readonly projectRoot: string
   readonly leads: readonly ProjectLead[]
   readonly missing: readonly string[]
+  /** Candidate-directory budget exhausted; unscanned entries are unknown, not absent. */
+  readonly truncated: boolean
+  /** Read failures and scan limits; missing only describes completely checked scopes. */
+  readonly diagnostics: readonly string[]
   readonly provenance: 'static-text'
   readonly verified: false
 }
@@ -56,18 +60,18 @@ export interface DynamicProjectFacts {
 }
 
 export const STATIC_LEAD_LIMIT = 50
-export const CLI_VERSION_POLICY = 'android-cli-1.0.x'
+export const CLI_VERSION_POLICY = 'stable-semver + validated-describe'
 /** 观测有效期：过期必须重新发现，不能把旧模型套到新批准上。 */
 export const OBSERVATION_TTL_MS = 5 * 60 * 1000
 
-/** `android --version` 的支持线；只接受 1.0.x 的稳定数字版本。 */
+/** `android --version` 的事实格式：稳定 semver（可带 build metadata），不是版本白名单。 */
 export function parseAndroidCliVersion(output: string): string | undefined {
   const text = output.trim()
-  return /^1\.0\.\d+$/u.test(text) ? text : undefined
+  return /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u.test(text) ? text : undefined
 }
 
 /**
- * 解析 Android CLI 1.0.x `describe` 报告。
+ * 解析 Android CLI `describe` 的执行相关结构；无关扩展行可以保留。
  *
  * 报告是行式的：锚点行 + 缩进的 Task/Variant/APK 三级结构。
  * 任何锚点缺失、重复、路径非绝对或形状不符都抛错——宁可不可用，不猜。
@@ -81,22 +85,35 @@ export function parseAndroidCliDescribe(
   const expectedWrapper = paths.gradleWrapperPath(canonicalProjectRoot)
   if (!paths.isAbsoluteHostPath(expectedWrapper)) throw new TypeError('Gradle wrapper path must be absolute')
 
-  if (!lines.includes(`Target project directory: ${canonicalProjectRoot}`)) {
-    throw new TypeError('Android CLI describe target does not match the requested project root')
-  }
-  if (!lines.includes(`Project directory exists: ${canonicalProjectRoot}`)) {
-    throw new TypeError('Android CLI did not confirm the requested project directory')
-  }
-  if (!lines.includes('Parsed tasks:')) throw new TypeError('Android CLI report is missing its task section')
-  if (!lines.includes('gradlew completed successfully.')) {
-    throw new TypeError('Android CLI did not complete Gradle description successfully')
+  const anchors = [
+    `Target project directory: ${canonicalProjectRoot}`,
+    `Project directory exists: ${canonicalProjectRoot}`,
+    'Parsed tasks:',
+    'gradlew completed successfully.',
+  ]
+  const errors = ['target does not match the requested project root', 'did not confirm the requested project directory', 'report is missing its task section', 'did not complete Gradle description successfully']
+  const positions = anchors.map((anchor, index) => {
+    const position = lines.indexOf(anchor)
+    if (position < 0) throw new TypeError(`Android CLI ${errors[index]}`)
+    const prefix = index < 2 ? anchor.slice(0, anchor.indexOf(':') + 1) : anchor
+    if (lines.filter((line) => line.startsWith(prefix)).length !== 1) {
+      throw new TypeError(`Android CLI reported duplicate or conflicting anchor: ${prefix}`)
+    }
+    return position
+  })
+  if (positions.some((position, index) => index > 0 && position <= positions[index - 1]!)) {
+    throw new TypeError('Android CLI report anchors are out of order')
   }
 
   const modules = new Map<string, { path: string; variants: Map<string, AndroidArtifactFact[]> }>()
   let currentModule: { path: string; variants: Map<string, AndroidArtifactFact[]> } | undefined
   let currentVariant: AndroidArtifactFact[] | undefined
-  for (const line of lines) {
-    const task = /^Task: (:[^\s]+)$/u.exec(line)
+  for (const [index, line] of lines.entries()) {
+    const structural = /^\s*(?:Task|Variant|APK):/u.test(line)
+    if (structural && (index <= positions[2]! || index >= positions[3]!)) {
+      throw new TypeError('Android CLI task structure is outside its task section')
+    }
+    const task = /^Task: (:[^:\s]+(?::[^:\s]+)*)$/u.exec(line)
     if (task !== null) {
       const path = task[1] as string
       if (modules.has(path)) throw new TypeError(`Android CLI reported duplicate module ${path}`)
@@ -124,9 +141,14 @@ export function parseAndroidCliDescribe(
         throw new TypeError(`Android CLI reported a non-absolute APK path: ${path}`)
       }
       currentVariant.push({ kind: 'apk', path })
+      continue
     }
+    if (structural) throw new TypeError(`Android CLI reported malformed task structure: ${line}`)
   }
   if (modules.size === 0) throw new TypeError('Android CLI describe report declared no modules')
+  for (const module of modules.values()) {
+    if (module.variants.size === 0) throw new TypeError(`Android CLI module has no variants: ${module.path}`)
+  }
 
   return {
     gradleWrapper: expectedWrapper,
@@ -216,12 +238,22 @@ export async function inspectStaticProject(params: {
   const rootPath = projectRoot
   const leads: ProjectLead[] = []
   const missing: string[] = []
+  const diagnostics: string[] = []
+  const unreadable = new Set<string>()
+  let truncated = false
 
   const resolveIn = async (relative: string) => fs.resolve(relative, { cwd: rootPath, signal })
   const exists = async (relative: string): Promise<string | undefined> => {
-    const target = await resolveIn(relative)
-    const info = await fs.stat(target, signal)
-    return info ? fs.processPath(target) : undefined
+    try {
+      const target = await resolveIn(relative)
+      const info = await fs.stat(target, signal)
+      return info ? fs.processPath(target) : undefined
+    } catch (error) {
+      if (signal.aborted || (error instanceof Error && error.name === 'AbortError')) throw error
+      unreadable.add(relative)
+      diagnostics.push(`Could not inspect ${relative}: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    }
   }
 
   for (const [kind, relative, detail] of [
@@ -235,19 +267,24 @@ export async function inspectStaticProject(params: {
     const found = await exists(relative)
     if (found) leads.push({ kind, path: found, detail })
   }
-  if (!leads.some((lead) => lead.kind === 'wrapper')) missing.push('gradlew')
+  if (!leads.some((lead) => lead.kind === 'wrapper') && !unreadable.has('gradlew') && !unreadable.has('gradlew.bat')) missing.push('gradlew')
 
   let entries: readonly { name: string; type: string }[] = []
   try {
     entries = await fs.listDir(await resolveIn('.'), signal)
-  } catch {
-    entries = []
+  } catch (error) {
+    if (signal.aborted || (error instanceof Error && error.name === 'AbortError')) throw error
+    diagnostics.push(`Could not list candidate directories: ${error instanceof Error ? error.message : String(error)}`)
   }
   let inspected = 0
   for (const entry of entries) {
-    if (inspected >= STATIC_LEAD_LIMIT) break
     if (entry.type !== 'directory') continue
     if (entry.name.startsWith('.') || entry.name === 'build' || entry.name === 'node_modules') continue
+    if (inspected >= STATIC_LEAD_LIMIT) {
+      truncated = true
+      diagnostics.push(`Candidate-directory scan truncated after ${STATIC_LEAD_LIMIT}; remaining directories were not inspected`)
+      break
+    }
     inspected += 1
     for (const candidate of ['build.gradle', 'build.gradle.kts']) {
       const found = await exists(`${entry.name}/${candidate}`)
@@ -260,12 +297,14 @@ export async function inspectStaticProject(params: {
       break
     }
   }
-  if (!leads.some((lead) => lead.kind === 'module-dir')) missing.push('module build files')
+  if (!truncated && diagnostics.length === 0 && !leads.some((lead) => lead.kind === 'module-dir')) missing.push('module build files')
 
   return Object.freeze({
     projectRoot: rootPath,
     leads: Object.freeze(leads),
     missing: Object.freeze(missing),
+    truncated,
+    diagnostics: Object.freeze(diagnostics),
     provenance: 'static-text',
     verified: false,
   })

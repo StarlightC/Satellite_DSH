@@ -7,11 +7,11 @@
 import { lstat, realpath } from 'node:fs/promises'
 import { randomBytes } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { runBounded, type BoundedRunResult } from '../../lib/bounded-process.ts'
 import type { SandboxLike, SubprocessLike } from '../../lib/process-contracts.ts'
-import { deny, literalPath, parseGitRequest, validateAttributes, type GitRequest } from './version-control-input.ts'
-import { inside, observeRepository, type RepositoryState } from './version-control-repository.ts'
+import { deny, literalPath, parseGitRequest, type GitRequest } from './version-control-input.ts'
+import { inside, noSymlinkAncestors, observeRepository, type RepositoryState } from './version-control-repository.ts'
 
 export interface LocalGitDependencies {
   readonly workspaceRoot: string
@@ -42,6 +42,7 @@ export interface LocalGitResult {
   message?: string
   stdout?: string
   stderr?: string
+  stagedGitlinks?: string
   stdoutTruncated?: boolean
   stderrTruncated?: boolean
   exitCode?: number | null
@@ -74,6 +75,9 @@ const FIXED = [
   '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'core.autocrlf=false',
   '-c', 'core.safecrlf=false', '-c', 'core.attributesFile=/dev/null',
 ]
+// Model-visible output stays small. Internal index/approval reads need complete
+// content, not the display budget; exceeding this memory budget blocks explicitly.
+const DISPLAY_BYTES = 128 * 1024, INTERNAL_BYTES = 16 * 1024 * 1024
 const TTL = 5 * 60_000
 type Snapshot = FrozenSnapshot
 const expired = (snapshot: Snapshot): boolean => snapshot.expiresAt <= Date.now() || snapshot.deadline <= performance.now()
@@ -150,7 +154,7 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
             if (write && (!writeSnapshot || expired(writeSnapshot))) deny('write snapshot expired')
             signal.throwIfAborted()
           }
-          const run = async (args: string[], write = false): Promise<BoundedRunResult> => {
+          const run = async (args: string[], write = false, outputMaxBytes = DISPLAY_BYTES): Promise<BoundedRunResult> => {
             const argv = fullArgv(args)
             let launched = false
             // Once a write enters the provider boundary, a lost launch/result cannot
@@ -165,7 +169,7 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
               const result = await runBounded({ sandbox: deps.sandbox, subprocess }, {
                 executable: argv[0]!, args: argv.slice(1), cwd: state.root,
                 mode: write ? 'workspace-write' : 'read-only', workspaceRoot: deps.workspaceRoot,
-                sessionId: deps.sessionId, ...(write && writableRoots ? { additionalWritableRoots: writableRoots } : {}), timeoutMs: 30_000, outputMaxBytes: 128 * 1024,
+                sessionId: deps.sessionId, ...(write && writableRoots ? { additionalWritableRoots: writableRoots } : {}), timeoutMs: 30_000, outputMaxBytes,
                 // Final freeze AFTER the last confinement await; spawn follows synchronously.
                 beforeSpawn: () => check(write),
               }, signal)
@@ -180,8 +184,9 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
               throw error
             }
           }
-          const read = async (args: string[], allowed = [0]): Promise<BoundedRunResult> => {
-            const result = await run(args)
+          const read = async (args: string[], allowed = [0], outputMaxBytes = DISPLAY_BYTES): Promise<BoundedRunResult> => {
+            const result = await run(args, false, outputMaxBytes)
+            if (result.stdout.truncated || result.stderr.truncated) deny(`complete Git output exceeds ${outputMaxBytes}-byte ${outputMaxBytes === DISPLAY_BYTES ? 'display' : 'internal index/approval'} budget; no snapshot/approval from truncated content`)
             if (result.aborted || result.timedOut || result.cleanup !== 'completed' || result.failureDetail || result.stdout.truncated || result.stderr.truncated || !allowed.includes(result.exitCode ?? -1)) deny(`read failed: ${JSON.stringify(result)}`)
             return result
           }
@@ -189,18 +194,21 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           const headResult = await read(['rev-parse', '--verify', '--quiet', 'HEAD'], [0, 1])
           const head = headResult.exitCode === 1 ? null : headResult.stdout.text.trim()
           if (head !== null && !/^[a-f0-9]{40}$/.test(head)) deny('unsupported HEAD/object format')
-          const manifest = (await read(['ls-files', '--stage', '-z'])).stdout.text
+          const manifest = (await read(['ls-files', '--stage', '-z'], [0], INTERNAL_BYTES)).stdout.text
           const index: IndexEntry[] = manifest.split('\0').filter(Boolean).map(line => {
-            const match = /^(100644|100755) ([a-f0-9]{40}) 0\t(.+)$/.exec(line)
-            if (!match) deny('conflicted/special index entry (including gitlink/symlink)')
+            const match = /^(100644|100755|120000|160000) ([a-f0-9]{40}) 0\t(.+)$/.exec(line)
+            if (!match) deny('conflicted or unsupported index entry')
             return { mode: match[1]!, oid: match[2]!, path: literalPath(match[3]!) }
           })
-          for (const entry of index.filter(e => e.path.split('/').at(-1)!.toLowerCase() === '.gitattributes')) {
-            validateAttributes((await read(['show', `:${entry.path}`])).stdout.text)
-          }
           const validatePaths = async (paths: readonly string[], staging = true): Promise<void> => {
             for (const path of paths) {
-              // Full-tree scan rejects symlink ancestors and special files, even unrelated ones.
+              if (index.some(e => e.mode === '160000' && (e.path === path || path.startsWith(`${e.path}/`)))) {
+                if (staging) deny(`staging submodule HEAD/content is unsupported without observing its separate metadata: ${path}`)
+                continue
+              }
+              // Ordinary symlinks are leaves, never path traversal aliases.
+              try { await noSymlinkAncestors(dirname(join(state.root, path))) }
+              catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
               if (!state.files.has(path)) {
                 if (staging && !index.some(e => e.path === path)) deny(`not a regular file or explicit tracked deletion: ${path}`)
                 try { await lstat(join(state.root, path)); deny('deleted path resolves to existing alias/directory') }
@@ -211,12 +219,16 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           }
           if (r.action === 'status') {
             const result = await read(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all'])
+            // status's ignore=all avoids reading a submodule's external gitdir but
+            // hides staged gitlinks too. Cached raw diff reads only our own index/tree.
+            const stagedGitlinks = head !== null || index.some(e => e.mode === '160000')
+              ? (await read(['diff', '--cached', '--raw', '--no-abbrev', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--'], [0], INTERNAL_BYTES)).stdout.text.split('\n').filter(line => /^:(?:160000 |[0-9]{6} 160000 )/.test(line)).join('\n') : ''
             await check()
             for (const [key, snap] of snapshots) if (expired(snap)) snapshots.delete(key)
             if (snapshots.size >= 32) snapshots.delete(snapshots.keys().next().value!)
             const token = randomBytes(32).toString('hex'), expiresAt = Date.now() + TTL
             snapshots.set(token, { state, head, policy: initialPolicy, workspaceRoot: deps.workspaceRoot, expiresAt, deadline: performance.now() + TTL, owner })
-            return { status: 'succeeded', action: r.action, stdout: result.stdout.text, expectedSnapshot: token, snapshot: { head, indexDigest: state.indexDigest, digest: state.digest, expiresAt } }
+            return { status: 'succeeded', action: r.action, stdout: result.stdout.text, ...(stagedGitlinks ? { stagedGitlinks } : {}), expectedSnapshot: token, snapshot: { head, indexDigest: state.indexDigest, digest: state.digest, expiresAt } }
           }
           if (r.action === 'log') {
             const stdout = head === null ? '' : (await read(['log', `-${r.count}`, '--format=medium', '--no-decorate', '--no-show-signature', 'HEAD', '--'])).stdout.text
@@ -224,7 +236,7 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           }
           if (r.action === 'diff') {
             if (r.paths) await validatePaths(r.paths, false)
-            const result = await read(['diff', ...(r.target === 'staged' ? ['--cached'] : []), '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=all', '--', ...(r.paths ?? [])])
+            const result = await read(['diff', ...(r.target === 'staged' ? ['--cached'] : []), '--no-ext-diff', '--no-textconv', '--no-renames', r.target === 'staged' ? '--ignore-submodules=none' : '--ignore-submodules=all', '--submodule=short', '--', ...(r.paths ?? [])])
             return { status: 'succeeded', action: r.action, stdout: result.stdout.text }
           }
           // single-use even on denial/change/cancellation
@@ -242,9 +254,9 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
             args = ['add', '--', ...r.paths]
           } else {
             if (!index.length) deny('empty index')
-            const changed = await read(['diff', '--cached', '--quiet', '--no-ext-diff', '--no-textconv', '--ignore-submodules=all', '--'], [0, 1])
+            const changed = await read(['diff', '--cached', '--quiet', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--'], [0, 1])
             if (changed.exitCode === 0) deny('no staged change')
-            indexPatch = (await read(['diff', '--cached', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=all', '--'])).stdout.text
+            indexPatch = (await read(['diff', '--cached', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', '--no-renames', '--ignore-submodules=none', '--submodule=short', '--'], [0], INTERNAL_BYTES)).stdout.text
             args = ['commit', '--no-gpg-sign', '--no-verify', '-m', r.message]
           }
           const argv = fullArgv(args)
@@ -252,10 +264,9 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
             action: r.action, repository: state.root, layout: state.layout, ...(writableRoots ? { additionalWritableRoots: writableRoots } : {}), identity: state.identity, head, indexDigest: state.indexDigest,
             treeDigest: state.digest, configDigest: state.configDigest, attributesDigest: state.attributesDigest,
             argv, owner, policy: initialPolicy,
-            ...(r.action === 'stage' ? { targets: r.paths.map(path => ({ path, digest: state.files.get(path) ?? null })) } : { entireIndex: index, indexPatch }),
+            ...(r.action === 'stage' ? { targets: r.paths.map(path => ({ path, digest: state.files.get(path) ?? null, ...(state.fileKinds.get(path) ?? {}) })) } : { entireIndex: index, indexPatch }),
           }
           const reason = `Local Git exact one-shot write; no remote operation. Commit covers the ENTIRE actual index.${writableRoots ? ` Also grants this one call write access to the linked worktree's shared Git directory ${writableRoots[0]} (outside the workspace).` : ''}\n${JSON.stringify(plan)}`
-          if (Buffer.byteLength(reason) > 64 * 1024) deny('approval plan too large; do not truncate')
           await check(true)
           // Capability probe is side-effect free; never ask approval for an unenforceable write.
           // Same policy shape as the real write run (incl. the exact external commondir grant).

@@ -134,10 +134,12 @@ When a component's configuration shape changes:
   written into a profile; a sparse profile keeps meaning "user chose this", not
   "snapshot of today's default".
 - **Never guess deployment defaults.** If the effective default cannot be read for
-  the layer in question, say it is unknown and refuse the edit; do not invent a
-  provider/model pair or silently fall back to one.
+  the layer being changed, report the missing fact and pause only the edit that
+  depends on it; do not invent a provider/model pair or silently fall back to one.
 - **Respect layer replacement.** Later configuration layers replace a whole row's
   config rather than deep-merging; keep the rest of that row intact when overriding
   one field.
-- **Fail closed on unknown shapes.** A layer whose schema or default cannot be read
-  is not editable by guesswork.
+- **Do not migrate a layer by guesswork.** Stop the affected migration when its
+  schema or necessary default cannot be established: replacing that row could lose
+  user choices. This is not a general rejection rule for unknown configuration or
+  unrelated supported workflows; apply the shared restriction-design principles.

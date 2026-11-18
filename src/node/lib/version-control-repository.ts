@@ -1,9 +1,9 @@
 /** Bounded host-shared repository observation. No filesystem writes. */
 import { constants } from 'node:fs'
-import { lstat, open, readdir, realpath } from 'node:fs/promises'
+import { lstat, open, readdir, readlink, realpath } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { deny, literalPath, validateAttributes, validateLocalConfig } from './version-control-input.ts'
+import { deny, literalPath, validateLocalConfig } from './version-control-input.ts'
 
 export const digest = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex')
 export const inside = (root: string, path: string): boolean => path === root || (!relative(root, path).startsWith(`..${sep}`) && relative(root, path) !== '..' && !isAbsolute(relative(root, path)))
@@ -19,7 +19,7 @@ export async function regularBytes(path: string, maxBytes: number): Promise<Buff
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
     const before = await handle.stat()
-    if (!before.isFile() || before.nlink !== 1 || before.size > maxBytes) deny('special, hardlinked or oversized file')
+    if (!before.isFile() || before.nlink !== 1 || before.size > maxBytes) deny('special, hardlinked metadata or oversized file')
     // Fixed-size read: concurrent growth cannot turn this into an unbounded allocation.
     const bytes = Buffer.alloc(before.size + 1)
     let offset = 0
@@ -33,12 +33,12 @@ export async function regularBytes(path: string, maxBytes: number): Promise<Buff
     return bytes.subarray(0, offset)
   } finally { await handle.close() }
 }
-/** Streamed sha256 of a regular single-link file; same identity checks as regularBytes, no size cap. */
-export async function regularDigest(path: string): Promise<string> {
+/** Streamed full-content sha256; ordinary hardlinks are data, metadata aliases are refused. */
+export async function regularDigest(path: string, metadata = true): Promise<string> {
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
     const before = await handle.stat()
-    if (!before.isFile() || before.nlink !== 1) deny('special or hardlinked file')
+    if (!before.isFile() || (metadata && before.nlink !== 1)) deny('special or hardlinked metadata')
     const hash = createHash('sha256'), chunk = Buffer.alloc(Math.min(1024 * 1024, before.size + 1))
     // Read at most size+1 bytes: growth is detected without unbounded reading.
     let offset = 0
@@ -72,6 +72,7 @@ export interface RepositoryState {
   attributesDigest: string
   indexDigest: string | null
   files: Map<string, string>
+  fileKinds: Map<string, { mode: number; linkTextBase64?: string }>
   locks: string[]
 }
 async function canonicalDirectory(path: string, label: string): Promise<import('node:fs').Stats> {
@@ -129,7 +130,7 @@ export async function observeRepository(workspaceRoot: string, repo: string): Pr
   // Private metadata is addressed as `.git/...` in both layouts: for a linked worktree
   // its gitdir is `.git/worktrees/<name>` inside the scanned common directory.
   const privatePrefix = layout.kind === 'main' ? '.git' : `.git/worktrees/${basename(layout.gitDir)}`
-  const records: unknown[] = [['layout', layout.kind, layout.worktreeRoot, layout.gitDir, layout.commonDir, gitfile ?? null]], attributes: unknown[] = [], files = new Map<string, string>(), locks: string[] = []
+  const records: unknown[] = [['layout', layout.kind, layout.worktreeRoot, layout.gitDir, layout.commonDir, gitfile ?? null]], attributes: unknown[] = [], files = new Map<string, string>(), fileKinds: RepositoryState['fileKinds'] = new Map(), locks: string[] = []
   let config: string | undefined, indexDigest: string | null = null
   const walk = async (directory: string, prefix: string, metadata: boolean): Promise<void> => {
     const before = await lstat(directory)
@@ -148,27 +149,47 @@ export async function observeRepository(workspaceRoot: string, repo: string): Pr
       const lower = rel.toLowerCase(), lowerName = name.toLowerCase()
       const worktreeEntry = /^\.git\/worktrees\/[^/]+\/(.+)$/.exec(lower)?.[1]
       if (metadata && ['.git/config', `${privatePrefix}/index`.toLowerCase()].includes(lower) && rel !== lower && rel !== `${privatePrefix}/index`) deny('noncanonical reserved metadata alias')
-      if (!metadata && (lowerName === '.git' || lowerName === '.gitmodules')) deny('nested repository/submodule unsupported')
-      if (metadata && (['.git/commondir', '.git/gitdir', '.git/shallow', '.git/objects/info/alternates', '.git/objects/info/http-alternates', '.git/info/grafts', '.git/config.worktree', '.git/modules'].includes(lower) || worktreeEntry === 'config.worktree' || worktreeEntry === 'shallow' || worktreeEntry?.startsWith('modules') || lowerName.endsWith('.promisor') || lowerName.startsWith('sharedindex.'))) deny(`unsupported repository metadata ${rel}`)
+      // Nested repository metadata is another domain: do not recurse or follow gitfiles.
+      if (!metadata && lowerName === '.git') {
+        const st = await lstat(path)
+        records.push([rel, 'nested-metadata-not-followed', st.dev, st.ino, st.mode, st.size, st.mtimeMs, st.ctimeMs])
+        continue
+      }
+      if (metadata && (['.git/commondir', '.git/gitdir', '.git/objects/info/alternates', '.git/objects/info/http-alternates', '.git/info/grafts', '.git/config.worktree'].includes(lower) || worktreeEntry === 'config.worktree' || lowerName.endsWith('.promisor') || lowerName.startsWith('sharedindex.'))) deny(`unsupported repository metadata ${rel}`)
       const st = await lstat(path)
+      if (metadata && (lower === '.git/modules' || worktreeEntry === 'modules')) {
+        if (!st.isDirectory() || st.isSymbolicLink()) deny('submodule metadata must be an ordinary directory')
+        records.push([rel, 'submodule-metadata-not-recursed', st.dev, st.ino, st.mode])
+        continue
+      }
+      if (!metadata && st.isSymbolicLink()) {
+        // Never open the referent, even for directory links or .gitattributes.
+        // Git-gitattributes(5) likewise never follows worktree attribute symlinks.
+        const link = await readlink(path, { encoding: 'buffer' }), after = await lstat(path)
+        if (st.dev !== after.dev || st.ino !== after.ino || st.mode !== after.mode || st.size !== after.size || st.mtimeMs !== after.mtimeMs || st.ctimeMs !== after.ctimeMs) deny('symlink changed while observing')
+        const hash = digest(link)
+        literalPath(rel); files.set(rel, hash); fileKinds.set(rel, { mode: st.mode, linkTextBase64: link.toString('base64') })
+        records.push([rel, 'symlink', st.dev, st.ino, st.mode, st.size, st.mtimeMs, st.ctimeMs, hash])
+        continue
+      }
       if (st.isDirectory() && !st.isSymbolicLink()) {
         records.push([rel, 'directory', st.dev, st.ino, st.mode])
         await walk(path, rel, metadata)
       } else {
-        if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1) deny(`special path ${rel}`)
-        // Only config/attributes are parsed and therefore buffered; everything else is streamed.
-        const parsed = lower === '.git/config' || (!metadata && lowerName === '.gitattributes') || lower === '.git/info/attributes'
-        const content = parsed ? await regularBytes(path, Number.MAX_SAFE_INTEGER) : undefined
-        const hash = content ? digest(content) : await regularDigest(path)
+        if (!st.isFile() || st.isSymbolicLink() || (metadata && st.nlink !== 1)) deny(`special path or hardlinked metadata ${rel}`)
+        // Only config needs parsing. Attributes/macros are data: executable filter
+        // definitions are controlled in config, for worktree/info/index sources alike.
+        const content = lower === '.git/config' ? await regularBytes(path, Number.MAX_SAFE_INTEGER) : undefined
+        const hash = content ? digest(content) : await regularDigest(path, metadata)
         records.push([rel, st.dev, st.ino, st.mode, st.size, st.mtimeMs, st.ctimeMs, hash])
         if (!metadata) {
           literalPath(rel)
-          files.set(rel, hash)
+          files.set(rel, hash); fileKinds.set(rel, { mode: st.mode })
         }
         if (lower === '.git/config') { config = content!.toString('utf8'); validateLocalConfig(config) }
         if (rel === `${privatePrefix}/index`) indexDigest = hash
         if ((!metadata && lowerName === '.gitattributes') || lower === '.git/info/attributes') {
-          validateAttributes(content!.toString('utf8')); attributes.push([rel, hash])
+          attributes.push([rel, hash])
         }
         if (metadata && lowerName.endsWith('.lock')) locks.push(rel)
       }
@@ -187,5 +208,5 @@ export async function observeRepository(workspaceRoot: string, repo: string): Pr
   }
   if (config === undefined) deny('local config required')
   const ids = [rootStat.dev, rootStat.ino, gitStat.dev, gitStat.ino, commonStat.dev, commonStat.ino]
-  return { root, layout, identity: JSON.stringify([layout.kind, root, layout.gitDir, layout.commonDir, ...ids]), lockKey: JSON.stringify([commonStat.dev, commonStat.ino]), digest: digest(JSON.stringify(records)), configDigest: digest(config), attributesDigest: digest(JSON.stringify(attributes)), indexDigest, files, locks }
+  return { root, layout, identity: JSON.stringify([layout.kind, root, layout.gitDir, layout.commonDir, ...ids]), lockKey: JSON.stringify([commonStat.dev, commonStat.ino]), digest: digest(JSON.stringify(records)), configDigest: digest(config), attributesDigest: digest(JSON.stringify(attributes)), indexDigest, files, fileKinds, locks }
 }

@@ -147,6 +147,7 @@ function fakeFs({ files = { ...APPLE_FILES, [`${ROOT}/app.apk`]: 128 } } = {}) {
 function harness({
   mode = 'workspace-write', approval = 'allowed-once', devicesOut = DEVICES_L, getpropOut = GETPROP,
   exitCode = 0, files, enabled = true, adbPath = '/usr/bin/adb',
+  installStdout = 'Success', installStderr = '', installExitCode = exitCode, installTimeout = false, installSignal = null,
 } = {}) {
   const calls = { spawn: [], approvals: [] }
   const state = { devicesOut, getpropOut }
@@ -163,13 +164,16 @@ function harness({
         const isGetprop = spec.argv.includes('getprop')
         const isDevices = spec.argv.includes('devices')
         const isDumpsys = spec.argv.includes('dumpsys')
+        const isInstall = spec.argv.includes('install')
         const text = isGetprop ? state.getpropOut : isDevices ? state.devicesOut
-          : isDumpsys ? 'mResumedActivity: ActivityRecord{x u0 com.example.app/.MainActivity t1}' : 'Success'
+          : isDumpsys ? 'mResumedActivity: ActivityRecord{x u0 com.example.app/.MainActivity t1}' : isInstall ? installStdout : 'Success'
         return {
-          done: Promise.resolve({ exitCode, signal: null }), terminate() {}, async waitForExit() { return true },
+          done: isInstall && installTimeout
+            ? new Promise(resolve => spec.signal.addEventListener('abort', () => resolve({ exitCode: null, signal: 'SIGTERM' }), { once: true }))
+            : Promise.resolve({ exitCode: isInstall ? installExitCode : exitCode, signal: isInstall ? installSignal : null }), terminate() {}, async waitForExit() { return true },
           collected: {
             stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
-            stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+            stderr: { readFrom: () => ({ text: isInstall ? installStderr : '', nextOffset: isInstall ? installStderr.length : 0, lossy: false }) },
           },
         }
       },
@@ -179,7 +183,7 @@ function harness({
   const ctx = { get: (name) => services[name], tools: { register: (tool) => { tools[tool.name] = tool; return () => {} } }, effect: () => () => {} }
   // 传 null 表示"显式不配置"（传 undefined 会命中默认参数）。
   const config = resolveExecutionConfig({
-    execution: { enabled, ...(adbPath === null ? {} : { adbPath }) },
+    execution: { enabled, ...(adbPath === null ? {} : { adbPath }), ...(installTimeout ? { operationTimeoutMs: 1000 } : {}) },
   })
   registerAndroidExecutionTools(ctx, () => config)
   const exec = { agent: { id: 'caller-a', session: { header: { id: 'caller-a', cwd: ROOT } } }, callId: 'call-1', signal: new AbortController().signal }
@@ -594,4 +598,71 @@ test('同一目标被占用时旅程/采集的准备阶段立即 busy，不排�
       assert.match(result.outcome.error.message, /already using/)
     }
   }
+})
+
+
+// Production path: tool -> observed target + device lock -> runInstall -> adbRun.
+// Real adb signature failures live on stderr, not the historical stdout-only field.
+test('安装 stderr 签名冲突保留两流和真实 INSTALL_FAILED_*，不当作工具能力缺失', async () => {
+  const stderr = 'adb: failed to install app.apk: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package signatures do not match]'
+  const h = harness({ installStdout: 'Performing Streamed Install', installStderr: stderr, installExitCode: 1 })
+  const observed = await h.tools[DEVICE_TOOL].execute({ action: 'discover', serial: 'emulator-5554' }, h.exec)
+  const result = await h.tools[DEVICE_TOOL].execute({ action: 'install', serial: 'emulator-5554', observationId: observed.observationId, artifact: 'app.apk' }, h.exec)
+  assert.equal(result.status, 'failed')
+  assert.equal(result.error.code, 'INSTALL_FAILED')
+  assert.equal(result.installFailureCode, 'INSTALL_FAILED_UPDATE_INCOMPATIBLE')
+  assert.equal(result.stderr, stderr)
+  assert.equal(result.stdout, 'Performing Streamed Install')
+  assert.equal(result.exitCode, 1)
+  assert.equal(result.truncated, false)
+  assert.match(result.error.message, /matching key/)
+  assert.match(result.error.message, /loses its app data/)
+  assert.equal(h.calls.spawn.filter(spec => spec.argv.includes('install')).length, 1)
+  assert.equal(h.calls.spawn.some(spec => spec.argv.includes('uninstall')), false)
+})
+
+test('安装 stdout Success 才确认成功；exit0 Failure 或双流混合 Success/Failure 不成功', async () => {
+  for (const fixture of [
+    { installStdout: 'Performing Streamed Install\nSuccess\n', expected: 'succeeded' },
+    { installStdout: 'Failure [INSTALL_FAILED_INVALID_APK]', expected: 'failed' },
+    { installStdout: 'Success', installStderr: 'Failure [INSTALL_FAILED_VERSION_DOWNGRADE]', expected: 'failed' },
+  ]) {
+    const h = harness(fixture)
+    const observed = await h.tools[DEVICE_TOOL].execute({ action: 'discover', serial: 'emulator-5554' }, h.exec)
+    const result = await h.tools[DEVICE_TOOL].execute({ action: 'install', serial: 'emulator-5554', observationId: observed.observationId, artifact: 'app.apk' }, h.exec)
+    assert.equal(result.status, fixture.expected, JSON.stringify(result))
+    assert.equal(result.exitCode, 0)
+    assert.equal(result.stdout, fixture.installStdout)
+    assert.equal(result.stderr, fixture.installStderr ?? '')
+    assert.equal(h.calls.spawn.filter(spec => spec.argv.includes('install')).length, 1)
+    const argv = h.calls.spawn.at(-1).argv
+    assert.deepEqual(argv, ['/usr/bin/adb', '-s', 'emulator-5554', 'install', '-r', '/project/app.apk'])
+  }
+})
+
+test('安装 signal-only 终止保留 signal/两流并标记效果未知，不自动重试', async () => {
+  for (const installSignal of ['SIGKILL', 'SIGTERM']) {
+    const h = harness({ installSignal, installExitCode: null, installStdout: 'Performing Streamed Install', installStderr: 'package manager pending' })
+    const observed = await h.tools[DEVICE_TOOL].execute({ action: 'discover', serial: 'emulator-5554' }, h.exec)
+    const result = await h.tools[DEVICE_TOOL].execute({ action: 'install', serial: 'emulator-5554', observationId: observed.observationId, artifact: 'app.apk' }, h.exec)
+    assert.equal(result.status, 'effect-unknown')
+    assert.equal(result.error.code, 'EFFECT_UNKNOWN')
+    assert.equal(result.exitCode, null)
+    assert.equal(result.signal, installSignal)
+    assert.equal(result.stdout, 'Performing Streamed Install')
+    assert.equal(result.stderr, 'package manager pending')
+    assert.match(result.error.message, /No automatic retry/)
+    assert.equal(h.calls.spawn.filter(spec => spec.argv.includes('install')).length, 1)
+  }
+})
+
+test('安装已启动后 timeout 保留两流与效果未知，不自动重试', async () => {
+  const h = harness({ installTimeout: true, installStdout: 'Performing Streamed Install', installStderr: 'waiting for package manager' })
+  const observed = await h.tools[DEVICE_TOOL].execute({ action: 'discover', serial: 'emulator-5554' }, h.exec)
+  const result = await h.tools[DEVICE_TOOL].execute({ action: 'install', serial: 'emulator-5554', observationId: observed.observationId, artifact: 'app.apk' }, h.exec)
+  assert.equal(result.status, 'effect-unknown')
+  assert.equal(result.error.code, 'TIMEOUT')
+  assert.equal(result.stdout, 'Performing Streamed Install')
+  assert.equal(result.stderr, 'waiting for package manager')
+  assert.equal(h.calls.spawn.filter(spec => spec.argv.includes('install')).length, 1)
 })

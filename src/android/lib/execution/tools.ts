@@ -188,6 +188,10 @@ interface ProjectBinding {
   readonly sessionId?: string
   /** 工程根是否在会话工作区之外（外部工程）。 */
   readonly external: boolean
+  readonly additionalWritableRoots?: readonly string[]
+  /** Original path is re-resolved at approval and spawn boundaries (including aliases). */
+  readonly requestedPath: string
+  readonly sessionRoot: string
 }
 
 /**
@@ -200,8 +204,7 @@ interface ProjectBinding {
  * - 缺省：会话的不可变工作目录。
  * - 相对路径：会话工作区内的子目录。
  * - 绝对路径：允许工作区之外的工程；此时 `external: true`，写/执行类动作
- *   必须由调用方逐次取得宿主批准（沙箱没有"额外可写根"这一档，
- *   升级只能是一次性的 danger-full-access）。
+ *   必须逐次取得宿主批准，仅给本次 workspace-write 进程添加该工程的可写根。
  */
 async function bindProject(
   services: Services,
@@ -249,13 +252,13 @@ async function bindProject(
     workspaceRoot: policy.workspaceRoot,
     ...(policy.sessionId !== undefined ? { sessionId: policy.sessionId } : {}),
     external,
+    requestedPath: projectPath ?? hostRoot,
+    sessionRoot: fs.processPath(sessionTarget),
+    ...(policy.additionalWritableRoots !== undefined ? { additionalWritableRoots: policy.additionalWritableRoots } : {}),
   }
 }
 
-/**
- * 外部工程的逐次升级：沙箱只提供一次性 danger-full-access 这一档，
- * 因此必须由调用方明确要求并说明理由，再逐次向宿主申请批准。
- */
+/** Legacy escalation arguments remain accepted, but never select an unconfined mode. */
 interface Escalation {
   readonly justification: string
 }
@@ -264,34 +267,92 @@ function escalationGate(
   binding: ProjectBinding,
   action: string,
   request: { sandboxPermissions?: string; justification?: string },
+  exec: ScopedExecution,
 ): { ok: true; escalation?: Escalation } | { ok: false; outcome: OperationOutcome } {
   const wants = request.sandboxPermissions !== undefined || request.justification !== undefined
   if (!binding.external) {
-    if (wants) {
-      return { ok: false, outcome: blocked(action, 'ARGUMENT_INVALID', 'sandboxPermissions is only meaningful for a project outside the session workspace') }
-    }
+    if (wants) return { ok: false, outcome: blocked(action, 'ARGUMENT_INVALID', 'sandboxPermissions is only meaningful for a project outside the session workspace') }
     return { ok: true }
   }
-  if (!wants) {
-    return {
-      ok: false,
-      outcome: blocked(action, 'CAPABILITY_UNAVAILABLE',
-        `project ${binding.root} is outside the session workspace (${binding.workspaceRoot}); it needs a one-call escalation: `
-        + 'retry with sandboxPermissions:"danger-full-access" and a justification. The approval covers this one call only '
-        + '(its internal re-verification included); the next call needs its own approval.'),
+  const delegated = gateOf(exec)?.delegated
+  const handoff = delegated
+    ? ' Use satellite_parent_request for parent-owned discover-build of this project; a later parent build must use the parent-owned observation and its own approval. No child policy was changed.'
+    : ''
+  if (binding.mode === 'read-only') {
+    return { ok: false, outcome: blocked(action, 'PATH_DENIED', `Gradle writes project metadata; a read-only child/session cannot execute it.${handoff}`) }
+  }
+  // A call permit is not authority to exceed the existing call-gate root cap.
+  if (delegated && !(binding.additionalWritableRoots ?? []).includes(binding.root)) {
+    return { ok: false, outcome: blocked(action, 'PATH_DENIED', `the external project exceeds the delegated child writable roots.${handoff}`) }
+  }
+  if (request.sandboxPermissions !== undefined
+    && !['workspace-write', 'danger-full-access'].includes(request.sandboxPermissions)) {
+    return { ok: false, outcome: blocked(action, 'ARGUMENT_INVALID', 'sandboxPermissions must be workspace-write (legacy danger-full-access is accepted but never removes confinement)') }
+  }
+  const justification = request.justification?.replace(/\s+/gu, ' ').trim() ?? 'execute this explicitly selected external project'
+  if (!justification) return { ok: false, outcome: blocked(action, 'ARGUMENT_INVALID', 'justification must not be empty') }
+  return { ok: true, escalation: { justification: justification.slice(0, 2000) } }
+}
+
+class ProjectBoundaryError extends Error {
+  constructor(readonly result: OperationOutcome) { super(result.error?.message); this.name = 'ProjectBoundaryError' }
+}
+
+/** The actual entry chain is approval -> confine(await) -> beforeSpawn -> spawn.
+ * Both approval and confinement can yield while policy or a project alias changes.
+ * Keep the check local to Gradle's execution seam; do not mutate a standing policy.
+ */
+async function checkProjectExecution(services: Services, binding: ProjectBinding, exec: ScopedExecution): Promise<void> {
+  const checkPolicy = () => {
+    const now = resolvePolicy(services.sandboxPolicy, exec.agent?.session)
+    if (!now || policyKey(now) !== policyKey(binding)) {
+      throw new ProjectBoundaryError(blocked('project', 'POLICY_CHANGED', 'session policy or writable roots changed; retry required'))
     }
   }
-  if (request.sandboxPermissions !== 'danger-full-access') {
-    return { ok: false, outcome: blocked(action, 'ARGUMENT_INVALID', 'sandboxPermissions must be "danger-full-access" (the only wider mode)') }
+  checkPolicy()
+  const target = await binding.fs.resolve(binding.requestedPath, { cwd: binding.sessionRoot, signal: exec.signal })
+  if ((await binding.fs.stat(target, exec.signal))?.type !== 'directory'
+    || binding.fs.processPath(target) !== binding.root) {
+    throw new ProjectBoundaryError(blocked('project', 'TARGET_CHANGED', 'project canonical directory changed; retry required'))
   }
-  const justification = typeof request.justification === 'string'
-    // 折叠空白与换行：justification 会原文进入批准理由，不能让模型用它伪造提示结构。
-    ? request.justification.replace(/\s+/gu, ' ').trim()
-    : ''
-  if (justification.length === 0) {
-    return { ok: false, outcome: blocked(action, 'ARGUMENT_INVALID', 'a non-empty justification is required with sandboxPermissions') }
+  if (binding.external) {
+    // Native confinement paths are host paths: require the provider's same-file mapping.
+    for (const path of [binding.root, binding.workspaceRoot]) {
+      if (binding.fs.processPathFromHostPath?.(path) !== path) {
+        throw new ProjectBoundaryError(blocked('project', 'CAPABILITY_UNAVAILABLE', `host/shared canonical mapping unavailable: ${path}`))
+      }
+      const current = await binding.fs.resolve(path, { signal: exec.signal })
+      if ((await binding.fs.stat(current, exec.signal))?.type !== 'directory' || binding.fs.processPath(current) !== path) {
+        throw new ProjectBoundaryError(blocked('project', 'TARGET_CHANGED', `canonical directory changed: ${path}`))
+      }
+    }
   }
-  return { ok: true, escalation: { justification: justification.slice(0, 2000) } }
+  checkPolicy()
+}
+
+function gradleEnvironment(binding: ProjectBinding, platform: SupportedPlatform, config: AndroidExecutionConfig) {
+  return {
+    GRADLE_USER_HOME: [binding.workspaceRoot, '.satellite', 'gradle-user-home'].join(platform.pathSeparator),
+    ANDROID_USER_HOME: [binding.workspaceRoot, '.satellite', 'android-user-home'].join(platform.pathSeparator),
+    ...(binding.external ? { GRADLE_OPTS: withDaemonDisabled(process.env.GRADLE_OPTS) } : {}),
+    ...(config.javaHome ? { JAVA_HOME: config.javaHome } : {}),
+  }
+}
+
+function gradleScope(binding: ProjectBinding) {
+  return {
+    mode: binding.external ? 'workspace-write' as const : binding.mode,
+    workspaceRoot: binding.workspaceRoot,
+    ...(binding.external ? { additionalWritableRoots: [binding.root] } : {}),
+    ...(binding.sessionId !== undefined ? { sessionId: binding.sessionId } : {}),
+  }
+}
+
+function describeGradleScope(binding: ProjectBinding, platform: SupportedPlatform, config: AndroidExecutionConfig, escalation?: Escalation) {
+  return ` This process only: file sandbox ${binding.external ? 'workspace-write' : binding.mode}, workspace ${binding.workspaceRoot}, `
+    + `additional writable roots ${JSON.stringify(binding.external ? [binding.root] : [])}; caches ${JSON.stringify(gradleEnvironment(binding, platform, config))}. `
+    + 'Gradle executes arbitrary project build scripts; file confinement does not isolate network or device effects. No standing policy or profile change.'
+    + (escalation ? ` Justification: ${escalation.justification}.` : '')
 }
 
 const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex')
@@ -747,16 +808,44 @@ async function runInstall(
     evidence[0] = { kind: 'artifact', source: artifact, digest: sha256(bytes) }
   }
   const installed = await adbRun(deps, ['install', '-r', path], 'install', { serial: identity.serial })
-  if (!installed.ok) return installed.outcome
-  const succeeded = installed.exitCode === 0 && /Success/iu.test(installed.text)
+  if (!installed.ok) {
+    // The process ran, but termination cannot prove the package manager made no change.
+    const interrupted = 'exitCode' in installed.outcome
+      && (installed.outcome.error?.code === 'TIMEOUT' || installed.outcome.status === 'cancelled')
+    return {
+      ...installed.outcome,
+      ...(interrupted ? {
+        status: 'effect-unknown',
+        error: { code: installed.outcome.error?.code ?? 'CANCELLED', message: 'adb install was interrupted; installation effects are unconfirmed. No automatic retry.' },
+      } : {}),
+      evidence: [...evidence, ...installed.outcome.evidence],
+    }
+  }
+  const streams = `${installed.stdout}\n${installed.stderr}`
+  const installFailureCode = streams.match(/\bINSTALL_FAILED_[A-Z0-9_]+\b/u)?.[0]
+  const reportedFailure = installFailureCode !== undefined || /\bFailure\b/iu.test(streams)
+  const succeeded = installed.exitCode === 0 && !reportedFailure && /^\s*Success\s*$/mu.test(installed.stdout)
+  const signatureAdvice = installFailureCode === 'INSTALL_FAILED_UPDATE_INCOMPATIBLE'
+    ? ' Use an APK signed with the matching key, or explicitly choose uninstalling the existing app (which loses its app data); no uninstall or retry was performed.'
+    : ''
   return {
     status: succeeded ? 'succeeded' : 'failed',
     action: 'install',
-    evidence,
+    evidence: [...evidence,
+      { kind: 'stdout', source: 'bounded adb install stdout', digest: sha256(installed.stdout) },
+      { kind: 'stderr', source: 'bounded adb install stderr', digest: sha256(installed.stderr) },
+    ],
     cleanup: 'not-needed',
+    stdout: installed.stdout,
+    stderr: installed.stderr,
+    exitCode: installed.exitCode,
+    signal: installed.signal,
+    truncated: installed.truncated,
     deviceOutput: installed.text.slice(0, 4096),
-    ...(succeeded ? {} : { error: { code: 'CAPABILITY_UNAVAILABLE', message: `adb install exited with ${installed.exitCode}` } }),
+    ...(installFailureCode ? { installFailureCode } : {}),
+    ...(succeeded ? {} : { error: { code: 'INSTALL_FAILED', message: `adb install exited with ${installed.exitCode}${installFailureCode ? `: ${installFailureCode}` : reportedFailure ? ': Failure reported' : ': no Success confirmation'}.${signatureAdvice}` } }),
   }
+
 }
 
 async function runLaunch(deps: DeviceDeps, identity: DeviceIdentity, applicationId: string) {
@@ -800,10 +889,10 @@ function createProjectTool(ctx: AndroidToolContext, getConfig: () => AndroidExec
     name: PROJECT_TOOL,
     description: 'Inspect an Android project in this session workspace. "inspect" is a read-only static lead list and does not verify Gradle tasks. "discover-build" runs the configured Android CLI after host approval and returns verified module/variant facts with an id that the build tool requires.',
     parameters: {
-      action: { type: 'string', enum: ['inspect', 'discover-build'], required: true, description: 'inspect: static leads only. discover-build: approved dynamic facts.' },
+      action: { type: 'string', enum: ['inspect', 'discover-build'], required: true, description: 'inspect: static leads with truncated/diagnostics for scan gaps; missing is not exhaustive. discover-build: approved dynamic facts.' },
       project: { type: 'string', description: 'Project directory: relative to the session workspace, or an absolute path for a project outside it. Defaults to the workspace root.' },
-      sandboxPermissions: { type: 'string', enum: ['danger-full-access'], description: 'Only for a project outside the session workspace: request a one-call unconfined run. Requires justification.' },
-      justification: { type: 'string', description: 'Required with sandboxPermissions: why this external project must be written/executed in this call.' },
+      sandboxPermissions: { type: 'string', enum: ['workspace-write', 'danger-full-access'], description: 'External project only; optional legacy field. Both values retain workspace-write confinement with this project as an exact extra writable root, never unconfined.' },
+      justification: { type: 'string', description: 'Optional reason for executing this external project in this call.' },
     },
     output: toolOutput,
     // discover-build 会调 CLI/Gradle 写项目元数据与缓存：只有纯静态 inspect 可以并行。
@@ -829,7 +918,7 @@ function createProjectTool(ctx: AndroidToolContext, getConfig: () => AndroidExec
         const gated = escalationGate(binding, 'project.discover-build', {
           ...(args.sandboxPermissions !== undefined ? { sandboxPermissions: String(args.sandboxPermissions) } : {}),
           ...(args.justification !== undefined ? { justification: String(args.justification) } : {}),
-        })
+        }, exec)
         if (!gated.ok) return json(gated.outcome)
         const discovered = await discoverBuildFacts(
           { services, binding, exec, config, platform: hostPlatform.platform, ...(gated.escalation ? { escalation: gated.escalation } : {}) },
@@ -854,10 +943,11 @@ function createProjectTool(ctx: AndroidToolContext, getConfig: () => AndroidExec
           facts: discovered.facts,
           // 升级是这次调用的事实，不能只写在批准弹窗里：结果与证据链都要能审计到。
           ...(gated.escalation !== undefined
-            ? { escalation: { mode: 'danger-full-access' as const, justification: gated.escalation.justification } }
+            ? { escalation: { mode: 'workspace-write' as const, additionalWritableRoots: [binding.root], justification: gated.escalation.justification } }
             : {}),
         })
       } catch (error) {
+        if (error instanceof ProjectBoundaryError) return json(error.result)
         if (error instanceof ArgumentError) return json(blocked('project', 'ARGUMENT_INVALID', error.message))
         throw error
       }
@@ -893,6 +983,8 @@ interface DiscoveryDeps {
    * 因此不再发第二次批准请求。两种模式的其他门（CLI/隐私/只读/Apple）完全相同。
    */
   readonly approvalMode?: 'required' | 'covered'
+  /** A build approval covers this exact CLI path, not a later executable resolution. */
+  readonly expectedCliPath?: string
   /** 外部工程的一次性升级；缺省表示工程在会话工作区内。 */
   readonly escalation?: Escalation
 }
@@ -912,13 +1004,9 @@ export async function discoverBuildFacts(
     return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'Android CLI usage-collection privacy is not configured: verified-disabled or explicit-user-opt-in') }
   }
   if (binding.external && deps.escalation === undefined) {
-    return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'an external project requires sandboxPermissions:"danger-full-access" plus a justification') }
+    return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'external project execution requires an approved scoped plan') }
   }
-  // 未围栏运行必须**同时**满足"工作区外"与"已有一次性升级"：只看 external 的话，
-  // 任何绕过 gate 的调用路径都会静默变成未围栏（审查指出的可疑点，这里结构上消除）。
-  const effectiveMode: SandboxMode = binding.external && deps.escalation !== undefined
-    ? 'danger-full-access'
-    : binding.mode
+  const effectiveMode = gradleScope(binding).mode
   if (effectiveMode === 'read-only') {
     // 发现会写 AGP 元数据；只读会话里失败关闭，而不是半途被沙箱拒绝。
     return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'discovery writes project metadata and requires a workspace-write (or wider) session policy') }
@@ -933,16 +1021,17 @@ export async function discoverBuildFacts(
     return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', 'Android CLI did not resolve to an absolute host path') }
   }
 
+  if (deps.expectedCliPath !== undefined && cliPath !== deps.expectedCliPath) {
+    return { ok: false, outcome: blocked('project.discover-build', 'TARGET_CHANGED', 'CLI path no longer matches the exact approved build re-verification plan') }
+  }
   const describeArgs = ['describe', `--project_dir=${binding.root}`]
   if (deps.approvalMode !== 'covered') {
-    const externality = binding.external
-      ? ` The project is OUTSIDE the session workspace (${binding.workspaceRoot}): this call runs UNCONFINED (danger-full-access) and Gradle may write anywhere the tooling writes. Justification: ${deps.escalation?.justification ?? '(missing)'}.`
-      : ` Session sandbox: ${binding.mode} at ${binding.workspaceRoot}.`
+    await checkProjectExecution(services, binding, exec)
     const approved = await askApproval(services, exec, PROJECT_TOOL, platform,
       `Run the configured Android CLI in ${binding.root}: "${cliPath} --version" then "${cliPath} ${describeArgs.join(' ')}". `
       + `It invokes Gradle and writes AGP metadata/caches inside the project; usage collection is ${config.privacy}.`
-      + externality
-      + ` Network and device effects are not confined by the file sandbox; the approved wrapper is pinned by path and the report is version-gated to ${CLI_VERSION_POLICY}.`)
+      + describeGradleScope(binding, platform, config, deps.escalation)
+      + ` Network and device effects are not confined by the file sandbox; the approved wrapper is pinned by path and version/report policy is ${CLI_VERSION_POLICY}.`)
     if (approved) return { ok: false, outcome: approved }
   }
 
@@ -951,22 +1040,12 @@ export async function discoverBuildFacts(
     return { ok: false, outcome: blocked('project.discover-build', 'POLICY_CHANGED', 'session policy changed after approval; retry required') }
   }
 
-  // Android CLI 会在 $ANDROID_USER_HOME 下解包自身安装并写缓存；默认的 ~/.android
-  // 在 workspace-write 会话里不可写（实测 `Failed to open .../.android/cli/bundles/lock`）。
-  // 因此把它定向到会话工作区内，既能在受限会话里工作，也不污染用户项目。
-  const androidUserHome = [binding.workspaceRoot, '.satellite', 'android-user-home'].join(platform.pathSeparator)
+  await checkProjectExecution(services, binding, exec)
   const runOptions = {
     cwd: binding.root,
-    mode: effectiveMode,
-    workspaceRoot: binding.workspaceRoot,
-    ...(binding.sessionId !== undefined ? { sessionId: binding.sessionId } : {}),
-    env: {
-      ANDROID_USER_HOME: androidUserHome,
-      // 外部工程是一次性未围栏运行：不能让更早的受限进程留下的 Gradle daemon
-      // 继续执行（它带着旧的文件围栏，会在工程内 .gradle 上 EPERM）。
-      // 保留使用者已有的 GRADLE_OPTS，只在其后追加开关（覆盖式会静默丢掉他们的设置）。
-      ...(binding.external ? { GRADLE_OPTS: withDaemonDisabled(process.env.GRADLE_OPTS) } : {}),
-    },
+    ...gradleScope(binding),
+    env: gradleEnvironment(binding, platform, config),
+    beforeSpawn: () => checkProjectExecution(services, binding, exec),
   }
   const version = await runBounded(services, {
     executable: cliPath, args: ['--version'], ...runOptions,
@@ -976,7 +1055,7 @@ export async function discoverBuildFacts(
   if ('status' in versionMapped) return { ok: false, outcome: versionMapped }
   const cliVersion = parseAndroidCliVersion(versionMapped.result.stdout.text)
   if (!cliVersion) {
-    return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', `Android CLI version is not ${CLI_VERSION_POLICY}: ${versionMapped.result.stdout.text.trim() || 'unknown'}`) }
+    return { ok: false, outcome: blocked('project.discover-build', 'CAPABILITY_UNAVAILABLE', `Android CLI version output must be stable semver (${CLI_VERSION_POLICY}): ${versionMapped.result.stdout.text.trim() || 'unknown'}`) }
   }
 
   const describe = await runBounded(services, {
@@ -1032,8 +1111,8 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
       action: { type: 'string', enum: ['build', 'test'], required: true, description: 'build: assemble the selected variant. test: run the selected variant unit-test task.' },
       observationId: { type: 'string', required: true, description: 'Id from satellite_android_project discover-build; it expires after a few minutes.' },
       project: { type: 'string', description: 'Project directory: relative to the session workspace, or an absolute path outside it; must match the observation. Defaults to the workspace root.' },
-      sandboxPermissions: { type: 'string', enum: ['danger-full-access'], description: 'Only for a project outside the session workspace: request a one-call unconfined run. Requires justification.' },
-      justification: { type: 'string', description: 'Required with sandboxPermissions: why this external project must be built in this call.' },
+      sandboxPermissions: { type: 'string', enum: ['workspace-write', 'danger-full-access'], description: 'External project only; optional legacy field. Both values retain workspace-write confinement with this project as an exact extra writable root, never unconfined.' },
+      justification: { type: 'string', description: 'Optional reason for building this external project in this call.' },
       module: { type: 'string', required: true, description: 'Gradle module path exactly as reported, for example ":app".' },
       variant: { type: 'string', required: true, description: 'Variant name exactly as reported, for example "debug".' },
       clean: { type: 'boolean', description: 'Run "clean" before the selected task; defaults to false.' },
@@ -1069,7 +1148,7 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
         const gated = escalationGate(binding, action, {
           ...(args.sandboxPermissions !== undefined ? { sandboxPermissions: String(args.sandboxPermissions) } : {}),
           ...(args.justification !== undefined ? { justification: String(args.justification) } : {}),
-        })
+        }, exec)
         if (!gated.ok) return json(gated.outcome)
         const found = observations.getFor(observationId, exec.agent?.id ?? 'unknown')
         if (!found.ok) return json(blocked(action, found.code, found.message))
@@ -1094,23 +1173,19 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
           '--console=plain',
           ...(offline ? ['--offline'] : []),
           ...(rerunTasks ? ['--rerun-tasks'] : []),
-          // 同上：升级运行在本进程内执行，不复用可能残留的受限 daemon。
+          // 本次围栏内执行，不复用其他权限上下文的 daemon。
           ...(binding.external ? ['--no-daemon'] : []),
         ]
         const argv = [...taskNames, ...flags]
         // Gradle 默认写 ~/.gradle；在 workspace-write 会话里同样不可写，定向到工作区。
-        const env = {
-          GRADLE_USER_HOME: [binding.workspaceRoot, '.satellite', 'gradle-user-home'].join(hostPlatform.platform.pathSeparator),
-          ...(config.javaHome ? { JAVA_HOME: config.javaHome } : {}),
-        }
+        const env = gradleEnvironment(binding, hostPlatform.platform, config)
+        await checkProjectExecution(services, binding, exec)
 
         const approved = await askApproval(services, exec, BUILD_TOOL, hostPlatform.platform,
           `Run "${facts.gradleWrapper} ${argv.join(' ')}" in ${binding.root} (module ${modulePath}, variant ${variant}). `
           + `It writes build outputs and caches under the workspace and may download dependencies. Session sandbox: ${binding.mode} at ${binding.workspaceRoot}. `
-          + `Device effects: none. Before the build starts, the Android CLI is run again to re-check the approved project facts.`
-          + (binding.external
-            ? ` NOTE: the project is outside the session workspace (${binding.workspaceRoot}); this call runs UNCONFINED (danger-full-access). Justification: ${gated.escalation?.justification ?? '(missing)'}.`
-            : ''))
+          + `No device operation is requested by this tool. Before the build starts, re-check facts with "${facts.cliPath} --version" then "${facts.cliPath} describe --project_dir=${binding.root}".`
+          + describeGradleScope(binding, hostPlatform.platform, config, gated.escalation))
         if (approved) return json(approved)
 
         const after = resolvePolicy(services.sandboxPolicy, exec.agent?.session)
@@ -1120,7 +1195,7 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
 
         // 批准后重新发现：项目模型或选择变化时不执行构建。
         const reverified = await discoverBuildFacts(
-          { services, binding, exec, config, platform: hostPlatform.platform, approvalMode: 'covered', ...(gated.escalation ? { escalation: gated.escalation } : {}) },
+          { services, binding, exec, config, platform: hostPlatform.platform, approvalMode: 'covered', expectedCliPath: facts.cliPath, ...(gated.escalation ? { escalation: gated.escalation } : {}) },
           new Date().toISOString(),
         )
         if (!reverified.ok) {
@@ -1135,9 +1210,8 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
 
         const run = await runBounded(services, {
           executable: facts.gradleWrapper, args: argv, cwd: binding.root,
-          mode: binding.external && gated.escalation !== undefined ? 'danger-full-access' : binding.mode,
-          workspaceRoot: binding.external && gated.escalation !== undefined ? binding.root : binding.workspaceRoot,
-          ...(binding.sessionId !== undefined ? { sessionId: binding.sessionId } : {}),
+          ...gradleScope(binding),
+          beforeSpawn: () => checkProjectExecution(services, binding, exec),
           timeoutMs: config.operationTimeoutMs, outputMaxBytes: config.outputMaxBytes,
           ...(env ? { env } : {}),
         }, exec.signal)
@@ -1188,9 +1262,9 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
           ...(expectedArtifacts.length > 0
             ? { artifacts: { expected: expectedArtifacts.length, verified: artifactEvidence.length, missing: missingArtifacts } }
             : {}),
-          // 外部工程的升级也是这次构建的事实：结果里必须写清楚它是未围栏运行的。
+          // 本次进程的额外工程根写入结果，不能误报成 unconfined。
           ...(binding.external && gated.escalation !== undefined
-            ? { escalation: { mode: 'danger-full-access' as const, justification: gated.escalation.justification } }
+            ? { escalation: { mode: 'workspace-write' as const, additionalWritableRoots: [binding.root], justification: gated.escalation.justification } }
             : {}),
           ...(run.ok && run.result.unconfined ? { unconfined: true } : {}),
           ...(failedBuild
@@ -1200,6 +1274,7 @@ function createBuildTool(ctx: AndroidToolContext, getConfig: () => AndroidExecut
               : {}),
         })
       } catch (error) {
+        if (error instanceof ProjectBoundaryError) return json(error.result)
         if (error instanceof ArgumentError) return json(blocked('build', 'ARGUMENT_INVALID', error.message))
         throw error
       }
@@ -1265,7 +1340,7 @@ function createJourneyTool(
             action: { type: 'string', enum: ['tap', 'text', 'key', 'wait', 'assert-foreground', 'assert-ui-text', 'screenshot'], description: 'Exact action of this step; supply only the fields listed for it.' },
             x: { type: 'integer', description: 'tap only: x coordinate, 0–100000.' },
             y: { type: 'integer', description: 'tap only: y coordinate, 0–100000.' },
-            text: { type: 'string', description: 'text only (max 1024 chars, charset A–Z a–z 0–9 space . , _ @ / : + = -) or assert-ui-text only (max 512 chars).' },
+            text: { type: 'string', description: 'text: max 1024 printable ASCII chars; punctuation and leading "-" allowed, literal %s rejected; no Unicode input. assert-ui-text: max 512 chars.' },
             // 枚举直接取解析器的键表：描述与解析器不允许再各写一份。
             key: { type: 'string', enum: [...JOURNEY_KEYS], description: 'key only: one of the listed key codes, exactly as spelled.' },
             ms: { type: 'integer', description: 'wait only: 1–30000 milliseconds.' },

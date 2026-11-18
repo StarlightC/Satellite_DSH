@@ -78,6 +78,11 @@ retry engine.
 
 ## Rules that do not change per project
 
+Before planning or relaying a design, implementation, or review task, read
+[the shared restriction-design principles](references/restriction-design.md).
+Apply this cross-domain authority to the parent's own proposals too; pass the
+relevant risk and normal-workflow evidence, not a copy of the reference.
+
 1. Establish sufficient bounded context, reusing current evidence when its inputs
    are unchanged; do not repeat investigation merely to visit a node. Before any
    side effect, check tool/service/route/permission availability without side effects.

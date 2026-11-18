@@ -32,8 +32,9 @@ When a shipped shape changes:
   representations of the same choice;
 - keep defaults in code: a profile should record a user choice, not a snapshot of
   today's default;
-- if the effective default for a layer cannot be read, say so and refuse the edit
-  instead of guessing a value;
+- if a necessary effective default for the layer being changed cannot be read,
+  report the gap and pause that dependent edit instead of guessing a value; this
+  does not reject unrelated supported use or unknown configuration in general;
 - remember that a later configuration layer replaces a whole row's config rather
   than deep-merging it; name what must stay intact;
 - state whether existing users migrate automatically, keep working unchanged, or

@@ -2,22 +2,35 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { spawn, execFileSync } from 'node:child_process'
-import { mkdtemp, realpath, lstat, mkdir, writeFile, readFile, rm, symlink, unlink, chmod } from 'node:fs/promises'
+import { mkdtemp, realpath, lstat, mkdir, writeFile, readFile, rm, symlink, link, unlink, chmod } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, dirname, resolve, relative, isAbsolute } from 'node:path'
 import { createLocalVersionControl } from '../lib/node/lib/version-control.js'
 
-test('LFS format metadata is inert; LFS filter/unknown config still rejected before Git', async t => {
+test('real vscode branch config and normal Git syntax/attrs stage and commit without executing disabled entries', async t => {
   const f = await fixture(t), h = host(f)
   const base = await readFile(join(f.root, '.git/config'), 'utf8')
-  await f.put('.git/config', base + '[lfs]\n repositoryformatversion = 0\n')
+  const config = '[branch "next"] # comment\n vscode-merge-base = origin/next\n' +
+    '[Branch "page_create"]\n vscode-merge-base = "origin/page_create" ; comment\n' +
+    '[branch.parallel]\n vscode-merge-base = origin/parallel\n' +
+    '[tooling "quoted\\"sub\\\\section"]\n enabled\n value = "space ; # quote\\" slash\\\\ tab\\t"\n value = continued\\\n  value\n' +
+    '[lfs]\n repositoryformatversion = 0\n url = https://example.invalid\n' +
+    '[core]\n repositoryformatversion = +0\n hooksPath = ./hooks\n fsmonitor = ./sentinel\n attributesFile = /nonexistent/attrs\n pager = ./sentinel\n editor = ./sentinel\n' +
+    '[gpg]\n program = ./sentinel\n[commit]\n gpgSign = true\n' +
+    '[diff]\n external = ./sentinel\n[diff "evil"]\n textconv = ./sentinel\n command = ./sentinel\n' +
+    '[filter "smudge-only"]\n smudge = ./sentinel\n[merge "evil"]\n driver = ./sentinel\n' +
+    '[gc]\n auto = 1\n[maintenance]\n auto = true\n'
+  await f.put('.git/config', base + config)
+  // Git itself independently accepts this grammar (fixture config command, not production parsing).
+  assert.match(f.git(['config', '--local', '--no-includes', '--list']), /branch\.next\.vscode-merge-base=origin\/next/)
   assert.equal((await h.exec({ action: 'status' })).status, 'succeeded')
-  for (const config of ['[lfs]\n repositoryformatversion = 1\n', '[lfs]\n url = https://example.invalid\n', '[filter "lfs"]\n process = ./sentinel\n', '[lfs "x"]\n repositoryformatversion = 0\n']) {
-    await f.put('.git/config', base + config)
-    const before = h.calls.spawn.length
-    assert.equal((await h.exec({ action: 'status' })).status, 'blocked')
-    assert.equal(h.calls.spawn.length, before)
-  }
+  await f.put('sentinel', '#!/bin/sh\nprintf invoked > MARKER\n'); await chmod(await f.target('sentinel', { existing: true }), 0o755)
+  await f.put('.gitattributes', '[attr]normal text=auto merge=union linguist-generated\n*.txt normal diff=evil filter=smudge-only\n')
+  await f.put('x.txt', 'normal text\n')
+  assert.equal((await stage(h, ['.gitattributes', 'x.txt'])).status, 'succeeded')
+  assert.equal((await h.exec({ action: 'diff', target: 'staged' })).status, 'succeeded')
+  assert.equal((await h.exec({ action: 'commit', message: 'safe config', expectedSnapshot: await h.snapshot() })).status, 'succeeded')
+  await assert.rejects(lstat(join(f.root, 'MARKER')), { code: 'ENOENT' })
 })
 
 const signal = () => new AbortController().signal
@@ -158,6 +171,49 @@ test('literal argv, clean inherited env, normal remote, five actions and initial
   assert.ok(h.calls.confine.every(c => ['read-only', 'workspace-write'].includes(c.policy.mode)))
 })
 
+test('more than 100 explicit stage paths and more than 50 log entries remain bounded by actual output', async t => {
+  const f = await fixture(t), h = host(f), paths = Array.from({ length: 101 }, (_, i) => `source-${i}.txt`)
+  for (const path of paths) await f.put(path, 'source\n')
+  assert.equal((await stage(h, paths)).status, 'succeeded')
+  f.git(['commit', '--quiet', '-m', 'seed 101 files'])
+  for (let i = 0; i < 50; i++) f.git(['commit', '--quiet', '--allow-empty', '-m', `history ${i}`])
+  const result = await h.exec({ action: 'log', count: 51 })
+  assert.equal(result.status, 'succeeded', JSON.stringify(result)); assert.equal((result.stdout.match(/^commit /gm) ?? []).length, 51)
+})
+
+test('normal large whole-index patch is approved completely above old 64KiB/128KiB gates', async t => {
+  const f = await fixture(t), h = host(f), failures = []
+  for (const size of [70 * 1024, 160 * 1024]) {
+    const content = Array.from({ length: Math.ceil(size / 80) }, (_, i) => `${String(i).padStart(8, '0')} ${'normal text '.repeat(6)}\n`).join('')
+    const path = `large-${size}.txt`
+    await f.put(path, content); f.git(['add', '--', path])
+    const patch = f.git(['diff', '--cached', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', '--'])
+    const result = await h.exec({ action: 'commit', message: `normal patch ${size}`, expectedSnapshot: await h.snapshot() })
+    t.diagnostic(`content=${Buffer.byteLength(content)} patch=${Buffer.byteLength(patch)} status=${result.status} gate=${result.message?.includes('approval plan too large') ? '64KiB reason' : result.message?.includes('read failed') ? '128KiB internal read' : 'none'}`)
+    if (result.status !== 'succeeded') { failures.push(`patch=${Buffer.byteLength(patch)}: ${result.message?.slice(0, 80)}`); continue }
+    const reason = h.calls.approval.at(-1).reason, plan = JSON.parse(reason.split('\n').slice(1).join('\n'))
+    assert.equal(plan.indexPatch, patch); assert.ok(Buffer.byteLength(reason) > 64 * 1024)
+    assert.equal(f.git(['show', `HEAD:${path}`]), content)
+  }
+  assert.deepEqual(failures, [])
+})
+
+test('status reads staged raw data above the display budget completely before creating a snapshot', async t => {
+  const f = await fixture(t), h = host(f)
+  await f.put('seed', 'seed'); f.git(['add', '--', 'seed']); f.git(['commit', '--quiet', '-m', 'seed'])
+  const paths = Array.from({ length: 1400 }, (_, i) => `staged-${String(i).padStart(4, '0')}`)
+  await Promise.all(paths.map(path => f.put(path, 'staged\n')))
+  f.git(['add', '--', ...paths])
+  const raw = f.git(['diff', '--cached', '--raw', '--no-abbrev', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--'])
+  assert.ok(Buffer.byteLength(raw) > 128 * 1024)
+  const observed = await h.exec({ action: 'status' })
+  assert.equal(observed.status, 'succeeded', JSON.stringify(observed))
+  assert.equal(observed.stdout.split('\0').filter(Boolean).length, paths.length)
+  assert.ok(h.kernel.take(observed.expectedSnapshot))
+  const spec = h.calls.spawn.find(s => s.argv.includes('--raw'))
+  assert.equal(spec.stdio.stdout.maxBytes, 16 * 1024 * 1024)
+})
+
 test('normal commit records the whole actual index but leaves unrelated unstaged contents untouched', async t => {
   const f = await fixture(t)
   await f.put('x', 'old x'); await f.put('y', 'old y'); f.git(['add', '--', 'x', 'y']); f.git(['commit', '--quiet', '-m', 'fixture seed'])
@@ -176,7 +232,7 @@ test('closed schema rejects arbitrary commands/flags/revs/unknown keys before an
   const f = await fixture(t), h = host(f)
   for (const input of [
     {}, { action: 'push' }, { action: 'tag' }, { action: 'status', command: 'pwd' },
-    { action: 'log', count: 0 }, { action: 'log', count: 51 }, { action: 'log', count: 1, rev: 'other' },
+    { action: 'log', count: 0 }, { action: 'log', count: 1.5 }, { action: 'log', count: 1, rev: 'other' },
     { action: 'diff', target: 'HEAD~1' }, { action: 'stage', paths: [], expectedSnapshot: 'x' },
     { action: 'stage', paths: ['x'], expectedSnapshot: 'x', runner: {} },
     { action: 'commit', message: 'x\ny', expectedSnapshot: 'x' },
@@ -185,7 +241,7 @@ test('closed schema rejects arbitrary commands/flags/revs/unknown keys before an
   assert.equal(h.calls.spawn.length, 0); assert.equal(h.calls.approval.length, 0)
 })
 
-test('paths reject directories, globs, magic, controls, git, escapes; tracked explicit deletion works', async t => {
+test('paths require exact files, reject directories/controls/git/escapes; tracked explicit deletion works', async t => {
   const f = await fixture(t); await f.put('dir/file', 'value'); const h = host(f)
   for (const path of ['dir', '*', 'dir/*', ':(literal)dir/file', '../x', '/etc/passwd', '.git/config', 'dir/../file', 'dir\\file', 'a\n', 'a\t', 'a\0', 'no-such', 'dir/']) {
     assert.equal((await h.exec({ action: 'stage', paths: [path], expectedSnapshot: await h.snapshot() })).status, 'blocked', path)
@@ -200,31 +256,38 @@ test('paths reject directories, globs, magic, controls, git, escapes; tracked ex
   assert.equal(deletion.status, 'succeeded', JSON.stringify(deletion)); assert.match(deletion.stdout, /deleted file mode/)
 })
 
-test('working/ancestor symlinks and special index modes are rejected', async t => {
-  for (const variant of ['leaf', 'ancestor', 'index']) {
-    await t.test(variant, async t => {
-      const f = await fixture(t); await f.put('regular', 'x')
-      if (variant === 'index') {
-        await symlink('regular', await f.target('link')); f.git(['add', '--', 'link']); await f.remove('regular')
-        // Delete the symlink itself only after verifying the exact intended link target.
-        const path = await f.target('link'); assert.equal((await lstat(path)).isSymbolicLink(), true); await unlink(path)
-      } else await symlink(variant === 'leaf' ? 'regular' : '.', await f.target('link'))
-      const h = host(f)
-      assert.equal((await h.exec({ action: 'status' })).status, 'blocked')
-      assert.equal(h.calls.write, 0)
-      if (variant !== 'index') assert.equal(h.calls.spawn.length, 0)
-    })
-  }
+test('ordinary symlink/index mode, ignored dependency links, hardlinks and POSIX literal filenames work; snapshots bind their content', async t => {
+  const f = await fixture(t); await f.put('Nextpages/[id].tsx', 'page\n'); await f.put('.gitignore', 'dependencies/\n')
+  await f.put('dependencies/original', 'hardlink content\n')
+  await link(await f.target('dependencies/original'), await f.target('dependencies/hardlink'))
+  await symlink('/nonexistent/outside', await f.target('dependencies/external'))
+  await symlink('.', await f.target('dependencies/directory'))
+  await symlink('Nextpages/[id].tsx', await f.target('page-link'))
+  // Git does not follow .gitattributes symlinks in its worktree or index.
+  await symlink('/nonexistent/attributes', await f.target('.gitattributes'))
+  const names = ['literal:*?[]\\name', 'Nextpages/[id].tsx', 'page-link', '.gitattributes']
+  await f.put(names[0], 'literal filename\n')
+  const h = host(f)
+  assert.equal((await stage(h, names)).status, 'succeeded')
+  const plan = JSON.parse(h.calls.approval.at(-1).reason.split('\n').slice(1).join('\n'))
+  assert.equal(plan.targets.find(e => e.path === 'page-link').linkTextBase64, Buffer.from('Nextpages/[id].tsx').toString('base64'))
+  assert.equal((await h.exec({ action: 'commit', message: 'links and literal names', expectedSnapshot: await h.snapshot() })).status, 'succeeded')
+  assert.match(f.git(['ls-files', '--stage']), /120000 .*\tpage-link/)
+  assert.equal((await h.exec({ action: 'diff', target: 'staged', paths: ['Nextpages/[id].tsx'] })).status, 'succeeded')
+  const token = await h.snapshot()
+  await f.put('dependencies/hardlink', 'changed through alias\n')
+  assert.equal((await h.exec({ action: 'stage', paths: ['Nextpages/[id].tsx'], expectedSnapshot: token })).status, 'blocked')
+  const linkToken = await h.snapshot(), path = await f.target('page-link')
+  assert.equal((await lstat(path)).isSymbolicLink(), true); await unlink(path); await symlink('different', path)
+  assert.equal((await h.exec({ action: 'stage', paths: ['page-link'], expectedSnapshot: linkToken })).status, 'blocked')
+  assert.equal((await stage(h, ['dependencies/directory/Nextpages/[id].tsx'])).status, 'blocked')
 })
 
-test('include, filter, fsmonitor, gpg, externaldiff and external-path configs fail before Git; sentinels untouched', async t => {
+test('include, executable filter and unobserved layout configs fail before Git; sentinels untouched', async t => {
   for (const entry of [
     '[include]\n path = /tmp/elsewhere\n', '[includeIf "gitdir:*"]\n path = /tmp/elsewhere\n',
-    '[filter "evil"]\n clean = ./sentinel\n', '[filter "evil"]\n process = ./sentinel\n', '[filter "evil"]\n smudge = ./sentinel\n',
-    '[core]\n fsmonitor = ./sentinel\n', '[core]\n hooksPath = ./hooks\n', '[gpg]\n program = ./sentinel\n',
-    '[diff]\n external = ./sentinel\n', '[diff "evil"]\n textconv = ./sentinel\n',
-    '[core]\n worktree = /tmp\n', '[extensions]\n partialClone = origin\n', '[remote "origin"]\n promisor = true\n',
-    '[core]\n attributesFile = /tmp/attrs\n',
+    '[filter "evil"]\n clean = ./sentinel\n', '[filter "evil"]\n process = ./sentinel\n',
+    '[core]\n worktree = /tmp\n', '[core]\n repositoryformatversion = 1\n', '[extensions]\n partialClone = origin\n', '[remote "origin"]\n promisor = true\n',
   ]) {
     await t.test(entry.split('\n').slice(0, 2).join(' '), async t => {
       const f = await fixture(t)
@@ -237,9 +300,9 @@ test('include, filter, fsmonitor, gpg, externaldiff and external-path configs fa
   }
 })
 
-test('real hooks cannot run; safe attrs allowed, worktree/info/index filter attrs rejected', async t => {
+test('real hooks cannot run; worktree/info/index filter attrs without executable definitions are inert', async t => {
   const f = await fixture(t); await f.put('x', 'x')
-  for (const hook of ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'post-index-change']) {
+  for (const hook of ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'post-index-change', 'reference-transaction']) {
     await f.put(`.git/hooks/${hook}`, '#!/bin/sh\nprintf invoked > MARKER\nexit 1\n')
     await chmod(await f.target(`.git/hooks/${hook}`, { existing: true }), 0o755)
   }
@@ -249,15 +312,15 @@ test('real hooks cannot run; safe attrs allowed, worktree/info/index filter attr
   await assert.rejects(lstat(join(f.root, 'MARKER')), { code: 'ENOENT' })
   for (const path of ['.gitattributes', '.git/info/attributes']) {
     await f.put(path, '* filter=evil\n')
-    assert.equal((await h.exec({ action: 'status' })).status, 'blocked')
+    assert.equal((await h.exec({ action: 'status' })).status, 'succeeded')
     await f.put(path, '')
   }
   await f.put('.gitattributes', '* filter=evil\n'); f.git(['add', '--', '.gitattributes']); await f.remove('.gitattributes')
-  assert.equal((await h.exec({ action: 'status' })).status, 'blocked')
+  assert.equal((await h.exec({ action: 'status' })).status, 'succeeded')
 })
 
 test('unsafe repository layouts/metadata fail before any Git', async t => {
-  for (const path of ['.git/commondir', '.git/gitdir', '.git/shallow', '.git/objects/info/alternates', '.git/objects/info/http-alternates', '.git/info/grafts', '.git/objects/pack/a.promisor', '.git/sharedindex.x', '.git/config.worktree', '.gitmodules', '.git/objects/info/Alternates', '.git/Shallow', '.GITMODULES']) {
+  for (const path of ['.git/commondir', '.git/gitdir', '.git/objects/info/alternates', '.git/objects/info/http-alternates', '.git/info/grafts', '.git/objects/pack/a.promisor', '.git/sharedindex.x', '.git/config.worktree', '.git/objects/info/Alternates']) {
     await t.test(path, async t => {
       const f = await fixture(t); await f.put(path, 'unsafe\n')
       const h = host(f); assert.equal((await h.exec({ action: 'status' })).status, 'blocked'); assert.equal(h.calls.spawn.length, 0)
@@ -276,12 +339,41 @@ test('unsafe repository layouts/metadata fail before any Git', async t => {
   })
 })
 
-test('gitlink index entries and metadata/config symlinks fail closed', async t => {
+test('a real shallow clone supports observation and local writes without fetch', async t => {
+  const f = await fixture(t); await f.put('x', 'seed'); f.git(['add', '--', 'x']); f.git(['commit', '--quiet', '-m', 'seed'])
+  const clone = await f.target('shallow')
+  execFileSync('/usr/bin/git', ['clone', '--quiet', '--depth=1', `file://${f.root}`, clone], { cwd: f.root, env: { PATH: '/usr/bin:/bin', HOME: f.root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ALLOW_PROTOCOL: 'file' } })
+  f.git(['-C', clone, 'config', 'user.name', 'Fixture']); f.git(['-C', clone, 'config', 'user.email', 'fixture@example.invalid'])
+  await f.put('shallow/x', 'changed')
+  const h = host(f), observed = await h.exec({ action: 'status', repo: 'shallow' })
+  assert.equal(observed.status, 'succeeded', JSON.stringify(observed))
+  assert.equal((await h.exec({ action: 'stage', repo: 'shallow', paths: ['x'], expectedSnapshot: observed.expectedSnapshot })).status, 'succeeded')
+  const fresh = await h.exec({ action: 'status', repo: 'shallow' })
+  assert.equal((await h.exec({ action: 'commit', repo: 'shallow', message: 'local shallow commit', expectedSnapshot: fresh.expectedSnapshot })).status, 'succeeded')
+  assert.ok(h.calls.spawn.every(s => !s.argv.includes('fetch')))
+})
+
+test('gitlinks are observed and fully approved without reading external submodule metadata; critical metadata links fail closed', async t => {
   await t.test('gitlink', async t => {
     const f = await fixture(t); await f.put('x', 'x'); f.git(['add', '--', 'x']); f.git(['commit', '--quiet', '-m', 'fixture seed'])
-    const oid = f.git(['rev-parse', 'HEAD']).trim()
-    f.git(['update-index', '--add', '--cacheinfo', `160000,${oid},sub`])
-    const h = host(f); assert.equal((await h.exec({ action: 'status' })).status, 'blocked'); assert.equal(h.calls.write, 0)
+    const old = f.git(['rev-parse', 'HEAD']).trim()
+    f.git(['update-index', '--add', '--cacheinfo', `160000,${old},sub`]); f.git(['commit', '--quiet', '-m', 'seed gitlink'])
+    await f.put('x', 'new'); f.git(['add', '--', 'x']); f.git(['commit', '--quiet', '-m', 'new object'])
+    const next = f.git(['rev-parse', 'HEAD']).trim()
+    await f.put('.gitmodules', '[submodule "sub"]\n path = sub\n url = https://example.invalid/sub\n')
+    await f.put('sub/.git', 'gitdir: /nonexistent/external-submodule-metadata\n')
+    f.git(['update-index', '--cacheinfo', `160000,${next},sub`])
+    const h = host(f), observed = await h.exec({ action: 'status' })
+    assert.equal(observed.status, 'succeeded', JSON.stringify(observed)); assert.ok(observed.stagedGitlinks.includes(old)); assert.ok(observed.stagedGitlinks.includes(next))
+    assert.equal((await stage(h, ['sub'])).status, 'blocked'); assert.equal(h.calls.write, 0)
+    assert.equal((await stage(h, ['.gitmodules'])).status, 'succeeded')
+    const diff = await h.exec({ action: 'diff', target: 'staged', paths: ['sub'] })
+    assert.equal(diff.status, 'succeeded', JSON.stringify(diff)); assert.ok(diff.stdout.includes(old)); assert.ok(diff.stdout.includes(next))
+    const committed = await h.exec({ action: 'commit', message: 'approve gitlink OIDs', expectedSnapshot: await h.snapshot() })
+    assert.equal(committed.status, 'succeeded', JSON.stringify(committed))
+    const plan = JSON.parse(h.calls.approval.at(-1).reason.split('\n').slice(1).join('\n'))
+    assert.ok(plan.indexPatch.includes(`-Subproject commit ${old}`)); assert.ok(plan.indexPatch.includes(`+Subproject commit ${next}`))
+    assert.equal(plan.entireIndex.find(e => e.path === 'sub').mode, '160000')
   })
   await t.test('metadata symlink', async t => {
     const f = await fixture(t); await f.put('outside-config', await readFile(join(f.root, '.git/config'), 'utf8'))

@@ -1,11 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import { createParentGrantBroker, PARENT_REQUEST_TOOL } from '../lib/node/lib/parent-grant.js'
 
 import {
   CLI_VERSION_POLICY, createObservationStore, digestDynamicFacts, inspectStaticProject,
   parseAndroidCliDescribe, parseAndroidCliVersion,
 } from '../lib/android/lib/execution/project.js'
 import { BUILD_TOOL, DEVICE_TOOL, EMULATOR_TOOL, PROJECT_TOOL, registerAndroidExecutionTools } from '../lib/android/lib/execution/tools.js'
+import { createDelegatedApprovalBroker } from '../lib/delegated-approval.js'
 import { resolveExecutionConfig } from '../lib/android/index.js'
 
 const ROOT = '/project'
@@ -34,12 +37,14 @@ const DESCRIBE = [
 
 const sha = (value) => `sha:${Buffer.from(String(value)).length}`
 
-test('CLI 版本只接受 1.0.x', () => {
-  assert.equal(parseAndroidCliVersion('1.0.7\n'), '1.0.7')
-  assert.equal(parseAndroidCliVersion('2.0.0'), undefined)
-  assert.equal(parseAndroidCliVersion('1.1.0'), undefined)
-  assert.equal(parseAndroidCliVersion('android 1.0.7'), undefined)
-  assert.equal(CLI_VERSION_POLICY, 'android-cli-1.0.x')
+test('CLI 稳定 semver 记录事实，不拒未知 major/minor', () => {
+  for (const version of ['1.0.7', '1.12.0', '2.0.0', '0.9.0+build.12']) {
+    assert.equal(parseAndroidCliVersion(`${version}\n`), version)
+  }
+  for (const version of ['android 1.0.7', '1.2', '01.2.3', '1.2.3-beta']) {
+    assert.equal(parseAndroidCliVersion(version), undefined)
+  }
+  assert.equal(CLI_VERSION_POLICY, 'stable-semver + validated-describe')
 })
 
 test('describe 报告解析出模块、变体与绝对产物路径', () => {
@@ -65,11 +70,16 @@ test('describe 报告的锚点、重复与相对路径一律拒绝', () => {
     'gradlew completed successfully.',
   ].join('\n')
   const cases = [
+    [DESCRIBE.replace('Task: :lib', 'Task: :lib::bad'), /malformed task structure/],
+    [DESCRIBE.replace('    Variant: release', '    Variant: bad-name'), /malformed task structure/],
+    [DESCRIBE.replace('    Variant: release', ''), /no variants/],
+    [`${DESCRIBE}\nTask: :late`, /outside its task section/],
+    [`Target project directory: /other\n${DESCRIBE}`, /duplicate or conflicting anchor/],
     [DESCRIBE.replace(`Target project directory: ${ROOT}`, 'Target project directory: /other'), /target does not match/],
     [DESCRIBE.replace(`Project directory exists: ${ROOT}`, ''), /did not confirm/],
     [DESCRIBE.replace('Parsed tasks:', ''), /missing its task section/],
     [DESCRIBE.replace('gradlew completed successfully.', ''), /did not complete Gradle/],
-    [`${DESCRIBE}\nTask: :app`, /duplicate module/],
+    [DESCRIBE.replace('Task: :lib', 'Task: :app'), /duplicate module/],
     [duplicateVariant, /duplicate variant/],
     [DESCRIBE.replace('APK: /project/app', 'APK: app'), /non-absolute APK path/],
     ['Target project directory: /project\nProject directory exists: /project\nParsed tasks:\ngradlew completed successfully.', /declared no modules/],
@@ -113,6 +123,25 @@ test('静态检查报告缺失的入口，而不是猜一个', async () => {
   const facts = await inspectStaticProject({ projectRoot: ROOT, fs, signal: new AbortController().signal })
   assert.deepEqual(facts.leads, [])
   assert.deepEqual([...facts.missing].sort(), ['gradlew', 'module build files'])
+})
+
+test('静态预算截断和读取失败不会伪装模块不存在', async () => {
+  const dirs = Array.from({ length: 51 }, (_, index) => `module${index}`)
+  const fs = fakeFs({ files: { [`${ROOT}/module50/build.gradle`]: 'x' }, dirs: { [ROOT]: dirs } })
+  const facts = await inspectStaticProject({ projectRoot: ROOT, fs, signal: new AbortController().signal })
+  assert.equal(facts.truncated, true)
+  assert.match(facts.diagnostics.join(' '), /truncated after 50/)
+  assert.equal(facts.missing.includes('module build files'), false)
+  fs.listDir = async () => { throw new Error('EACCES') }
+  const unread = await inspectStaticProject({ projectRoot: ROOT, fs, signal: new AbortController().signal })
+  assert.equal(unread.truncated, false)
+  assert.match(unread.diagnostics.join(' '), /list candidate directories.*EACCES/)
+  assert.equal(unread.missing.includes('module build files'), false)
+  fs.listDir = async () => [{ name: 'app', type: 'directory' }]
+  fs.stat = async () => { throw new Error('read denied') }
+  const failed = await inspectStaticProject({ projectRoot: ROOT, fs, signal: new AbortController().signal })
+  assert.match(failed.diagnostics.join(' '), /app\/build.gradle.*read denied/)
+  assert.deepEqual(failed.missing, [])
 })
 
 test('观测表按调用方隔离、会过期，id 不授予执行', () => {
@@ -181,9 +210,9 @@ function harness({
     [`${ROOT}/app/build/outputs/apk/debug/app-debug.apk`]: 256,
     [`${ROOT}/app/build/outputs/apk/debug/app-debug-unsigned.apk`]: 256,
   },
-  dirs = { [ROOT]: [] }, platform = 'posix', projectRoot = ROOT,
+  dirs = { [ROOT]: [] }, platform = 'posix', projectRoot = ROOT, consumerOf,
 } = {}) {
-  const calls = { spawn: [], approvals: [], confined: [] }
+  const calls = { spawn: [], approvals: [], confined: [], policies: [] }
   const services = {
     fs: fakeFs({
       files: { ...APPLE_FILES, [`${ROOT}/gradlew`]: 'x', ...files },
@@ -192,7 +221,7 @@ function harness({
     sandboxPolicy: { resolve: () => ({ mode, workspaceRoot: ROOT, sessionId: 's1' }) },
     approval: { async request(request) { calls.approvals.push(request); return approval } },
     sandbox: {
-      async confine(argv) { calls.confined.push([...argv]); return { argv: [...argv], enforcement: 'full', denialSignatures: [] } },
+      async confine(argv, policy) { calls.confined.push([...argv]); calls.policies.push(policy); return { argv: [...argv], enforcement: 'full', denialSignatures: [] } },
     },
     subprocess: {
       async terminalEnvironment() { return { platform } },
@@ -227,7 +256,7 @@ function harness({
     ...(emulatorPath ? { emulatorPath } : {}),
     ...(avdmanagerPath ? { avdmanagerPath } : {}),
   } })
-  registerAndroidExecutionTools(ctx, () => config)
+  registerAndroidExecutionTools(ctx, () => config, consumerOf)
   const exec = {
     agent: { id: 'caller-a', session: { header: { id: 'caller-a', cwd: projectRoot } } },
     callId: 'call-1',
@@ -378,12 +407,23 @@ test('批准后按版本门与报告门产出观测 id 与动态事实', async (
   assert.equal(h.calls.spawn.length, 2)
 })
 
-test('不支持的 CLI 版本在 describe 之前停止', async () => {
-  const h = harness({ cli: '/opt/android/bin/android', privacy: 'verified-disabled', versionOut: '2.1.0' })
+test('新 minor/major 的兼容报告产出观测，坏报告不能用于执行', async () => {
+  for (const versionOut of ['1.12.0', '2.1.0']) {
+    const h = harness({ cli: '/opt/android/bin/android', privacy: 'verified-disabled', versionOut,
+      describeOut: `${DESCRIBE}\nAdditional capability: future` })
+    const value = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build' }, h.exec)
+    assert.equal(value.status, 'succeeded')
+    assert.equal(value.facts.cliVersion, versionOut)
+  }
+  const h = harness({ cli: '/opt/android/bin/android', privacy: 'verified-disabled', versionOut: '1.12.0',
+    describeOut: DESCRIBE.replace('    Variant: debug', ' Variant: debug') })
   const value = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build' }, h.exec)
-  assert.equal(value.status, 'blocked')
-  assert.match(value.error.message, /android-cli-1\.0\.x/)
-  assert.equal(h.calls.spawn.length, 1)
+  assert.equal(value.status, 'failed')
+  assert.equal(value.observationId, undefined)
+  assert.match(value.error.message, /malformed task structure/)
+  const built = await h.tools[BUILD_TOOL].execute({ action: 'build', observationId: 'invalid', module: ':app', variant: 'debug' }, h.exec)
+  assert.equal(built.status, 'blocked')
+  assert.equal(h.calls.spawn.length, 2)
 })
 
 test('构建工具要求有效观测、拒绝未声明的模块与变体', async () => {
@@ -630,6 +670,15 @@ test('旅程 key 参数的枚举直接来自解析器键表（描述不许另写
   assert.deepEqual(properties.steps.items.properties.key.enum, [...JOURNEY_KEYS])
   // 描述里不该再出现自成一体的键名清单。
   assert.doesNotMatch(properties.steps.items.properties.key.description, /VOLUME_UP|POWER|HOME,/)
+  assert.match(properties.steps.items.properties.text.description, /printable ASCII/)
+  assert.equal(properties.steps.items.properties.text.pattern, undefined)
+  const configured = harness({ adbPath: '/usr/bin/adb' })
+  const args = { serial: 's', observationId: 'missing', applicationId: 'com.example.app', steps: [{ action: 'text', text: "-a'b!$;()[]%" }] }
+  const allowedText = await configured.tools['satellite_android_journey'].execute(args, configured.exec)
+  assert.equal(allowedText.error.code, 'TARGET_REQUIRED', 'schema/parser must accept punctuation before the observation gate')
+  const literalSequence = await configured.tools['satellite_android_journey'].execute({ ...args, steps: [{ action: 'text', text: '%s' }] }, configured.exec)
+  assert.equal(literalSequence.error.code, 'ARGUMENT_INVALID')
+  assert.match(literalSequence.error.message, /literal %s/)
 })
 
 /* ------------------------------------------- 工作区外的工程（逐次升级） */
@@ -658,37 +707,26 @@ function externalHarness(over = {}) {
   return h
 }
 
-test('工作区外的工程：只读 inspect 可直接用，写/执行需要逐次升级', async () => {
+test('外部 inspect 不执行；discover 默认走一次精确宿主批准而非要求 danger', async () => {
   const h = externalHarness()
   const inspected = await h.tools[PROJECT_TOOL].execute({ action: 'inspect', project: EXTERNAL }, h.exec)
   assert.equal(inspected.status, 'succeeded')
-  assert.equal(inspected.facts.projectRoot, EXTERNAL)
-
-  const blockedDiscover = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
-  assert.equal(blockedDiscover.status, 'blocked')
-  assert.equal(blockedDiscover.error.code, 'CAPABILITY_UNAVAILABLE')
-  assert.match(blockedDiscover.error.message, /outside the session workspace/)
-  assert.match(blockedDiscover.error.message, /sandboxPermissions/)
-  assert.equal(h.calls.approvals.length, 0, '未要求升级时不发批准请求')
   assert.equal(h.calls.spawn.length, 0)
+  const discovered = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
+  assert.equal(discovered.status, 'succeeded', JSON.stringify(discovered))
+  assert.equal(h.calls.approvals.length, 1)
+  assert.equal(h.calls.spawn.length, 2)
 })
 
-test('升级参数必须成对且只能是 danger-full-access', async () => {
-  const h = externalHarness()
-  const noJustification = await h.tools[PROJECT_TOOL].execute(
-    { action: 'discover-build', project: EXTERNAL, sandboxPermissions: 'danger-full-access' }, h.exec)
-  assert.equal(noJustification.error.code, 'ARGUMENT_INVALID')
-  assert.match(noJustification.error.message, /justification/)
-
-  // 枚举本身由工具 schema 拒绝（defineTool 校验），不到达处理逻辑。
-  await assert.rejects(h.tools[PROJECT_TOOL].execute(
-    { action: 'discover-build', project: EXTERNAL, sandboxPermissions: 'workspace-write', justification: 'x' }, h.exec),
-  /must be one of \["danger-full-access"\]/)
-
-  const justificationOnly = await h.tools[PROJECT_TOOL].execute(
-    { action: 'discover-build', project: EXTERNAL, justification: 'x' }, h.exec)
-  assert.equal(justificationOnly.error.code, 'ARGUMENT_INVALID')
-  assert.equal(h.calls.approvals.length, 0)
+test('外部 legacy danger 字段和 workspace-write 均保持本次进程围栏', async () => {
+  for (const sandboxPermissions of ['danger-full-access', 'workspace-write']) {
+    const h = externalHarness()
+    const value = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL, sandboxPermissions }, h.exec)
+    assert.equal(value.status, 'succeeded', JSON.stringify(value))
+    assert.equal(value.escalation.mode, 'workspace-write')
+    assert.equal(value.unconfined, undefined)
+    assert.ok(h.calls.policies.every(p => p.mode === 'workspace-write'))
+  }
 })
 
 test('工作区内的工程不需要升级：误传升级参数会被拒，避免无意义的批准', async () => {
@@ -700,7 +738,7 @@ test('工作区内的工程不需要升级：误传升级参数会被拒，避�
   assert.equal(h.calls.approvals.length, 0)
 })
 
-test('升级批准后 CLI 以 unconfined 方式运行，批准理由写明外部路径与影响', async () => {
+test('批准后 CLI 以精确额外工程根围栏运行，批准理由保留脚本风险', async () => {
   const h = externalHarness()
   const discovered = await h.tools[PROJECT_TOOL].execute({
     action: 'discover-build', project: EXTERNAL,
@@ -710,10 +748,15 @@ test('升级批准后 CLI 以 unconfined 方式运行，批准理由写明外部
   assert.equal(discovered.facts.projectRoot, EXTERNAL)
   const reason = h.calls.approvals[0].reason
   assert.match(reason, new RegExp(EXTERNAL.replaceAll('/', '\\/')))
-  assert.match(reason, /UNCONFINED/)
+  assert.match(reason, /This process only/)
   assert.match(reason, /需要在外部测试工程里生成 AGP 元数据/)
-  // harness 的 sandbox.confine 记录调用：外部工程不应经过 confine。
-  assert.equal(h.calls.confined.length, 0, 'unconfined 运行不经过沙箱 confine')
+  assert.match(reason, /arbitrary project build scripts/)
+  assert.equal(h.calls.confined.length, 2)
+  for (const policy of h.calls.policies) {
+    assert.equal(policy.mode, 'workspace-write')
+    assert.equal(policy.workspaceRoot, ROOT)
+    assert.deepEqual(policy.additionalWritableRoots, [EXTERNAL])
+  }
 })
 
 test('外部工程的构建沿用同一份升级批准，且不重复请求', async () => {
@@ -730,7 +773,7 @@ test('外部工程的构建沿用同一份升级批准，且不重复请求', as
   }, h.exec)
   assert.equal(built.status, 'succeeded', JSON.stringify(built))
   assert.equal(h.calls.approvals.length - before, 1, '构建本身一次批准（复核包含在内）')
-  assert.match(h.calls.approvals.at(-1).reason, /UNCONFINED/)
+  assert.match(h.calls.approvals.at(-1).reason, /This process only/)
 })
 
 test('外部工程的升级运行不复用 Gradle daemon（避免旧围栏的 daemon 继续执行）', async () => {
@@ -766,14 +809,14 @@ test('工作区内构建仍然复用 daemon（不加 --no-daemon）', async () =
   assert.equal(spawn.env.GRADLE_OPTS, undefined)
 })
 
-test('升级事实进入结果：外部工程的 discover/build 结果带 escalation 与 unconfined', async () => {
+test('外部 discover/build 结果准确记录 workspace-write roots，不谎报 unconfined', async () => {
   const h = externalHarness()
   const discovered = await h.tools[PROJECT_TOOL].execute({
     action: 'discover-build', project: EXTERNAL,
     sandboxPermissions: 'danger-full-access', justification: '外部工程验收理由',
   }, h.exec)
   assert.equal(discovered.status, 'succeeded')
-  assert.deepEqual(discovered.escalation, { mode: 'danger-full-access', justification: '外部工程验收理由' })
+  assert.deepEqual(discovered.escalation, { mode: 'workspace-write', additionalWritableRoots: [EXTERNAL], justification: '外部工程验收理由' })
 
   const built = await h.tools[BUILD_TOOL].execute({
     action: 'build', project: EXTERNAL, observationId: discovered.observationId,
@@ -781,8 +824,8 @@ test('升级事实进入结果：外部工程的 discover/build 结果带 escala
     sandboxPermissions: 'danger-full-access', justification: '外部工程验收理由',
   }, h.exec)
   assert.equal(built.status, 'succeeded', JSON.stringify(built))
-  assert.deepEqual(built.escalation, { mode: 'danger-full-access', justification: '外部工程验收理由' })
-  assert.equal(built.unconfined, true)
+  assert.deepEqual(built.escalation, { mode: 'workspace-write', additionalWritableRoots: [EXTERNAL], justification: '外部工程验收理由' })
+  assert.equal(built.unconfined, undefined)
 })
 
 test('工作区内的结果不带 escalation/unconfined 字段', async () => {
@@ -825,13 +868,57 @@ test('justification 折叠空白与换行（批准理由不允许被伪造结构
   assert.equal(/\n/u.test(reason), false, '批准理由里不应出现换行')
 })
 
-test('未升级时不可能进入未围栏运行（结构上由 escalation 决定）', async () => {
-  // 外部工程但没有升级参数：在到达任何进程之前就被拒。
+test('外部调用拒绝审批时零 confine/spawn，read-only 不会借审批写入', async () => {
+  for (const options of [{ approval: 'rejected' }, { mode: 'read-only' }]) {
+    const h = externalHarness(options)
+    const value = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
+    assert.equal(value.status, 'blocked')
+    assert.equal(h.calls.spawn.length, 0)
+    assert.equal(h.calls.confined.length, 0)
+  }
+})
+
+test('外部 discover/build 每个进程 roots 精确且缓存 env 一致，partial 围栏零 spawn', async () => {
   const h = externalHarness()
-  const outcome = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
-  assert.equal(outcome.status, 'blocked')
-  assert.equal(h.calls.spawn.length, 0)
-  assert.equal(h.calls.confined.length, 0)
+  const discovered = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
+  const built = await h.tools[BUILD_TOOL].execute({ action: 'build', project: EXTERNAL, observationId: discovered.observationId, module: ':app', variant: 'debug' }, h.exec)
+  assert.equal(built.status, 'succeeded', JSON.stringify(built))
+  assert.equal(h.calls.policies.length, 5)
+  for (const p of h.calls.policies) assert.deepEqual(p, { mode: 'workspace-write', workspaceRoot: ROOT, sessionId: 's1', additionalWritableRoots: [EXTERNAL] })
+  for (const run of h.calls.spawn) {
+    assert.equal(run.env.GRADLE_USER_HOME, `${ROOT}/.satellite/gradle-user-home`)
+    assert.equal(run.env.ANDROID_USER_HOME, `${ROOT}/.satellite/android-user-home`)
+    assert.match(run.env.GRADLE_OPTS, /-Dorg\.gradle\.daemon=false$/)
+  }
+  const partial = externalHarness()
+  partial.services.sandbox.confine = async argv => ({ argv, enforcement: 'partial', denialSignatures: [] })
+  const value = await partial.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, partial.exec)
+  assert.equal(value.status, 'blocked')
+  assert.equal(partial.calls.spawn.length, 0)
+})
+
+test('外部 roots/policy/alias 在审批或 final confine 期间改变均在 spawn 前拒绝', async () => {
+  for (const boundary of ['approval', 'confine']) {
+    for (const change of ['policy-roots', 'project-alias']) {
+      const h = externalHarness()
+      const mutate = () => {
+        if (change === 'policy-roots') h.services.sandboxPolicy.resolve = () => ({ mode: 'workspace-write', workspaceRoot: ROOT, sessionId: 's1', additionalWritableRoots: ['/new-root'] })
+        else {
+          const resolve = h.services.fs.resolve
+          h.services.fs.resolve = async (path, options) => path === EXTERNAL ? { targetKey: '/replaced-project' } : resolve(path, options)
+        }
+      }
+      if (boundary === 'approval') h.services.approval.request = async () => { mutate(); return 'allowed-once' }
+      else {
+        const confine = h.services.sandbox.confine
+        h.services.sandbox.confine = async (...args) => { const result = await confine(...args); mutate(); return result }
+      }
+      const value = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
+      assert.equal(value.status, 'blocked', `${boundary}/${change}: ${JSON.stringify(value)}`)
+      assert.equal(value.error.code, change === 'policy-roots' ? 'POLICY_CHANGED' : 'TARGET_CHANGED')
+      assert.equal(h.calls.spawn.length, 0)
+    }
+  }
 })
 
 // The parser consumes an explicit path capability, not the executing test machine's OS.
@@ -851,4 +938,114 @@ test('static inspection recognises gradlew.bat without a host implementation', a
   const value = await inspectStaticProject({ projectRoot: ROOT, fs, signal: new AbortController().signal })
   assert.equal(value.leads.find((lead) => lead.kind === 'wrapper').path, `${ROOT}/gradlew.bat`)
   assert.equal(value.missing.includes('gradlew'), false)
+})
+
+
+test('真实委派 broker 下 child readonly/额外根上限不变，交回父精确调用而非伪造 child policy', async () => {
+  for (const mode of ['read-only', 'workspace-write']) {
+    const broker = createDelegatedApprovalBroker()
+    const consumer = broker.consumer()
+    const h = externalHarness({ mode, consumerOf: () => consumer })
+    h.exec.agent.ctx = { get: name => h.services[name] }
+    let parentAsks = 0
+    const parent = { id: 'parent', session: {}, ctx: { get: name => name === 'approval' ? parentApproval : undefined } }
+    const parentApproval = { overrideOf: () => 'ask', request: async () => { parentAsks++; return 'allowed-once' } }
+    const release = broker.issuer.bind({ child: h.exec.agent, childSession: h.exec.agent.session,
+      parent, parentSession: parent.session, runId: 'node-run', parentCallId: 'node-call',
+      signal: h.exec.signal, live: () => true, toolOf: name => h.tools[name] })
+    const result = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
+    assert.equal(result.status, 'blocked', JSON.stringify(result))
+    assert.equal(result.error.code, 'PATH_DENIED')
+    assert.match(result.error.message, /satellite_parent_request/)
+    assert.equal(parentAsks, 0)
+    assert.equal(h.calls.spawn.length, 0)
+    assert.deepEqual(h.services.sandboxPolicy.resolve(), { mode, workspaceRoot: ROOT, sessionId: 's1' })
+    release(); consumer.dispose(); broker.issuer.release()
+  }
+})
+
+
+// Production wrappers and both real brokers; only host I/O and runtime final-result
+// confirmation are fixtures. Neither policy is provisioned with an external root.
+test('普通 child roots=[] 的 external 请求经 exact parentAction 后一次批准到达 confined spawn', async () => {
+  const approvalBroker = createDelegatedApprovalBroker()
+  const consumer = approvalBroker.consumer()
+  const child = externalHarness({ consumerOf: () => consumer })
+  const parent = externalHarness()
+  parent.exec.agent.id = 'parent'
+  const childTools = new Map()
+  const scopedTools = {
+    register(tool) { childTools.set(tool.name, tool); return () => childTools.delete(tool.name) },
+    guard() { return () => {} },
+    get(name, agent) {
+      if (agent === parent.exec.agent) return child.tools[name]
+      return childTools.get(name) ?? child.tools[name]
+    },
+    executable(name, agent) { return this.get(name, agent) },
+  }
+  child.exec.agent.ctx = { get: name => name === 'tools' ? scopedTools : child.services[name] }
+  parent.exec.agent.ctx = { get: name => parent.services[name], effect: () => () => {} }
+  const signal = child.exec.signal
+  const releaseApproval = approvalBroker.issuer.bind({
+    child: child.exec.agent, childSession: child.exec.agent.session,
+    parent: parent.exec.agent, parentSession: parent.exec.agent.session,
+    runId: 'external-run', parentCallId: 'node-call', signal, live: () => true,
+    toolOf: name => child.tools[name],
+  })
+  const broker = createParentGrantBroker({ defineTool, root: { get(name) {
+    if (name === 'tools') return scopedTools
+    if (name === 'agents') return { get: id => id === 'parent' ? parent.exec.agent : undefined }
+  } } })
+  const releaseRequest = broker.issuer.bind({
+    child: child.exec.agent, parent: parent.exec.agent, parentSession: parent.exec.agent.session,
+    nodeId: 'implement', runId: 'external-run', callToken: 'external-token', parentCallId: 'node-call',
+    signal, live: () => true, childMode: 'workspace-write', parentMode: () => 'workspace-write',
+  })
+  try {
+    const args = { action: 'discover-build', project: EXTERNAL }
+    const blocked = await child.tools[PROJECT_TOOL].execute(args, child.exec)
+    assert.equal(blocked.error.code, 'PATH_DENIED')
+    assert.match(blocked.error.message, /satellite_parent_request/)
+    assert.equal(child.calls.spawn.length, 0)
+    const staged = await childTools.get(PARENT_REQUEST_TOOL).execute({ tool: PROJECT_TOOL, arguments: args }, child.exec)
+    assert.equal(staged.status, 'proposed', JSON.stringify(staged))
+    const action = broker.publish('external-token', signal)
+    assert.equal(action.status, 'ready')
+    assert.equal(broker.confirm(action.ticket), true)
+    assert.equal(broker.guard.claim({ name: action.tool, agent: parent.exec.agent, arguments: { ...action.arguments, project: '/arbitrary' }, callId: 'handoff' }).kind, 'deny')
+    assert.equal(broker.guard.claim({ name: action.tool, agent: parent.exec.agent, arguments: action.arguments, callId: 'handoff' }).kind, 'allow')
+    const result = await child.tools[action.tool].execute(action.arguments, parent.exec)
+    assert.equal(result.status, 'succeeded', JSON.stringify(result))
+    assert.equal(parent.calls.approvals.length, 1, 'target tool still asks its own fresh exact approval')
+    assert.equal(parent.calls.spawn.length, 2)
+    assert.equal(parent.calls.confined.length, 2)
+    for (const policy of parent.calls.policies) {
+      assert.equal(policy.mode, 'workspace-write')
+      assert.equal(policy.workspaceRoot, ROOT)
+      assert.deepEqual(policy.additionalWritableRoots, [EXTERNAL])
+    }
+    for (const h of [child, parent]) {
+      assert.deepEqual(h.services.sandboxPolicy.resolve().additionalWritableRoots ?? [], [])
+    }
+    assert.equal(broker.guard.claim({ name: action.tool, agent: parent.exec.agent, arguments: action.arguments, callId: 'again' }).kind, 'deny')
+  } finally {
+    releaseRequest(); broker.release(); releaseApproval(); consumer.dispose(); approvalBroker.issuer.release()
+  }
+})
+
+test('外部 build 最终 Gradle confine 后 standing roots 改变：只复核、不 spawn Gradle', async () => {
+  const h = externalHarness()
+  const discovered = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
+  const before = h.calls.spawn.length
+  const confine = h.services.sandbox.confine
+  h.services.sandbox.confine = async (argv, ...args) => {
+    const result = await confine(argv, ...args)
+    if (argv[0] === `${EXTERNAL}/gradlew`) h.services.sandboxPolicy.resolve = () => ({ mode: 'workspace-write', workspaceRoot: ROOT, sessionId: 's1', additionalWritableRoots: ['/changed'] })
+    return result
+  }
+  const built = await h.tools[BUILD_TOOL].execute({ action: 'build', project: EXTERNAL, observationId: discovered.observationId, module: ':app', variant: 'debug' }, h.exec)
+  assert.equal(built.status, 'blocked')
+  assert.equal(built.error.code, 'POLICY_CHANGED')
+  assert.equal(h.calls.spawn.length - before, 2, 'only approved CLI re-verification ran')
+  assert.equal(h.calls.spawn.some(spec => spec.argv[0] === `${EXTERNAL}/gradlew`), false)
 })

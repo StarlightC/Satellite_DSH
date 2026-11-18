@@ -127,22 +127,31 @@ function parsePackageName(value: unknown, where: string): string {
 }
 
 /**
- * `input text` 的字符集收窄。
- *
- * adb 会把 argv 重新拼成远程 shell 命令，因此**任何**shell 元字符都不能放行；
- * 这里只接受字母数字与少量安全标点，空格按 `input text` 的要求编码成 `%s`。
- * 这不是"方便"的选择，而是把注入面直接去掉。
+ * AOSP adb_shell joins argv with spaces without escaping (client/commandline.cpp).
+ * Quote the encoded value as one POSIX remote-shell argument, including apostrophes.
+ * InputShellCommand.runText reads a positional arg (so leading '-' is text), then
+ * sendText replaces %s with spaces and uses KeyCharacterMap.VIRTUAL_KEYBOARD.
+ * No lossless literal %s escape exists in this single-command contract. Printable
+ * ASCII excludes controls; Unicode needs device keyboard evidence, not shell quoting.
+ * Sources: https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/client/commandline.cpp
+ * https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/services/core/java/com/android/server/input/InputShellCommand.java
  */
-export const INPUT_TEXT_PATTERN = /^[A-Za-z0-9 .,_@/:+=_-]+$/u
+export const INPUT_TEXT_PATTERN = /^[\x20-\x7e]+$/u
 
 export function encodeInputText(value: unknown): string {
   if (typeof value !== 'string') throw new ArgumentError('text must be a string')
   requireText(value, 'text', MAX_TEXT_LENGTH)
   if (!INPUT_TEXT_PATTERN.test(value)) {
-    throw new ArgumentError('text may only contain letters, digits, space and . , _ @ / : + = - (shell metacharacters are not accepted)')
+    throw new ArgumentError('text must contain printable ASCII only; Unicode input is not supported by this virtual-keyboard contract')
   }
-  if (value.startsWith('-')) throw new ArgumentError('text must not start with "-"')
+  if (value.includes('%s')) {
+    throw new ArgumentError('text cannot contain literal %s: Android input text converts that exact sequence to a space')
+  }
   return value.replaceAll(' ', '%s')
+}
+
+function quoteInputText(encoded: string): string {
+  return `'${encoded.replaceAll("'", "'\"'\"'")}'`
 }
 
 function parseStep(value: unknown, index: number): JourneyStep {
@@ -615,7 +624,7 @@ async function executeStep(context: RunContext, step: JourneyStep): Promise<Step
     }
     case 'text': {
       const encoded = encodeInputText(step.text)
-      const run = await runCommand(context, adb(deps, request.serial, ['shell', 'input', 'text', encoded]), { effect: true })
+      const run = await runCommand(context, adb(deps, request.serial, ['shell', 'input', 'text', quoteInputText(encoded)]), { effect: true })
       if (!run.ok) return run.outcome
       return { ok: true, evidence: [{ kind: 'device-action', source: `input text (${encoded.length} chars)` }] }
     }

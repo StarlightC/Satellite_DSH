@@ -5,9 +5,12 @@
  * 这里固定的是"结果怎么说"和"参数怎么校验"，不含任何后端选择。
  */
 
+import { normalize } from 'node:path'
+
 /** 统一错误码；调用方按词表报告，不解析自然语言正文。 */
 export const EXECUTION_ERROR_CODES = Object.freeze([
   'CAPABILITY_UNAVAILABLE',
+  'INSTALL_FAILED',
   'TARGET_REQUIRED',
   'TARGET_AMBIGUOUS',
   'TARGET_CHANGED',
@@ -150,7 +153,7 @@ export function requireEnum<T extends string>(value: unknown, where: string, all
 export type { SandboxLike, SubprocessLike } from '../../../lib/process-contracts.ts'
 
 export interface PolicyLike {
-  resolve(request: { session: unknown }): { mode?: string; workspaceRoot?: string; sessionId?: string } | undefined
+  resolve(request: { session: unknown }): { mode?: string; workspaceRoot?: string; sessionId?: string; additionalWritableRoots?: readonly string[] } | undefined
 }
 
 export interface ApprovalLike {
@@ -203,8 +206,8 @@ export function isSandboxMode(value: unknown): value is SandboxMode {
 export function resolvePolicy(
   policy: PolicyLike,
   session: unknown,
-): { mode: SandboxMode; workspaceRoot: string; sessionId?: string } | undefined {
-  let resolved: { mode?: string; workspaceRoot?: string; sessionId?: string } | undefined
+): { mode: SandboxMode; workspaceRoot: string; sessionId?: string; additionalWritableRoots?: readonly string[] } | undefined {
+  let resolved: { mode?: string; workspaceRoot?: string; sessionId?: string; additionalWritableRoots?: readonly string[] } | undefined
   try {
     resolved = policy.resolve({ session })
   } catch {
@@ -212,7 +215,10 @@ export function resolvePolicy(
   }
   if (!resolved || !isSandboxMode(resolved.mode)) return undefined
   if (typeof resolved.workspaceRoot !== 'string' || resolved.workspaceRoot.length === 0) return undefined
+  if (resolved.additionalWritableRoots !== undefined && (!Array.isArray(resolved.additionalWritableRoots)
+    || resolved.additionalWritableRoots.some(root => typeof root !== 'string' || root.length === 0))) return undefined
   return {
+    ...(resolved.additionalWritableRoots !== undefined ? { additionalWritableRoots: [...new Set(resolved.additionalWritableRoots)].sort() } : {}),
     mode: resolved.mode,
     workspaceRoot: resolved.workspaceRoot,
     ...(typeof resolved.sessionId === 'string' ? { sessionId: resolved.sessionId } : {}),
@@ -220,6 +226,6 @@ export function resolvePolicy(
 }
 
 /** 同一策略的身份比较：批准前后必须逐字段一致。 */
-export function policyKey(policy: { mode: string; workspaceRoot: string; sessionId?: string }): string {
-  return JSON.stringify([policy.mode, policy.workspaceRoot, policy.sessionId ?? null])
+export function policyKey(policy: { mode: string; workspaceRoot: string; sessionId?: string; additionalWritableRoots?: readonly string[] }): string {
+  return JSON.stringify([policy.mode, policy.workspaceRoot, policy.sessionId ?? null, [...new Set((policy.additionalWritableRoots ?? []).map(root => normalize(root)))].sort()])
 }

@@ -306,8 +306,9 @@ async function handoff(t, { approve = 'allowed-once' } = {}) {
   return { f, boundary, root, child, tagged, parentServices, rootCtx, status, stage }
 }
 
-test('handoff: host allowed-once executes the frozen stage+commit with parent scope services; child token is single-use and not transferable', async t => {
+test('handoff: danger parent still uses confined allowed-once stage+commit; child remains narrow and tokens single-use', async t => {
   const h = await handoff(t)
+  h.root.session.mode = 'danger-full-access'
   const snap = await h.status()
   assert.equal(snap.status, 'succeeded')
   assert.equal(writeSpawns(h.tagged.child).length, 0)
@@ -316,7 +317,8 @@ test('handoff: host allowed-once executes the frozen stage+commit with parent sc
   assert.equal(h.tagged.parentApproval.length, 1)
   assert.ok(h.tagged.parentApproval[0].agent === h.root); assert.equal(h.tagged.parentApproval[0].callId, 'parent-node-call')
   assert.equal(writeSpawns(h.tagged.parent).length, 1); assert.equal(writeSpawns(h.tagged.child).length, 0)
-  assert.ok(h.tagged.parentConfine.every(p => p.sessionId === h.root.id))
+  assert.ok(h.tagged.parentConfine.every(p => p.sessionId === h.root.id && ['workspace-write', 'read-only'].includes(p.mode)))
+  assert.equal(h.child.session.mode, 'workspace-write')
   assert.match(git(h.f.root, 'diff', '--cached', '--name-only'), /^x$/m)
   // Reuse of the consumed token and a forged token are refused before any approval.
   for (const token of [snap.expectedSnapshot, 'f'.repeat(64)]) {

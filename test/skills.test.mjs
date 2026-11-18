@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import { loadSkill, packageRootFrom, parseSkillFile, resourceDirFrom } from '../lib/skills.js'
 
@@ -178,7 +178,7 @@ test('按需参考与 SKILL.md 相对链接双向一致', () => {
   for (const { directory, name } of entries) {
     const skill = loadSkill(directory, name)
     const content = readFileSync(skill.path, 'utf8')
-    const links = [...content.matchAll(/\]\((references\/[^)\s]+)\)/g)].map((match) => match[1])
+    const links = [...content.matchAll(/\]\(((?:references\/|\.\.\/)[^)\s]+)\)/g)].map((match) => match[1])
     assert.deepEqual(
       links,
       [...new Set(links)],
@@ -196,6 +196,25 @@ test('按需参考与 SKILL.md 相对链接双向一致', () => {
         `${name}: references/${file} 没有被 SKILL.md 链接，模型无法按需读到`,
       )
     }
+  }
+})
+
+// Production path: configured node method -> loaded skill -> one shared packaged
+// resource. This checks reachability, not whether a model obeys the principles.
+test('父流程和三个节点方法都可读取同一限制设计权威资源', async () => {
+  const { DEFAULT_CONFIG } = await import('../lib/node/lib/config.js')
+  const authority = resolve(NODE_DIR, 'skills/satellite-base-flow/references/restriction-design.md')
+  const names = ['satellite-base-flow', ...['solution', 'implement', 'review'].flatMap((node) => {
+    const binding = DEFAULT_CONFIG.nodes[node]
+    const roles = [binding.role, ...Object.values(binding.tierRoles ?? {})]
+    return roles.map((role) => DEFAULT_CONFIG.roles[role].skill)
+  })]
+  for (const name of new Set(names)) {
+    const skill = loadSkill(NODE_DIR, name)
+    const links = [...skill.content.matchAll(/\]\(([^)\s]+)\)/g)]
+      .map((match) => resolve(skill.resourceBase.path, match[1]))
+    assert.ok(links.includes(authority), `${name}: 未引用共享权威资源`)
+    assert.ok(readFileSync(authority, 'utf8').trim().length > 0)
   }
 })
 

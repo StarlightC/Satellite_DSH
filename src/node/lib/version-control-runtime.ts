@@ -152,7 +152,7 @@ export function createVersionControlBoundary(ctx: ScopeContext, defineToolFn: ty
             if (who.session !== session) deny(`${label} session changed`)
             for (const name of SERVICES) if (serviceTarget(who.ctx.get(name)) !== serviceTarget(s[name])) deny(`${label} scope service changed: ${name}`)
             const p = s.sandboxPolicy.resolve({ session: who.session })
-            if (!p || !['read-only', 'workspace-write'].includes(p.mode) || p.sessionId !== who.id
+            if (!p || !['read-only', 'workspace-write', 'danger-full-access'].includes(p.mode) || p.sessionId !== who.id
               || !isAbsolute(p.workspaceRoot) || who.session.header.id !== who.id) deny(`${label} session policy unavailable or mismatched`)
             return p
           }

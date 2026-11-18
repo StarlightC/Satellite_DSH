@@ -30,7 +30,9 @@ host for a real `allowed-once` for the exact plan (not reusable), and rechecks
 repo/HEAD/index/config/files/argv/expiry/parent policy after its final confinement
 and immediately before spawn. Parent read-only/`never`/no answerer/missing service,
 lost ownership or unknown mapping are blocked. Only stage/commit use the handoff;
-it does not widen reads or the child's tools. The main session still has no
+it does not widen reads or the child's tools. A danger-full-access parent is a
+valid wider parent policy, but the actual Git write still requests workspace-write,
+full native confinement and allowed-once; the child is not promoted. The main session still has no
 git/shell tool. A file sandbox is not network isolation.
 
 Supported layouts: an ordinary .git directory (registered linked worktrees under
@@ -49,23 +51,57 @@ real confinement; gitdir/commondir must pass the host-shared mapping check, whic
 is rechecked after approval and final confinement). That directory includes hooks
 and config: this tool revalidates config and disables hooks every time, but other
 host Git invocations are not protected by it.
-SHA-1 format 0, bounded strict config and safe
-attributes. Only `[lfs] repositoryformatversion = 0` is accepted as inert metadata;
-`[filter "lfs"]`, filter attributes/drivers, hooks config, includes, external paths
-and unknown config are rejected before Git. Ordinary inert origin URL is allowed
-but never used. No bare repo, submodules, partial clone, alternates,
-shallow/split index, symlink/hardlink/special paths. Scan includes ignored files
-and has no repository entry/byte quota: every regular file is hashed in full by
-streaming (no whole-file buffering except parsed config/attributes). Large trees
-cost proportional time. Repositories containing dependency symlinks can be
-unsupported; the scan is never silently skipped.
+SHA-1 format 0, including shallow clones (never auto-fetch). Normal Git config
+syntax, repeated keys, unknown inert tooling keys and attributes/macros are allowed.
+Unknown config is not claimed universally safe: the fixed five actions and controls
+below define the reachable execution boundary. Includes, worktree redirection,
+unobserved worktree config, partial clones, alternate object sources, grafts and
+split index remain unsupported. Config is parsed locally before any Git startup;
+no untrusted Git invocation is used to parse it.
+
+Execution entry → control:
+- Hooks (including reference-transaction), fsmonitor → fixed core.hooksPath=/dev/null
+  and core.fsmonitor=false. Their repository settings need not be deleted.
+- add/status/diff clean/process filters → executable filter.clean/process definitions
+  are rejected before Git, independent of attribute source or macro. Smudge-only
+  configuration is inert: none of the five actions checks out files.
+  Inert filter names, text=auto, merge=union, linguist attributes and macros work.
+- diff drivers/textconv → every diff uses --no-ext-diff/--no-textconv; no action merges.
+- Pager/editor/signing → --no-pager, commit -m/--no-gpg-sign, log --no-show-signature,
+  fixed commit.gpgSign=false/tag.gpgSign=false. Configured programs are inert here.
+- Auto-GC/maintenance → fixed gc.auto=0/maintenance.auto=false.
+- Includes/external attrs/worktree → includes and core.worktree rejected;
+  core.attributesFile=/dev/null, system attrs disabled, worktree config rejected.
+- Remote/object sources → no remote action, clean environment, protocols disabled,
+  GIT_NO_LAZY_FETCH=1; partial clones/promisor packs and alternates rejected.
+
+Scan includes ignored files with no scan-level repository entry/byte quota;
+Git output resource caps below still limit which operations can complete. Ordinary
+regular/hardlinked files are content-hashed in full; symlinks bind mode and raw link
+text without following them (directory links are leaves). Metadata links/hardlinks
+are refused: Git writes there, and an alias could escape the observed write domain.
+Worktree .gitattributes symlinks are not followed, matching Git's documented rule.
+.gitmodules and index gitlinks are supported without recursing into submodule .git
+or .git/modules metadata. Only staging a submodule HEAD/content is unsupported;
+stage other files and commit the actual index remain available. Status reports staged
+gitlink changes separately as stagedGitlinks (old/new OIDs), since its worktree status
+suppresses submodule recursion. Cached diff and commit approval include gitlink
+changes with complete old/new OIDs. Large trees cost proportional time.
 Real commit is exercised only with simulated host services in temporary fixture
 repositories; live-host approval UI has not been demonstrated here.
 
 Snapshots are process-local, single-use, five minutes, and bound to exact caller,
 policy, repo/HEAD/index/config/attributes/tree. Any relevant change requires a new
 observation and new approval. Commit approval contains whole index and binary
-diff; oversized plans are refused, not truncated. Locks are preserved. Write
+diff, never an abbreviated approval summary. Model-facing Git reads use a 128 KiB
+per-stream output cap; complete internal index manifests, status cached raw diffs
+and commit approval patches use a 16 MiB per-stream buffered-output resource cap.
+These are real operation limits: even a smaller displayed status can be refused
+if its internal cached raw diff exceeds 16 MiB. This is not unlimited index or
+patch support, nor a whole-process memory bound. Exceeding the applicable cap
+is an explicit refusal, never a snapshot
+or approval made from truncated data; no artificial approval-reason length gate.
+Locks are preserved. Write
 failure, cancellation, timeout or lost launch result is conservatively uncertain;
 a cancelled write that reached spawn keeps the host's aborted result but carries an
 `effect-unknown` note.

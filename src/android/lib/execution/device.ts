@@ -14,7 +14,7 @@ import type {
   ApprovalLike, OperationOutcome, PolicyLike, SandboxLike, ScopedExecution, SubprocessLike,
 } from './contracts.js'
 import {
-  ArgumentError, blocked, cancelled, failed, outcome, policyKey, rejectUnknownKeys, requireEnum,
+  ArgumentError, blocked, cancelled, effectUnknown, failed, outcome, policyKey, rejectUnknownKeys, requireEnum,
   requireInteger, requireText, resolvePolicy,
 } from './contracts.js'
 import type { SandboxMode } from './contracts.js'
@@ -256,7 +256,7 @@ export async function adbRun(
   args: readonly string[],
   action: string,
   target?: { serial?: string; transportId?: string },
-): Promise<{ ok: true; text: string; exitCode: number | null } | { ok: false; outcome: OperationOutcome }> {
+): Promise<{ ok: true; text: string; stdout: string; stderr: string; truncated: boolean; exitCode: number | null; signal: string | null } | { ok: false; outcome: OperationOutcome }> {
   const { services, binding, exec, config } = deps
   const run = await runBounded(services, {
     executable: config.adbPath,
@@ -271,15 +271,22 @@ export async function adbRun(
   const failure = runFailure(action, run)
   if (failure) return { ok: false, outcome: failure }
   if (!run.ok) return { ok: false, outcome: blocked(action, 'CAPABILITY_UNAVAILABLE', 'execution unavailable') }
-  if (run.result.aborted || run.result.timedOut) {
-    return {
-      ok: false,
-      outcome: run.result.aborted
-        ? cancelled(action, run.result.cleanup === 'completed' ? 'completed' : 'failed')
-        : failed(action, 'TIMEOUT', 'adb did not finish before its deadline'),
-    }
+  const { result } = run
+  const output = {
+    stdout: result.stdout.text, stderr: result.stderr.text,
+    truncated: result.stdout.truncated || result.stderr.truncated,
+    exitCode: result.exitCode, signal: result.signal,
   }
-  return { ok: true, text: run.result.stdout.text, exitCode: run.result.exitCode }
+  if (result.failureDetail !== undefined || result.aborted || result.timedOut || result.signal !== null) {
+    const diagnosis = result.failureDetail !== undefined || (!result.aborted && !result.timedOut && result.signal !== null)
+      ? effectUnknown(action, 'EFFECT_UNKNOWN', result.failureDetail ?? `adb terminated by ${result.signal}; effects are unconfirmed. No automatic retry.`)
+      : result.aborted
+        ? cancelled(action, result.cleanup === 'completed' ? 'completed' : 'failed')
+        : failed(action, 'TIMEOUT', 'adb did not finish before its deadline')
+    return { ok: false, outcome: { ...diagnosis, ...output, cleanup: result.cleanup } }
+  }
+  // text remains stdout-only for existing device/capture/journey parsers.
+  return { ok: true, text: output.stdout, ...output }
 }
 
 /** 解析设备属性；`ro.boot.serialno`/`ro.serialno` 都没有时身份不可用。 */

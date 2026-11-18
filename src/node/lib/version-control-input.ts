@@ -13,7 +13,7 @@ export function text(value: unknown, name: string, max = 1024): string {
 }
 export function literalPath(value: unknown): string {
   const path = text(value, 'literal file path')
-  if (path.includes('\\') || /[:*?\[\]]/.test(path) || path.startsWith('/') || path.split('/').some(p => !p || p === '.' || p === '..' || p.toLowerCase() === '.git')) deny('non-literal or outside path')
+  if (path.startsWith('/') || path.split('/').some(p => !p || p === '.' || p === '..' || p.toLowerCase() === '.git')) deny('outside path or reserved Git metadata')
   return path
 }
 export function parseGitRequest(value: unknown): GitRequest {
@@ -27,7 +27,7 @@ export function parseGitRequest(value: unknown): GitRequest {
   if (!Object.hasOwn(keys, action) || Reflect.ownKeys(v).some(k => typeof k !== 'string' || !keys[action]!.includes(k))) deny('unknown action or key')
   const repo = v.repo === '.' ? '.' : literalPath(v.repo)
   const paths = (): string[] => {
-    if (!Array.isArray(v.paths) || !v.paths.length || v.paths.length > 100) deny('paths must contain 1–100 files')
+    if (!Array.isArray(v.paths) || !v.paths.length) deny('paths must contain at least one file')
     const result = v.paths.map(literalPath)
     if (new Set(result).size !== result.length) deny('duplicate paths')
     return result
@@ -38,7 +38,7 @@ export function parseGitRequest(value: unknown): GitRequest {
     return { action, repo, target: v.target, ...(v.paths === undefined ? {} : { paths: paths() }) }
   }
   if (action === 'log') {
-    if (!Number.isInteger(v.count) || (v.count as number) < 1 || (v.count as number) > 50) deny('log count must be 1–50')
+    if (!Number.isSafeInteger(v.count) || (v.count as number) < 1) deny('log count must be a positive safe integer')
     return { action, repo, count: v.count as number }
   }
   const expectedSnapshot = text(v.expectedSnapshot, 'expectedSnapshot', 128)
@@ -46,44 +46,66 @@ export function parseGitRequest(value: unknown): GitRequest {
   return { action: 'commit', repo, message: text(v.message, 'commit message', 4096), expectedSnapshot }
 }
 
-/** Deliberately small config language. Unknown/escaped/continued constructs fail closed.
- * It is parsed BEFORE Git reads local config; this parser never follows includes.
- * Remote URLs/refspecs are inert data: no action here invokes a remote.
- */
-export function validateLocalConfig(source: string): void {
-  let section = ''
-  for (const raw of source.split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line || /^[#;]/.test(line)) continue
-    const header = /^\[([a-zA-Z][a-zA-Z0-9-]*)(?: "([^"\\\x00-\x1f]*)")?\]$/.exec(line)
-    if (header) {
-      section = header[1]!.toLowerCase()
-      if (!['core', 'user', 'remote', 'branch', 'init', 'lfs'].includes(section)) deny(`unsupported config section ${section}`)
-      if (['remote', 'branch'].includes(section) !== (header[2] !== undefined)) deny('invalid config subsection')
-      continue
-    }
-    const entry = /^([a-zA-Z][a-zA-Z0-9-]*)\s*=\s*([^\\\x00-\x1f]*)$/.exec(line)
-    if (!entry) deny('unsupported config syntax')
-    const key = entry[1]!.toLowerCase(), val = entry[2]!.trim()
-    const allowed: Record<string, string[]> = {
-      core: ['repositoryformatversion', 'bare', 'filemode', 'logallrefupdates', 'ignorecase', 'precomposeunicode', 'symlinks', 'autocrlf', 'safecrlf', 'quotepath'],
-      user: ['name', 'email'], remote: ['url', 'pushurl', 'fetch', 'tagopt'], branch: ['remote', 'merge', 'rebase'], init: ['defaultbranch'],
-      // Pure repository-format metadata only. No LFS filters/drivers or execution.
-      lfs: ['repositoryformatversion'],
-    }
-    if (!allowed[section]?.includes(key)) deny(`unsupported config ${section}.${key}`)
-    if (section === 'lfs' && val !== '0') deny('unsupported lfs repository format')
-    if (section === 'core') {
-      if (key === 'repositoryformatversion' ? val !== '0' : key === 'bare' ? val !== 'false' : !['true', 'false', 'input'].includes(val)) deny(`unsupported core value ${key}`)
-    }
-  }
+/** Git's integer parser is strtoimax(value, &end, 0) plus an optional k/m/g
+ * unit, so 0, 00, +0, -0, 0x0 and 0k are the same zero. Any other value is
+ * either non-zero or rejected by Git itself. */
+function isGitIntegerZero(value: string): boolean {
+  const parsed = /^[ \t]*[+-]?(?:0[xX]([0-9a-fA-F]+)|([0-9]+))[kKmMgG]?$/.exec(value)
+  return parsed !== null && /^0+$/.test(parsed[1] ?? parsed[2]!)
 }
 
-export function validateAttributes(source: string): void {
-  for (const raw of source.split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line || line.startsWith('#')) continue
-    const parts = line.split(/\s+/)
-    if (parts.length < 2 || parts[0]!.startsWith('[attr]') || !parts.slice(1).every(a => ['text', '-text', '!text', 'binary', 'eol=lf', 'eol=crlf', 'diff', '-diff'].includes(a))) deny('unsupported attributes (filters/macros/drivers forbidden)')
+/** Parse locally, before Git startup can read includes or redirected metadata.
+ * Git-config(1) syntax: comments, quoted fragments, escapes, continuations,
+ * implicit booleans, deprecated dotted subsections and repeated keys.
+ * Unknown keys are NOT an execution protocol. Restrictions below name reachable
+ * execution/path entries not already neutralised by the kernel's fixed argv/env.
+ */
+export function validateLocalConfig(source: string): void {
+  if (source.includes('\0')) deny('NUL in local config')
+  let section = '', subsection: string | undefined
+  const lines = source.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i]!.trimStart()
+    if (!line || /^[#;]/.test(line)) continue
+    if (line.startsWith('[')) {
+      const header = /^\[([A-Za-z0-9.-]+)(?:[ \t]+"((?:[^"\\]|\\.)*)")?\]/.exec(line)
+      if (!header) deny('invalid config section syntax')
+      const dot = header[1]!.indexOf('.')
+      section = (dot < 0 ? header[1]! : header[1]!.slice(0, dot)).toLowerCase()
+      subsection = header[2] !== undefined ? header[2].replace(/\\(.)/g, '$1') : dot < 0 ? undefined : header[1]!.slice(dot + 1).toLowerCase()
+      line = line.slice(header[0].length).trimStart()
+      if (!line || /^[#;]/.test(line)) continue
+    }
+    const entry = /^([A-Za-z][A-Za-z0-9-]*)([ \t]*(?:=([\s\S]*)|[#;].*)?)$/.exec(line)
+    if (!section || !entry) deny('invalid config entry syntax')
+    const key = entry[1]!.toLowerCase()
+    let value = '', pending = '', quoted = false
+    line = entry[3] ?? ''
+    for (let j = 0; j < line.length; j++) {
+      const c = line[j]!
+      if (c === '\\') {
+        if (j === line.length - 1 && i + 1 < lines.length) { line += '\n' + lines[++i]!; j++; continue }
+        const escape = line[++j], decoded: Record<string, string> = { n: '\n', t: '\t', b: '\b', '"': '"', '\\': '\\' }
+        if (escape === undefined || !Object.hasOwn(decoded, escape)) deny('invalid config escape')
+        value += pending + decoded[escape]; pending = ''
+      } else if (c === '"') { value += pending; pending = ''; quoted = !quoted }
+      else if (!quoted && (c === '#' || c === ';')) break
+      else if (!quoted && /[ \t]/.test(c)) { if (value) pending += c }
+      else { value += pending + c; pending = '' }
+    }
+    if (quoted) deny('unterminated config quote')
+    const name = `${section}.${key}`, implicit = entry[3] === undefined
+    const falseValue = !implicit && (/^(?:false|no|off|\+?0+[kmg]?)$/i.test(value) || value === '')
+    // add/status/diff may run clean/process filters, including via indexed attrs
+    // or macros. Deny executable definitions, not inert attributes/driver names.
+    if (section === 'filter' && subsection !== undefined && ['clean', 'process'].includes(key) && value) deny(`executable filter config ${name}`)
+    if (((section === 'include' && subsection === undefined) || (section === 'includeif' && subsection !== undefined)) && key === 'path') deny('config includes are outside the observed config boundary')
+    if (section === 'core' && subsection === undefined && key === 'worktree') deny('core.worktree redirects the observed worktree')
+    if (section === 'core' && subsection === undefined && key === 'bare' && !falseValue) deny('bare repository unsupported')
+    if (section === 'core' && subsection === undefined && key === 'repositoryformatversion' && !isGitIntegerZero(value)) deny('unsupported repository format')
+    if (section === 'extensions' && subsection === undefined && ['worktreeconfig', 'objectformat', 'refstorage', 'partialclone'].includes(key)) deny(`unsupported repository layout ${name}`)
+    if (section === 'remote' && subsection !== undefined && key === 'promisor' && !falseValue) deny('partial-clone lazy object source unsupported')
+    // core.hooksPath/fsmonitor/attributesFile, pager, signing and diff drivers
+    // are accepted: fixed -c/command options disable their execution entrances.
   }
 }

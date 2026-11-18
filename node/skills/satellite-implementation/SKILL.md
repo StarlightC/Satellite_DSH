@@ -11,6 +11,10 @@ it does not commit, publish, verify, or widen the goal.
 
 ## Before editing
 
+Read [the shared restriction-design principles](../satellite-base-flow/references/restriction-design.md)
+before changing the unit. Check each added restriction against its evidence and
+normal-workflow impact; keep the control at the evidenced entry point.
+
 Restate the unit in one short block:
 
 - what changes, and why this is the agreed baseline;
