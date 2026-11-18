@@ -27,7 +27,7 @@ model arguments or facts); approval, sandbox, subprocess, cwd, fs mapping and
 policy all come from the parent's own scope. The parent re-observes the repository,
 requires it to equal the child's snapshot and the same workspace/cwd, asks the
 host for a real `allowed-once` for the exact plan (not reusable), and rechecks
-repo/HEAD/index/config/files/argv/expiry/parent policy after its final confinement
+repo/HEAD/index/config/target files/attributes/argv/parent policy after its final confinement
 and immediately before spawn. Parent read-only/`never`/no answerer/missing service,
 lost ownership or unknown mapping are blocked. Only stage/commit use the handoff;
 it does not widen reads or the child's tools. A danger-full-access parent is a
@@ -40,10 +40,9 @@ Supported layouts: an ordinary .git directory (registered linked worktrees under
 an absolute `gitdir:` gitfile naming a canonical `<commondir>/worktrees/<name>`
 whose `commondir` resolves to a canonical, non-bare `.git` and whose `gitdir`
 backlink names exactly this root's `.git`. Relative gitfiles, nested layouts,
-`config.worktree` and `extensions.worktreeConfig` are rejected. The bounded scan
-covers the worktree and the whole common directory (including the private gitdir
-and sibling worktrees' metadata) under the same limits; any lock there blocks
-writes. Snapshots bind the layout; requests on one common directory are serialized.
+`config.worktree` and `extensions.worktreeConfig` are rejected. Observation covers HEAD and its ref source, actual index, config, necessary
+attributes, write-relevant locks and validated layout identity. It never hashes the
+worktree, objects, refs/logs/hooks trees or sibling worktrees. Relevant locks block writes. Snapshots bind the layout; requests on one common directory are serialized.
 The repository root must still be inside the workspace. Only when the validated
 common directory is outside it does a write call add exactly that directory as
 `additionalWritableRoots` (stated in the approval plan; same policy for probe and
@@ -75,32 +74,40 @@ Execution entry → control:
 - Remote/object sources → no remote action, clean environment, protocols disabled,
   GIT_NO_LAZY_FETCH=1; partial clones/promisor packs and alternates rejected.
 
-Scan includes ignored files with no scan-level repository entry/byte quota;
-Git output resource caps below still limit which operations can complete. Ordinary
-regular/hardlinked files are content-hashed in full; symlinks bind mode and raw link
-text without following them (directory links are leaves). Metadata links/hardlinks
-are refused: Git writes there, and an alias could escape the observed write domain.
-Worktree .gitattributes symlinks are not followed, matching Git's documented rule.
-.gitmodules and index gitlinks are supported without recursing into submodule .git
-or .git/modules metadata. Only staging a submodule HEAD/content is unsupported;
-stage other files and commit the actual index remain available. Status reports staged
-gitlink changes separately as stagedGitlinks (old/new OIDs), since its worktree status
-suppresses submodule recursion. Cached diff and commit approval include gitlink
-changes with complete old/new OIDs. Large trees cost proportional time.
+Status binds contents of changed leaves it reports; stage binds only exact target
+contents (regular hardlinks supported, symlinks bind mode/raw link bytes without
+following). Unreported explicit targets bind near approval. Stage also observes
+worktree attributes in target ancestor directories plus root/info attributes; indexed
+attributes bind through the complete index. Global/system attributes are disabled.
+Commit binds HEAD, actual index and necessary config/layout/attributes, not unrelated
+unstaged/untracked/ignored contents; it does not hash every indexed worktree file.
+Metadata links/hardlinks remain refused. No repository entry/byte quota is introduced.
+.gitmodules and index gitlinks work without recursing into submodule .git or
+.git/modules metadata. Staging submodule HEAD/content remains unsupported. Status
+reports staged gitlinks separately (old/new OIDs); cached diff and commit approval
+contain them. Requests sharing one common directory remain serialized, but an
+unrelated sibling index change no longer invalidates this worktree's snapshot.
 Real commit is exercised only with simulated host services in temporary fixture
 repositories; live-host approval UI has not been demonstrated here.
 
-Snapshots are process-local, single-use, five minutes, and bound to exact caller,
-policy, repo/HEAD/index/config/attributes/tree. Any relevant change requires a new
-observation and new approval. Commit approval contains whole index and binary
-diff, never an abbreviated approval summary. Model-facing Git reads use a 128 KiB
-per-stream output cap; complete internal index manifests, status cached raw diffs
-and commit approval patches use a 16 MiB per-stream buffered-output resource cap.
-These are real operation limits: even a smaller displayed status can be refused
-if its internal cached raw diff exceeds 16 MiB. This is not unlimited index or
-patch support, nor a whole-process memory bound. Exceeding the applicable cap
-is an explicit refusal, never a snapshot
-or approval made from truncated data; no artificial approval-reason length gate.
+Snapshots are private, single-use, caller-bound and fresh for five minutes BEFORE
+approval admission. Time spent reading an admitted approval does not expire it;
+HEAD/index/config/layout/targets/attributes and live authorization still recheck after
+final confinement and immediately before write spawn. No long-lived digest cache.
+Reads use lightweight HEAD/index before/after checks and metadata startup checks,
+not a full observation before every Git read. Each request makes one base observation;
+the final write freeze and required post-write facts are separate bounded checks.
+Commit returns before/after HEAD, index digest and actual whole-index scope, so do
+not issue a follow-up status/log on success. Stage still needs one fresh status before
+commit (two statuses total); no cross-parent/child replacement-token framework.
+Commit approval still contains the COMPLETE actual index and binary patch, never
+an abbreviated summary. Display diff has a 128 KiB per-stream preview budget and
+explicit truncation flags; a preview is not complete summary or approval material.
+Other snapshot-bearing reads still require complete output. Internal index/status
+cached raw diff/approval patch reads retain the existing 16 MiB per-stream buffered
+resource cap: truncation refuses the operation, never approves incomplete content.
+This is an operation limit, not unlimited support or a whole-process memory bound.
+No artificial approval-reason length gate.
 Locks are preserved. Write
 failure, cancellation, timeout or lost launch result is conservatively uncertain;
 a cancelled write that reached spawn keeps the host's aborted result but carries an

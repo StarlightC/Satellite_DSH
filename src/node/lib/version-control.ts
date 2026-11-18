@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path'
 import { runBounded, type BoundedRunResult } from '../../lib/bounded-process.ts'
 import type { SandboxLike, SubprocessLike } from '../../lib/process-contracts.ts'
 import { deny, literalPath, parseGitRequest, type GitRequest } from './version-control-input.ts'
-import { inside, noSymlinkAncestors, observeRepository, type RepositoryState } from './version-control-repository.ts'
+import { digest, inside, noSymlinkAncestors, observeRepository, observeTargets, repositoryLayout, repositoryReadState, repositoryMetadataStamp, type RepositoryState } from './version-control-repository.ts'
 
 export interface LocalGitDependencies {
   readonly workspaceRoot: string
@@ -47,6 +47,10 @@ export interface LocalGitResult {
   stderrTruncated?: boolean
   exitCode?: number | null
   expectedSnapshot?: string
+  beforeHead?: string | null
+  afterHead?: string | null
+  indexDigest?: string | null
+  actualScope?: string[]
   snapshot?: { head: string | null; indexDigest: string | null; digest: string; expiresAt: number }
 }
 const queues = new Map<string, Promise<void>>()
@@ -125,7 +129,7 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
         if (deps.readOnly && (r.action === 'stage' || r.action === 'commit')) deny('writes are only executed by the parent-owned handoff')
         policy(r.action === 'stage' || r.action === 'commit')
         // Derive the queue key with read-only observation, not a caller path spelling.
-        const queuedState = await observeRepository(deps.workspaceRoot, r.repo)
+        const queuedState = await repositoryLayout(deps.workspaceRoot, r.repo)
         return await serial(queuedState.lockKey, async (): Promise<LocalGitResult> => {
           signal.throwIfAborted()
           const initialPolicy = policy(false), executable = await executableIdentity()
@@ -141,17 +145,24 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           await hostPaths()
           // Exactly the validated common directory, only when it is outside the workspace.
           const writableRoots = inside(deps.workspaceRoot, state.layout.commonDir) ? undefined : [state.layout.commonDir] as const
-          let writeSnapshot: Snapshot | undefined
+          const initialReadState = await repositoryReadState(state.layout)
+          let readStamp = state.metadataStamp
+          let targets: Awaited<ReturnType<typeof observeTargets>> | undefined
+          const targetPaths = r.action === 'stage' ? r.paths : []
+          const sameTargets = (a: typeof targets, b: typeof targets): boolean => !!a && !!b && a.attributesDigest === b.attributesDigest && JSON.stringify([...a.files]) === JSON.stringify([...b.files]) && JSON.stringify([...a.fileKinds]) === JSON.stringify([...b.fileKinds])
           const check = async (write = false): Promise<void> => {
             signal.throwIfAborted()
             if (await executableIdentity() !== executable) deny('executable changed')
-            const current = await observeRepository(deps.workspaceRoot, r.repo)
-            await hostPaths()
-            // Synchronous tail AFTER the last await: policy/expiry/cancellation are
-            // re-read with no further async gap before the caller's next step.
-            if (current.identity !== state.identity || current.digest !== state.digest) deny('repository changed; observe again')
+            if (write) {
+              // Full write recheck AFTER final confinement, immediately before spawn.
+              await hostPaths()
+              const current = await observeRepository(deps.workspaceRoot, r.repo)
+              if (current.identity !== state.identity || current.digest !== state.digest) deny('repository changed; observe again')
+              if (current.locks.length) deny('Git locks present')
+              if (r.action === 'stage' && !sameTargets(targets, await observeTargets(state.root, targetPaths))) deny('stage targets or attributes changed')
+              if (await repositoryMetadataStamp(deps.workspaceRoot, r.repo) !== current.metadataStamp) deny('metadata changed at final write boundary')
+            } else if (await repositoryReadState(state.layout) !== initialReadState) deny('HEAD/index changed; observe again')
             if (policy(write) !== initialPolicy) deny('policy changed')
-            if (write && (!writeSnapshot || expired(writeSnapshot))) deny('write snapshot expired')
             signal.throwIfAborted()
           }
           const run = async (args: string[], write = false, outputMaxBytes = DISPLAY_BYTES): Promise<BoundedRunResult> => {
@@ -171,7 +182,10 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
                 mode: write ? 'workspace-write' : 'read-only', workspaceRoot: deps.workspaceRoot,
                 sessionId: deps.sessionId, ...(write && writableRoots ? { additionalWritableRoots: writableRoots } : {}), timeoutMs: 30_000, outputMaxBytes,
                 // Final freeze AFTER the last confinement await; spawn follows synchronously.
-                beforeSpawn: () => check(write),
+                beforeSpawn: write ? () => check(true) : async () => {
+                  if (await repositoryMetadataStamp(deps.workspaceRoot, r.repo) !== readStamp) deny('metadata changed before Git read')
+                  signal.throwIfAborted(); if (policy(false) !== initialPolicy) deny('policy changed')
+                },
               }, signal)
               if (!result.ok) {
                 if (write && launched) return uncertain(JSON.stringify(result.failure))
@@ -184,10 +198,10 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
               throw error
             }
           }
-          const read = async (args: string[], allowed = [0], outputMaxBytes = DISPLAY_BYTES): Promise<BoundedRunResult> => {
+          const read = async (args: string[], allowed = [0], outputMaxBytes = DISPLAY_BYTES, preview = false): Promise<BoundedRunResult> => {
             const result = await run(args, false, outputMaxBytes)
-            if (result.stdout.truncated || result.stderr.truncated) deny(`complete Git output exceeds ${outputMaxBytes}-byte ${outputMaxBytes === DISPLAY_BYTES ? 'display' : 'internal index/approval'} budget; no snapshot/approval from truncated content`)
-            if (result.aborted || result.timedOut || result.cleanup !== 'completed' || result.failureDetail || result.stdout.truncated || result.stderr.truncated || !allowed.includes(result.exitCode ?? -1)) deny(`read failed: ${JSON.stringify(result)}`)
+            if (!preview && (result.stdout.truncated || result.stderr.truncated)) deny(`complete Git output exceeds ${outputMaxBytes}-byte ${outputMaxBytes === DISPLAY_BYTES ? 'display' : 'internal index/approval'} budget; no snapshot/approval from truncated content`)
+            if (result.aborted || result.timedOut || result.cleanup !== 'completed' || result.failureDetail || !allowed.includes(result.exitCode ?? -1)) deny(`read failed: ${JSON.stringify(result)}`)
             return result
           }
           // No Git command runs until the bounded local config/attributes/metadata scan passed.
@@ -209,7 +223,7 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
               // Ordinary symlinks are leaves, never path traversal aliases.
               try { await noSymlinkAncestors(dirname(join(state.root, path))) }
               catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-              if (!state.files.has(path)) {
+              if (!state.fileKinds.has(path)) {
                 if (staging && !index.some(e => e.path === path)) deny(`not a regular file or explicit tracked deletion: ${path}`)
                 try { await lstat(join(state.root, path)); deny('deleted path resolves to existing alias/directory') }
                 catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
@@ -217,12 +231,28 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
               if ([...state.files.keys(), ...index.map(e => e.path)].some(p => p.startsWith(`${path}/`))) deny('directory path denied')
             }
           }
+          if (r.action === 'stage' || (r.action === 'diff' && r.paths)) {
+            targets = await observeTargets(state.root, r.action === 'stage' ? r.paths : r.paths!.filter(path => !index.some(e => e.mode === '160000' && e.path === path)))
+            state.files = targets.files; state.fileKinds = targets.fileKinds
+          }
           if (r.action === 'status') {
             const result = await read(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all'])
             // status's ignore=all avoids reading a submodule's external gitdir but
             // hides staged gitlinks too. Cached raw diff reads only our own index/tree.
             const stagedGitlinks = head !== null || index.some(e => e.mode === '160000')
               ? (await read(['diff', '--cached', '--raw', '--no-abbrev', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--'], [0], INTERNAL_BYTES)).stdout.text.split('\n').filter(line => /^:(?:160000 |[0-9]{6} 160000 )/.test(line)).join('\n') : ''
+            await check()
+            // Only changed leaves reported by status, never every tracked/ignored file.
+            const fields = result.stdout.text.split('\0'), paths: string[] = []
+            for (let i = 0; i < fields.length; i++) {
+              const field = fields[i]!
+              if (!field) continue
+              const path = literalPath(field.slice(3))
+              if (!index.some(e => e.mode === '160000' && (e.path === path || path.startsWith(`${e.path}/`)))) paths.push(path)
+              if (/^[RC]|^.[RC]/.test(field.slice(0, 2))) i++
+            }
+            const changed = await observeTargets(state.root, paths, true)
+            state.files = changed.files; state.fileKinds = changed.fileKinds
             await check()
             for (const [key, snap] of snapshots) if (expired(snap)) snapshots.delete(key)
             if (snapshots.size >= 32) snapshots.delete(snapshots.keys().next().value!)
@@ -232,12 +262,14 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           }
           if (r.action === 'log') {
             const stdout = head === null ? '' : (await read(['log', `-${r.count}`, '--format=medium', '--no-decorate', '--no-show-signature', 'HEAD', '--'])).stdout.text
+            await check()
             return { status: 'succeeded', action: r.action, stdout }
           }
           if (r.action === 'diff') {
             if (r.paths) await validatePaths(r.paths, false)
-            const result = await read(['diff', ...(r.target === 'staged' ? ['--cached'] : []), '--no-ext-diff', '--no-textconv', '--no-renames', r.target === 'staged' ? '--ignore-submodules=none' : '--ignore-submodules=all', '--submodule=short', '--', ...(r.paths ?? [])])
-            return { status: 'succeeded', action: r.action, stdout: result.stdout.text }
+            const result = await read(['diff', ...(r.target === 'staged' ? ['--cached'] : []), '--no-ext-diff', '--no-textconv', '--no-renames', r.target === 'staged' ? '--ignore-submodules=none' : '--ignore-submodules=all', '--submodule=short', '--', ...(r.paths ?? [])], [0], DISPLAY_BYTES, true)
+            await check()
+            return { status: 'succeeded', action: r.action, stdout: result.stdout.text, stderr: result.stderr.text, stdoutTruncated: result.stdout.truncated, stderrTruncated: result.stderr.truncated, ...(result.stdout.truncated || result.stderr.truncated ? { message: 'Truncated preview only; not complete summary or approval material.' } : {}) }
           }
           // single-use even on denial/change/cancellation
           const snap = deps.handoff ? deps.handoff.take(r.expectedSnapshot) : snapshots.get(r.expectedSnapshot)
@@ -246,7 +278,10 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           // policy differs by session, so only the shared workspace root is compared.
           const policyMatches = deps.handoff ? snap?.workspaceRoot === deps.workspaceRoot : snap?.policy === initialPolicy
           if (!snap || expired(snap) || snap.owner !== (deps.handoff?.owner ?? owner) || snap.state.identity !== state.identity || snap.state.digest !== state.digest || snap.head !== head || !policyMatches) deny('expectedSnapshot missing, expired, foreign or changed')
-          writeSnapshot = snap
+          if (r.action === 'stage') for (const path of r.paths) {
+            if (!snap.state.files.has(path)) deny(`stage target not observed by status; fresh status required: ${path}`)
+            if (snap.state.files.get(path) !== state.files.get(path) || JSON.stringify(snap.state.fileKinds.get(path)) !== JSON.stringify(state.fileKinds.get(path))) deny('stage target changed since status')
+          }
           if (state.locks.length) deny(`Git locks present (not removed): ${state.locks.join(', ')}`)
           let args: string[], indexPatch: string | undefined
           if (r.action === 'stage') {
@@ -262,26 +297,38 @@ export function createLocalVersionControl(deps: LocalGitDependencies): {
           const argv = fullArgv(args)
           const plan = {
             action: r.action, repository: state.root, layout: state.layout, ...(writableRoots ? { additionalWritableRoots: writableRoots } : {}), identity: state.identity, head, indexDigest: state.indexDigest,
-            treeDigest: state.digest, configDigest: state.configDigest, attributesDigest: state.attributesDigest,
+            treeDigest: state.digest, configDigest: state.configDigest, attributesDigest: r.action === 'stage' ? digest(JSON.stringify([state.attributesDigest, targets!.attributesDigest])) : state.attributesDigest,
             argv, owner, policy: initialPolicy,
-            ...(r.action === 'stage' ? { targets: r.paths.map(path => ({ path, digest: state.files.get(path) ?? null, ...(state.fileKinds.get(path) ?? {}) })) } : { entireIndex: index, indexPatch }),
+            ...(r.action === 'stage' ? { targets: r.paths.map(path => ({ path, digest: state.files.get(path) === 'missing' ? null : state.files.get(path) ?? null, ...(state.fileKinds.get(path) ?? {}) })) } : { entireIndex: index, indexPatch }),
           }
           const reason = `Local Git exact one-shot write; no remote operation. Commit covers the ENTIRE actual index.${writableRoots ? ` Also grants this one call write access to the linked worktree's shared Git directory ${writableRoots[0]} (outside the workspace).` : ''}\n${JSON.stringify(plan)}`
-          await check(true)
+          await check()
           // Capability probe is side-effect free; never ask approval for an unenforceable write.
           // Same policy shape as the real write run (incl. the exact external commondir grant).
           const confinement = await deps.sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: deps.workspaceRoot, sessionId: deps.sessionId, ...(writableRoots ? { additionalWritableRoots: [...writableRoots] } : {}) }, signal)
           if (confinement.enforcement !== 'full' || !confinement.argv.length) deny('full write confinement unavailable')
           if (!deps.approval || typeof deps.approval.request !== 'function') deny('approval service unavailable')
+          // Fresh at approval admission; user reading time does not expire the plan.
+          if (expired(snap)) deny('expectedSnapshot expired before approval')
           let granted: string
           try { granted = await deps.approval.request({ agent: deps.agent, toolName: 'satellite_version_control', ...(callId ? { callId } : {}), reason, signal }) }
           catch { deny('approval service exception; denied') }
           if (granted !== 'allowed-once') deny(`approval ${granted}; denied`)
-          if (expired(snap)) deny('expectedSnapshot expired while awaiting approval')
-          await check(true) // freeze binds actual repo+HEAD+index+all target contents+config/attributes+argv
           const result = await run(args, true)
           const unknown = result.aborted || result.timedOut || result.cleanup !== 'completed' || !!result.failureDetail || result.exitCode !== 0
-          return { status: unknown ? 'effect-unknown' : 'succeeded', action: r.action, exitCode: result.exitCode, stdout: result.stdout.text, stderr: result.stderr.text, stdoutTruncated: result.stdout.truncated, stderrTruncated: result.stderr.truncated, ...(unknown ? { message: 'Write may have taken effect. Observe status before any new decision; never automatically retry.' } : {}) }
+          if (unknown) return { status: 'effect-unknown', action: r.action, exitCode: result.exitCode, stdout: result.stdout.text, stderr: result.stderr.text, stdoutTruncated: result.stdout.truncated, stderrTruncated: result.stderr.truncated, message: 'Write may have taken effect. Observe status before any new decision; never automatically retry.' }
+          // Return only post-write facts, without a status/log round trip.
+          try {
+            const after = await observeRepository(deps.workspaceRoot, r.repo)
+            if (after.identity !== state.identity || after.configDigest !== state.configDigest || policy(true) !== initialPolicy) deny('post-write context changed')
+            readStamp = after.metadataStamp
+            const afterResult = await run(['rev-parse', '--verify', '--quiet', 'HEAD'])
+            const afterHead = afterResult.exitCode === 1 ? null : afterResult.stdout.text.trim()
+            if (![0, 1].includes(afterResult.exitCode ?? -1) || afterResult.stdout.truncated || afterResult.stderr.truncated || afterResult.aborted || afterResult.timedOut || afterResult.cleanup !== 'completed' || afterResult.failureDetail || (afterHead !== null && !/^[a-f0-9]{40}$/.test(afterHead))) deny('post-write HEAD unavailable')
+            return { status: 'succeeded', action: r.action, exitCode: result.exitCode, stdout: result.stdout.text, stderr: result.stderr.text, stdoutTruncated: result.stdout.truncated, stderrTruncated: result.stderr.truncated, beforeHead: head, afterHead, indexDigest: after.indexDigest, actualScope: r.action === 'stage' ? r.paths : index.map(e => e.path) }
+          } catch (error) {
+            return { status: 'effect-unknown', action: r.action, message: `Write completed but post-write facts unavailable: ${error instanceof Error ? error.message : String(error)}. Observe before any new decision; never automatically retry.` }
+          }
         })
       } catch (error) {
         return { status: 'blocked', ...(request ? { action: request.action } : {}), message: error instanceof Error ? error.message : String(error) }

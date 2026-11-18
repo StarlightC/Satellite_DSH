@@ -256,6 +256,28 @@ test('paths require exact files, reject directories/controls/git/escapes; tracke
   assert.equal(deletion.status, 'succeeded', JSON.stringify(deletion)); assert.match(deletion.stdout, /deleted file mode/)
 })
 
+test('status preserves staged deletion at a D/F boundary and commit leaves unrelated directory contents alone', async t => {
+  const f = await fixture(t); await f.put('x', 'old leaf'); await f.put('keep', 'kept'); await f.put('.gitignore', 'x/\n')
+  f.git(['add', '--', 'x', 'keep', '.gitignore']); f.git(['commit', '--quiet', '-m', 'seed'])
+  f.git(['rm', '--', 'x']); await f.put('x/y', 'unrelated ignored content')
+  const h = host(f), observed = await h.exec({ action: 'status' })
+  assert.equal(observed.status, 'succeeded', JSON.stringify(observed)); assert.match(observed.stdout, /D  x\0/)
+  const snapshot = h.kernel.take(observed.expectedSnapshot)
+  assert.deepEqual([...snapshot.state.files], [['x', 'directory-boundary']])
+  assert.equal(snapshot.state.fileKinds.has('x'), false)
+  const committed = await h.exec({ action: 'commit', message: 'delete leaf only', expectedSnapshot: await h.snapshot() })
+  assert.equal(committed.status, 'succeeded', JSON.stringify(committed))
+  assert.match(f.git(['diff-tree', '--no-commit-id', '--name-status', '-r', 'HEAD']), /^D\s+x\n$/)
+  assert.equal(await readFile(join(f.root, 'x/y'), 'utf8'), 'unrelated ignored content')
+  const plan = JSON.parse(h.calls.approval[0].reason.split('\n').slice(1).join('\n'))
+  assert.match(plan.indexPatch, /deleted file mode/); assert.ok(!plan.indexPatch.includes('unrelated ignored content'))
+  const writes = h.calls.write, approvals = h.calls.approval.length
+  const directoryStage = await stage(h, ['x'])
+  assert.equal(directoryStage.status, 'blocked', JSON.stringify(directoryStage))
+  assert.match(directoryStage.message, /exact regular file/)
+  assert.equal(h.calls.write, writes); assert.equal(h.calls.approval.length, approvals)
+})
+
 test('ordinary symlink/index mode, ignored dependency links, hardlinks and POSIX literal filenames work; snapshots bind their content', async t => {
   const f = await fixture(t); await f.put('Nextpages/[id].tsx', 'page\n'); await f.put('.gitignore', 'dependencies/\n')
   await f.put('dependencies/original', 'hardlink content\n')
@@ -274,11 +296,14 @@ test('ordinary symlink/index mode, ignored dependency links, hardlinks and POSIX
   assert.equal((await h.exec({ action: 'commit', message: 'links and literal names', expectedSnapshot: await h.snapshot() })).status, 'succeeded')
   assert.match(f.git(['ls-files', '--stage']), /120000 .*\tpage-link/)
   assert.equal((await h.exec({ action: 'diff', target: 'staged', paths: ['Nextpages/[id].tsx'] })).status, 'succeeded')
+  await f.put('Nextpages/[id].tsx', 'observed page change\n')
   const token = await h.snapshot()
   await f.put('dependencies/hardlink', 'changed through alias\n')
-  assert.equal((await h.exec({ action: 'stage', paths: ['Nextpages/[id].tsx'], expectedSnapshot: token })).status, 'blocked')
-  const linkToken = await h.snapshot(), path = await f.target('page-link')
-  assert.equal((await lstat(path)).isSymbolicLink(), true); await unlink(path); await symlink('different', path)
+  assert.equal((await h.exec({ action: 'stage', paths: ['Nextpages/[id].tsx'], expectedSnapshot: token })).status, 'succeeded')
+  const path = await f.target('page-link')
+  assert.equal((await lstat(path)).isSymbolicLink(), true); await unlink(path); await symlink('observed-change', path)
+  const linkToken = await h.snapshot()
+  await unlink(path); await symlink('different', path)
   assert.equal((await h.exec({ action: 'stage', paths: ['page-link'], expectedSnapshot: linkToken })).status, 'blocked')
   assert.equal((await stage(h, ['dependencies/directory/Nextpages/[id].tsx'])).status, 'blocked')
 })
@@ -400,6 +425,23 @@ test('snapshots cannot be forged, crossed between instances or reused; pre-appro
   assert.equal((await h.exec({ action: 'stage', paths: ['x'], expectedSnapshot: fresh })).status, 'blocked')
 })
 
+test('clean status cannot authorize later target content; fresh status stages the observed change', async t => {
+  const f = await fixture(t); await f.put('x', 'seed')
+  f.git(['add', '--', 'x']); f.git(['commit', '--quiet', '-m', 'seed'])
+  const h = host(f), clean = await h.exec({ action: 'status' })
+  assert.equal(clean.status, 'succeeded', JSON.stringify(clean)); assert.equal(clean.stdout, '')
+  await f.put('x', 'changed after clean status')
+  const stale = await h.exec({ action: 'stage', paths: ['x'], expectedSnapshot: clean.expectedSnapshot })
+  assert.equal(stale.status, 'blocked', JSON.stringify(stale)); assert.match(stale.message, /not observed.*fresh status/i)
+  assert.equal(h.calls.approval.length, 0); assert.equal(h.calls.write, 0)
+  assert.equal(f.git(['diff', '--cached', '--name-only']), '')
+  const fresh = await h.snapshot(), start = h.calls.spawn.length
+  const staged = await h.exec({ action: 'stage', paths: ['x'], expectedSnapshot: fresh })
+  assert.equal(staged.status, 'succeeded', JSON.stringify(staged))
+  assert.equal(f.git(['show', ':x']), 'changed after clean status')
+  assert.ok(h.calls.spawn.slice(start).every(s => !s.argv.includes('status')))
+})
+
 test('approval-time tree/index/HEAD/config/attributes/policy changes are denied without write retry', async t => {
   for (const kind of ['tree', 'index', 'HEAD', 'config', 'attributes', 'policy']) {
     await t.test(kind, async t => {
@@ -481,13 +523,21 @@ test('snapshot lifetime and calling session are enforced independently of prompt
   assert.equal(h.calls.write, 0); assert.equal(h.calls.approval.length, 0)
 })
 
-test('snapshot expiry during approval cannot authorize a later write', async t => {
-  const f = await fixture(t); await f.put('x', 'x'); const now = Date.now
-  const h = host(f, { approve: async () => { Date.now = () => now() + 6 * 60_000; return 'allowed-once' } })
-  try {
-    const result = await stage(h, ['x'])
-    assert.equal(result.status, 'blocked', JSON.stringify(result)); assert.equal(h.calls.write, 0)
-  } finally { Date.now = now }
+test('admitted approval survives reading past TTL but still rejects changed targets', async t => {
+  const now = Date.now
+  for (const changed of [false, true]) {
+    const f = await fixture(t); await f.put('x', 'x')
+    const h = host(f, { approve: async () => {
+      Date.now = () => now() + 6 * 60_000
+      if (changed) await f.put('x', 'changed while reading')
+      return 'allowed-once'
+    } })
+    try {
+      const result = await stage(h, ['x'])
+      assert.equal(result.status, changed ? 'blocked' : 'succeeded', JSON.stringify(result))
+      assert.equal(h.calls.write, changed ? 0 : 1)
+    } finally { Date.now = now }
+  }
 })
 
 test('same repo is serialized across kernel instances; second request observes first write', async t => {
@@ -523,33 +573,66 @@ test('cancellation during write returns effect-unknown and does not retry', asyn
   assert.equal((await h.exec({ action: 'status' })).status, 'succeeded')
 })
 
-test('no artificial repository quota: >64 MiB total, >8 MiB file and >20k entries observe and bind changes', async t => {
-  const f = await fixture(t), h = host(f), started = Date.now()
+test('status binds a large changed target, never ignored contents or unused object contents', async t => {
+  const f = await fixture(t), h = host(f)
   const big = Buffer.alloc(9 * 1024 * 1024, 0x61)
   await f.put('.gitignore', 'cache/\n')
-  for (let i = 0; i < 8; i++) await f.put(`cache/big-${i}.bin`, big) // 72 MiB total, each 9 MiB
-  await mkdir(await f.target('cache/many'), { recursive: true })
-  for (let i = 0; i < 20_050; i += 500) await Promise.all(Array.from({ length: Math.min(500, 20_050 - i) }, (_, j) => writeFile(join(f.root, 'cache/many', `f${i + j}`), '')))
-  const setup = Date.now()
-  // expectedSnapshot is a random token; take() exposes the observed tree so the real full-content digest can be checked.
+  await f.put('tracked.bin', big); f.git(['add', '--', '.gitignore', 'tracked.bin']); f.git(['commit', '--quiet', '-m', 'large tracked seed'])
+  await f.put('cache/ignored', 'ignored before')
+  // An unused dangling object link made the old full metadata walk fail; neither
+  // snapshot observation nor Git's requested operation should read this object.
+  await mkdir(await f.target('.git/objects/aa'), { recursive: true })
+  await symlink('/nonexistent/unused-object', await f.target('.git/objects/aa/unused'))
+  big[big.length - 1] = 0x62; await f.put('tracked.bin', big)
   const before = await h.exec({ action: 'status' })
   assert.equal(before.status, 'succeeded', JSON.stringify(before))
-  const observed = Date.now()
   const first = h.kernel.take(before.expectedSnapshot)
-  assert.ok(first, 'status snapshot must be retrievable through take()')
-  assert.equal(first.state.files.size, 20_059) // .gitignore + 8 big files + 20,050 entries
-  assert.equal(first.state.files.get('cache/many/f20049'), createHash('sha256').update('').digest('hex'))
-  const firstDigest = createHash('sha256').update(big).digest('hex')
-  assert.equal(first.state.files.get('cache/big-7.bin'), firstDigest)
-  big[big.length - 1] = 0x62
-  await f.put('cache/big-7.bin', big) // same size, last byte differs: full-content hash must change
-  const after = await h.exec({ action: 'status' })
-  assert.equal(after.status, 'succeeded', JSON.stringify(after))
-  const second = h.kernel.take(after.expectedSnapshot)
-  assert.ok(second, 'status snapshot must be retrievable through take()')
-  assert.equal(second.state.files.size, 20_059)
-  const secondDigest = createHash('sha256').update(big).digest('hex')
-  assert.notEqual(firstDigest, secondDigest) // independent whole-buffer hashes, not tree digests (mtime/ctime)
-  assert.equal(second.state.files.get('cache/big-7.bin'), secondDigest)
-  t.diagnostic(`setup ${setup - started}ms, observe ${observed - setup}ms, re-observe ${Date.now() - observed}ms`)
+  assert.deepEqual([...first.state.files.keys()], ['tracked.bin'])
+  assert.equal(first.state.files.get('tracked.bin'), createHash('sha256').update(big).digest('hex'))
+  await f.put('cache/ignored', 'ignored after')
+  const token = await h.snapshot()
+  big[big.length - 1] = 0x63; await f.put('tracked.bin', big)
+  assert.equal((await h.exec({ action: 'stage', paths: ['tracked.bin'], expectedSnapshot: token })).status, 'blocked')
+  t.diagnostic(`changed-leaf hashes=${first.state.files.size}; ignored/object leaves absent; large last-byte change is bound`)
+})
+
+test('commit ignores unrelated worktree changes during approval and returns final facts without status/log', async t => {
+  const f = await fixture(t); await f.put('x', 'seed'); await f.put('y', 'seed')
+  f.git(['add', '--', 'x', 'y']); f.git(['commit', '--quiet', '-m', 'seed'])
+  await f.put('x', 'staged'); f.git(['add', '--', 'x'])
+  await f.put('.gitignore', 'ignored/\n')
+  const h = host(f, { approve: async () => {
+    await f.put('y', 'unrelated unstaged'); await f.put('new-untracked', 'new'); await f.put('ignored/data', 'ignored')
+    return 'allowed-once'
+  } })
+  const token = await h.snapshot(), start = h.calls.spawn.length
+  const result = await h.exec({ action: 'commit', message: 'only index', expectedSnapshot: token })
+  assert.equal(result.status, 'succeeded', JSON.stringify(result))
+  assert.match(result.beforeHead, /^[a-f0-9]{40}$/); assert.match(result.afterHead, /^[a-f0-9]{40}$/)
+  assert.notEqual(result.beforeHead, result.afterHead); assert.deepEqual(result.actualScope, ['x', 'y'])
+  assert.equal(result.indexDigest, createHash('sha256').update(await readFile(join(f.root, '.git/index'))).digest('hex'))
+  assert.ok(h.calls.spawn.slice(start).every(s => !s.argv.includes('status') && !s.argv.includes('log')))
+  assert.equal(f.git(['show', 'HEAD:y']), 'seed')
+})
+
+test('one combined diff returns explicit preview, while internal approval truncation still refuses', async t => {
+  const f = await fixture(t), h = host(f)
+  await f.put('large.txt', Array.from({ length: 4000 }, (_, i) => `${i} ${'text '.repeat(20)}\n`).join(''))
+  f.git(['add', '--', 'large.txt'])
+  const diff = await h.exec({ action: 'diff', target: 'staged' })
+  assert.equal(diff.status, 'succeeded', JSON.stringify(diff)); assert.equal(diff.stdoutTruncated, true)
+  assert.match(diff.message, /preview.*not complete/i)
+  // Existing provider seam: signal incomplete internal content without allocating 16MiB.
+  const spawn = h.deps.subprocess.spawn
+  h.deps.subprocess.spawn = spec => {
+    const child = spawn(spec)
+    if (spec.argv.includes('--binary')) {
+      const read = child.collected.stdout.readFrom
+      child.collected.stdout.readFrom = (...args) => ({ ...read(...args), lossy: true })
+    }
+    return child
+  }
+  const result = await h.exec({ action: 'commit', message: 'incomplete internal patch', expectedSnapshot: await h.snapshot() })
+  assert.equal(result.status, 'blocked'); assert.match(result.message, /internal index\/approval/)
+  assert.equal(h.calls.approval.length, 0); assert.equal(h.calls.write, 0)
 })

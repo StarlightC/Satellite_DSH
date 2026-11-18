@@ -373,7 +373,6 @@ test('handoff: changes after approval or during the FINAL write confinement prod
     'index in final confine': { run: () => git(h.f.root, 'update-index', '--add', '--cacheinfo', '100644', git(h.f.root, 'hash-object', '-w', join(h.f.root, 'x')).trim(), 'y') },
     'config in final confine': { run: () => git(h.f.root, 'config', 'user.name', 'changed') },
     'policy read-only in final confine': { run: () => { h.root.session.mode = 'read-only' }, after: () => { h.root.session.mode = 'workspace-write' } },
-    'snapshot expired in final confine': { run: () => { Date.now = () => realNow() + 60 * 60_000 }, after: () => { Date.now = realNow } },
   }
   for (const [name, m] of Object.entries(mutations)) {
     writeFileSync(join(h.f.root, 'x'), `${name}\n`)

@@ -201,27 +201,24 @@ test('linked worktree writes deny lock, pointer, config and permission changes; 
   }
 })
 
-test('two worktrees sharing one commondir: concurrent writes serialize, stale one denied, each granted exactly that commondir', async t => {
-  const l = await layout(t)
-  const wt2 = join(l.base, 'wt2')
+test('two worktrees sharing one commondir serialize without invalidating unrelated private indexes', async t => {
+  const l = await layout(t), wt2 = join(l.base, 'wt2')
   l.git(l.main, 'worktree', 'add', '--quiet', '-b', 'feature2', wt2)
   await l.put(join(l.wt, 'shared.txt'), 'one\n'); await l.put(join(wt2, 'shared.txt'), 'two\n')
-  const h1 = host(l.wt), h2 = host(wt2)
+  let entered, release
+  const atApproval = new Promise(resolve => { entered = resolve }), held = new Promise(resolve => { release = resolve })
+  const h1 = host(l.wt, { approve: async () => { entered(); await held } }), h2 = host(wt2)
   const [s1, s2] = await Promise.all([h1.snapshot(), h2.snapshot()])
-  const [r1, r2] = await Promise.all([
-    h1.exec({ action: 'stage', paths: ['shared.txt'], expectedSnapshot: s1 }),
-    h2.exec({ action: 'stage', paths: ['shared.txt'], expectedSnapshot: s2 }),
-  ])
-  // Serialized on the shared commondir: the second sees the first's metadata change and is
-  // denied stale with no write; a fresh observation then succeeds.
-  const results = [r1, r2].map(r => r.status).sort()
-  assert.deepEqual(results, ['blocked', 'succeeded'], JSON.stringify([r1, r2]))
-  const [loser, lost] = r1.status === 'blocked' ? [h1, r1] : [h2, r2]
-  assert.match(lost.message, /expectedSnapshot/); assert.equal(h1.calls.write + h2.calls.write, 1)
-  const retry = await loser.exec({ action: 'stage', paths: ['shared.txt'], expectedSnapshot: await loser.snapshot() })
-  assert.equal(retry.status, 'succeeded', JSON.stringify(retry))
-  assert.equal(l.git(l.wt, 'diff', '--cached', '--name-only'), 'shared.txt\n')
-  assert.equal(l.git(wt2, 'diff', '--cached', '--name-only'), 'shared.txt\n')
+  const first = h1.exec({ action: 'stage', paths: ['shared.txt'], expectedSnapshot: s1 })
+  await atApproval
+  const second = h2.exec({ action: 'stage', paths: ['shared.txt'], expectedSnapshot: s2 })
+  const before = h2.calls.spawn.length
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(h2.calls.spawn.length, before); assert.equal(h2.calls.approval.length, 0)
+  release()
+  const results = await Promise.all([first, second])
+  assert.deepEqual(results.map(r => r.status), ['succeeded', 'succeeded'], JSON.stringify(results))
+  for (const wt of [l.wt, wt2]) assert.equal(l.git(wt, 'diff', '--cached', '--name-only'), 'shared.txt\n')
   assert.equal(l.git(l.main, 'diff', '--cached', '--name-only'), '')
   for (const h of [h1, h2]) for (const c of writeConfines(h)) assert.deepEqual(c.policy.additionalWritableRoots, [l.commonDir])
 })
