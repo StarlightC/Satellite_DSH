@@ -54,7 +54,12 @@ Per-intent notes:
 - **commit / version-control** — an optional local node, not a default tail of any
   intent. Only an explicit user request selects it; method text does not make an
   unavailable node callable. Exact scope and fresh host approval are required for
-  each write; prior evidence or authorization is not reusable approval.
+  each write; prior evidence or authorization is not reusable approval. An explicit
+  commit normally finishes in this ONE node: status for scope, at most one combined
+  diff for a useful summary, stage if requested, then commit the entire actual index.
+  Do not prepend context/solution/review/validate/signoff, tests/builds, quality review
+  or acceptance. Ask only if scope is unclear; do not repeat whole-tree scans.
+  Success reports message/hash/scope and stops without another log/status.
 - **release-preparation** — collects the goal, checks the applicable readiness
   matrix, and reports readiness and blockers. Publishing is a separate decision.
 
