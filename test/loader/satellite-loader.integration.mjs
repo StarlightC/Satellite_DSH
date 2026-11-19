@@ -507,6 +507,32 @@ async function delegatedChildCall(tool, args, answer) {
   return texts
 }
 
+/** One base-node turn whose child calls the declared parser tool in the given order. */
+async function delegatedNodeCalls(node, calls, answer) {
+  let base
+  resetState()
+  state.approvalAnswer = answer
+  const texts = []
+  state.script = (req) => {
+    if (req.kind === 'main') {
+      base ??= req.toolResults
+      return req.toolResults === base
+        ? { tool: 'satellite_node', args: { node, task: `[node=${node}] declared parser` } }
+        : { text: 'MAIN DONE' }
+    }
+    if (req.last?.role === 'tool') texts.push(req.last.text)
+    const call = calls[req.toolResults]
+    return call ? { tool: 'satellite_skill_script_run', args: call } : { text: 'CHILD DONE' }
+  }
+  await runTurn(`declared parser via ${node}`)
+  return {
+    texts,
+    child: state.requests.find((request) => request.kind === 'child'),
+    // The session keeps earlier turns' tool results; only this turn's are ours.
+    main: mainToolResults().slice(base ?? 0),
+  }
+}
+
 test('delegated approval: Android device discover through the real Loader (allowed-once / rejected / parent never)', async () => {
   await enableAndroidExecution()
   const root = await mainAgent()
@@ -547,7 +573,10 @@ test('delegated approval: Android device discover through the real Loader (allow
   } finally { off?.() }
 })
 
-test('delegated approval: skill script run through the real Loader (allowed-once runs once, rejected runs nothing)', async () => {
+test('delegated approval (execution recorder): skill script asks the parent once; only allowed-once reaches the shell seam', async () => {
+  // This is a Loader-level wiring/recorder test, NOT native execution: the shell
+  // seam returns a fixed "PARSED" result. The native interpreter + sandbox chain
+  // is covered by the next test on purpose.
   const { mkdirSync, writeFileSync } = await import('node:fs')
   const dir = join(world.repo, '.dsh', 'skills', 'parser-skill')
   mkdirSync(join(dir, 'scripts'), { recursive: true })
@@ -568,6 +597,94 @@ test('delegated approval: skill script run through the real Loader (allowed-once
       assert.match(allowed[0] ?? '', /PARSED/, allowed[0])
     })
   } finally { rmSync(join(world.repo, '.dsh'), { recursive: true, force: true }) }
+})
+
+test('delegated approval (native): read-only context runs an isolated declared parser with the real interpreter and sandbox; rejection zero, write denied, next call re-asks', async () => {
+  // Real chain: no shell/fs/subprocess replacement. The only deterministic input
+  // is the scripted model and the approval answerer (test input, NOT human
+  // approval evidence). The parser reads a known fixture with the real node
+  // interpreter under the real read-only file sandbox.
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  const skillName = 'loader-native-parser'
+  const dir = join(world.repo, '.dsh', 'skills', skillName)
+  const payload = 'SATELLITE_KNOWN_FIXTURE_2f9c'
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  writeFileSync(join(dir, 'SKILL.md'), `---\nname: ${skillName}\ndescription: loader native parser fixture\n---\nRead the fixture with the declared parser.\n`)
+  writeFileSync(join(dir, 'payload.txt'), `${payload}\n`)
+  writeFileSync(join(dir, 'scripts', 'manifest.json'), JSON.stringify({ schemaVersion: 1, scripts: [
+    { id: 'read-known', path: 'scripts/read-known.mjs', runtime: 'node', execution: 'stdin-v1', parameters: [], timeoutMs: 10000, outputMaxBytes: 4096 },
+    { id: 'write-probe', path: 'scripts/write-probe.mjs', runtime: 'node', execution: 'stdin-v1', parameters: [], timeoutMs: 10000, outputMaxBytes: 4096 },
+  ] }))
+  writeFileSync(join(dir, 'scripts', 'read-known.mjs'), `import { readFileSync } from 'node:fs'
+const payload = readFileSync('payload.txt', 'utf8').trim()
+console.log(JSON.stringify({ payload, cwd: process.cwd(), args: process.argv.slice(2) }))
+`)
+  writeFileSync(join(dir, 'scripts', 'write-probe.mjs'), `import { writeFileSync } from 'node:fs'
+writeFileSync('native-write-probe.txt', 'written\\n')
+console.log('WROTE')
+`)
+  const read = { skill: skillName, script: 'read-known', parameters: {} }
+  const write = { skill: skillName, script: 'write-probe', parameters: {} }
+  const probe = join(dir, 'native-write-probe.txt')
+  const childAgents = []
+  const off = ctx.on('agent/created', ({ agent }) => { if (agent.session.header.origin === 'subagent') childAgents.push(agent) })
+  try {
+    const rejected = await delegatedNodeCalls('context', [read], 'rejected')
+    assert.equal(state.approvals.length, 1)
+    assert.equal(rejected.texts.length, 1, JSON.stringify(rejected.texts))
+    assert.match(rejected.texts[0] ?? '', /approval rejected/, rejected.texts[0])
+    assert.doesNotMatch(rejected.texts[0] ?? '', new RegExp(payload), 'rejection produced no parser evidence')
+
+    const allowed = await delegatedNodeCalls('context', [read, write, read], 'allowed-once')
+    assert.equal(allowed.texts.length, 3, JSON.stringify(allowed.texts, null, 1))
+    // Wiring facts that do not depend on the native sandbox backend:
+    // a new child call asks again: no cached/replayed permit, including after a
+    // failed execution.
+    assert.equal(state.approvals.length, 3, JSON.stringify(state.approvals))
+    const root = await mainAgent()
+    for (const approval of state.approvals) {
+      assert.equal(approval.agentId, root.id, 'asked of the exact parent')
+      assert.equal(approval.live, true)
+      assert.match(approval.reason, /Delegated child approval/)
+    }
+    const childCallIds = state.approvals.map((approval) => /child call (\S+)\./.exec(approval.reason)?.[1])
+    assert.equal(new Set(childCallIds).size, 3, JSON.stringify(childCallIds))
+    for (const child of childAgents) assert.equal(ctx.get('approval').effectivePolicy(child.session), 'never')
+    const child = allowed.child
+    assert.ok(child, 'child model request captured')
+    assert.ok(child.toolNames.includes('satellite_skill_script_run'), JSON.stringify(child.toolNames))
+    assert.ok(!child.toolNames.includes('satellite_parent_request'), 'read-only context has no parent-request tool')
+    assert.match(allowed.main[0] ?? '', /沙箱：satellite_node:context=read-only/)
+
+    // Everything above is real Loader wiring. The assertions below also need the
+    // host's native sandbox backend; classify an unavailable backend rather than
+    // passing as if it were verified.
+    environmentBlocked(allowed.texts, 'delegated native project parser')
+
+    const first = JSON.parse(allowed.texts[0])
+    assert.equal(first.success, true, allowed.texts[0])
+    assert.equal(first.exitCode, 0)
+    assert.equal(first.sandbox.mode, 'read-only')
+    assert.equal(first.sandbox.enforcement, 'full')
+    assert.equal(first.sandbox.denied, false)
+    const firstOutput = JSON.parse(first.stdout.text)
+    assert.equal(firstOutput.payload, payload)
+    assert.equal(realpathSync(firstOutput.cwd), realpathSync(dir), 'real parser cwd is the winning skill directory')
+    assert.deepEqual(firstOutput.args, [])
+
+    const denied = JSON.parse(allowed.texts[1])
+    assert.equal(denied.success, false, allowed.texts[1])
+    assert.notEqual(denied.exitCode, 0)
+    assert.match(denied.stderr.text, /EPERM|EACCES|EROFS|Operation not permitted|Read-only file system/i)
+    assert.equal(existsSync(probe), false, 'the read-only sandbox left no write behind')
+
+    const third = JSON.parse(allowed.texts[2])
+    assert.equal(third.success, true, allowed.texts[2])
+    assert.equal(JSON.parse(third.stdout.text).payload, payload, 'the next allowed call ran again after re-approval')
+  } finally {
+    off?.()
+    rmSync(join(world.repo, '.dsh'), { recursive: true, force: true })
+  }
 })
 
 test('delegated approval: managed emulator.start through the real Loader (allowed-once spawns once confined, rejected zero, owned handle released)', async () => {

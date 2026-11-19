@@ -2,7 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import { parseScriptManifest, runSkillScript, scriptArguments, registerSkillScriptTool } from '../src/node/lib/skill-scripts.ts'
+import { parseScriptManifest, runSkillScript, scriptArguments, registerSkillScriptTool, SKILL_SCRIPT_TOOL } from '../src/node/lib/skill-scripts.ts'
+import { createDelegatedApprovalBroker } from '../src/lib/delegated-approval.ts'
 
 const declaration = () => ({ id: 'extract', path: 'scripts/extract.mjs', runtime: 'node', execution: 'stdin-v1',
   parameters: [{ name: 'format', type: 'string', maxLength: 20, choices: ['summary', 'full'] },
@@ -337,4 +338,79 @@ test('registration does not require execution services until called', async () =
   const dispose = () => {}
   assert.equal(registerSkillScriptTool({ tools: { register(value) { tool = value; return dispose } }, get() {} }, x => x), dispose)
   await assert.rejects(tool.execute(request(), fixture().exec), /service unavailable/)
+})
+
+/**
+ * Cross-layer contract: the registered tool owns an internal delegated broker.
+ * The caller here is a role child (approval pinned to never) whose exact parent
+ * would answer a real host approval; the tool must not consult the child's own
+ * approval and must not need `satellite_parent_request`.
+ */
+function delegatedRegistration(child, options = {}) {
+  const parentAsked = []
+  const parentApproval = {
+    policy: options.parentPolicy ?? 'ask',
+    config: { policy: 'ask' },
+    overrideOf() { return this.policy },
+    async request(approvalRequest) { parentAsked.push(approvalRequest); return options.answer ?? 'allowed-once' },
+  }
+  const parent = { id: 'root', session: { id: 'root-session' }, ctx: new ServiceScope({ approval: parentApproval }) }
+  child.exec.agent.ctx = new ServiceScope(child.services)
+  const scope = new ServiceScope(child.services)
+  let tool
+  scope.tools = { register(value) { tool = value; return () => {} } }
+  const broker = createDelegatedApprovalBroker()
+  const remove = registerSkillScriptTool(scope, value => value, broker.consumer())
+  const nodeCall = new AbortController()
+  const unbind = broker.issuer.bind({
+    child: child.exec.agent, childSession: child.exec.agent.session,
+    parent, parentSession: parent.session, runId: 'run-1', parentCallId: 'parent-call-1',
+    signal: nodeCall.signal, live: () => true,
+    toolOf: (name) => name === SKILL_SCRIPT_TOOL ? tool : undefined,
+  })
+  return {
+    child, parent, parentAsked, tool, unbind, nodeCall, remove,
+    run: () => tool.execute(request(), child.exec),
+  }
+}
+
+test('delegated skill script: read-only child asks the exact parent once and runs once, without its own never approval', async () => {
+  const f = fixture()
+  f.state.policy.mode = 'read-only'
+  const d = delegatedRegistration(f)
+  try {
+    const result = await d.run()
+    assert.equal(result.success, true)
+    assert.equal(d.parentAsked.length, 1)
+    assert.equal(d.parentAsked[0].agent, d.parent, 'asked of the exact parent object')
+    assert.equal(d.parentAsked[0].callId, 'parent-call-1', 'tagged with the parent satellite_node call')
+    assert.match(d.parentAsked[0].reason, /Delegated child approval/)
+    assert.match(d.parentAsked[0].reason, /child call call-1/)
+    assert.equal(f.state.approvals.length, 0, 'the child pinned never is never consulted')
+    assert.equal(f.state.specs.length, 1)
+    assert.equal(f.state.specs[0].sandboxPolicy.mode, 'read-only')
+  } finally {
+    d.unbind()
+    d.remove()
+  }
+})
+
+for (const [label, options, pattern, asks] of [
+  ['rejected', { answer: 'rejected' }, /approval rejected: parent user rejected/, 1],
+  ['cancelled', { answer: 'cancelled' }, /approval cancelled: parent approval cancelled/, 1],
+  ['unavailable', { answer: 'unavailable' }, /approval unavailable: no parent approval answerer available/, 1],
+  ['parent never', { parentPolicy: 'never' }, /approval unavailable: .*never.*nothing ran/, 0],
+]) test(`delegated skill script ${label}: zero execution, no child-policy fallback`, async () => {
+  const f = fixture()
+  f.state.policy.mode = 'read-only'
+  const d = delegatedRegistration(f, options)
+  try {
+    await assert.rejects(d.run(), pattern)
+    assert.equal(f.state.specs.length, 0, 'the native shell never received a spec')
+    assert.equal(f.state.approvals.length, 0, 'the child never was not asked')
+    assert.equal(d.parentAsked.length, asks)
+  } finally {
+    d.unbind()
+    d.remove()
+  }
 })

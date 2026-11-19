@@ -113,6 +113,24 @@ test('a managed child keeps its role tools', async () => {
   } finally { await f.ctx.fiber.dispose() }
 })
 
+test('project parser tool: coordinator call is denied before its body while a managed child keeps it', async () => {
+  const f = await fixture({ register: [...WORK, 'satellite_skill_script_run'] })
+  try {
+    const root = f.agent('root')
+    const child = f.agent('child')
+    f.roots.push(root)
+    await f.mount()
+    const args = { skill: 'parser-skill', script: 'parse', parameters: {} }
+    const denied = await f.call('satellite_skill_script_run', root, args)
+    assert.equal(denied.isError, true)
+    assert.match(denied.error.message, /satellite_node/)
+    assert.deepEqual(f.executions, [], 'the coordinator never reaches the parser body')
+    const allowed = await f.call('satellite_skill_script_run', child, args)
+    assert.equal(allowed.isError, false)
+    assert.deepEqual(f.executions.map(({ name }) => name), ['satellite_skill_script_run'])
+  } finally { await f.ctx.fiber.dispose() }
+})
+
 test('agentless host calls are not model calls and stay allowed', async () => {
   const f = await fixture()
   try {

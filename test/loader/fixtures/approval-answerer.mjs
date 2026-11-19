@@ -1,7 +1,8 @@
 // A composed `approval/request` answerer: the deterministic stand-in for the
-// human who answers the prompt. It does NOT replace the approval service — the
-// real `@deepseek-ai/dsh-user-approval` row still applies session policy, writes
-// the `approval/asked` + `approval/decided` audit pair, races the signal, and
+// human who answers the prompt. Its answers are test inputs, NOT human approval
+// evidence. It does NOT replace the approval service — the real
+// `@deepseek-ai/dsh-user-approval` row still applies session policy, writes the
+// `approval/asked` + `approval/decided` audit pair, races the signal, and
 // normalizes the outcome. This row only answers the question it is asked.
 import { state } from './script-state.mjs'
 

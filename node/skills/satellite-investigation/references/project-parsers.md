@@ -7,6 +7,11 @@ or execution service is unavailable, not permission to use another command.
 A prose reference in `SKILL.md` alone is not authorization: the project owner
 must supply a schemaVersion 1 manifest and explicitly adapt the script.
 
+This contract governs only entries declared for `satellite_skill_script_run`.
+It does not turn every script a project skill mentions into a declared parser,
+and it does not globally forbid ordinary skill scripts: those stay under their
+own skill instructions and the node or role permissions they already run under.
+
 ## Machine declaration
 
 The manifest has exactly `schemaVersion: 1` and `scripts` (1–16 entries). Every
@@ -61,10 +66,20 @@ Host approval covers the execution protocol, interpreter and env paths, exact
 invocation, declaration hash, entry-source hash, skill identity and effective
 session sandbox policy. These are checked again after approval; changes require a
 new call. A parent's forwarded `decision` or prose does not substitute for approval.
-If a child cannot obtain approval, return the exact skill/id/parameters to its
-coordinator. The parent can load the skill and make its own actual tool call under
-its own approval boundary, then pass the original result back. Pure-text work may
-continue; do not weaken the child or switch to direct shell execution.
+
+A role child runs with its own approval pinned to never; it does not fall back to
+a parent tool call. `satellite_skill_script_run` routes exactly one real approval
+per child call to the exact delegating parent through its internal delegated
+broker, tagged with the parent's open `satellite_node` call and the child call,
+while the child keeps its own read-only fs/shell services. A read-only
+investigation child has no `satellite_parent_request`; the broker is part of the
+tool and remains available. Only `allowed-once` starts execution. Rejection,
+cancellation, an unavailable answerer, or a changed delegation/binding/permit
+means zero execution: report it and stop. Do not retry around the decision,
+weaken the child, or ask the coordinator to call the tool in its place — the main
+coordinator cannot call it directly (it is outside the closed coordination set),
+and a read-only child has no `satellite_parent_request` to stage one. Pure-text
+work may continue.
 
 All parser calls request read-only filesystem execution, even in a writable parent.
 This is NOT network, device, dependency, or subprocess isolation. Hashing the entry

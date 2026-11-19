@@ -263,6 +263,27 @@ interface Escalation {
   readonly justification: string
 }
 
+/** Read-only: name what cannot happen and leave the missing evidence as the result. */
+const READ_ONLY_EXECUTION_MESSAGE = 'Gradle writes project metadata; a read-only child/session cannot execute it. Nothing ran, so no build fact or evidence can be produced from this call; report the evidence gap instead of an execution.'
+
+/**
+ * Delegated child that cannot run the call itself. Registration visibility does
+ * not prove the handback tool's guard or admission will accept a request (the
+ * same node call allows only one, and the tool may reject it), so this only
+ * offers a conditional attempt and leaves the outcome to the tool's actual
+ * result; it never claims the request is staged or guaranteed.
+ *
+ * Observations belong to the caller that discovered them, so a later build can
+ * use only the parent's own observation. A build/test call therefore must not be
+ * replayed under the parent; the parent has to discover-build again.
+ */
+function delegatedHandback(action: string): string {
+  if (action !== 'project.discover-build') {
+    return ' Nothing ran. This build/test call cannot be handed back unchanged: an observation belongs to the caller that discovered it, so the parent cannot use this call\'s observationId. If the parent should proceed, it must run its own satellite_android_project discover-build as a new operation for this project (not a replay of this build), then build/test with the parent-owned observation. Only a discover-build may be requested as-is; if this scope actually provides satellite_parent_request, that attempt\'s actual return decides whether anything is staged, and the parent may decline. Otherwise report this exact call as a pending item. No child policy was changed.'
+  }
+  return ' Nothing ran. Only discover-build can be handed back unchanged. If this scope actually provides satellite_parent_request, you may try staging exactly one satellite_android_project discover-build call with this call\'s identical arguments; that tool\'s actual return decides whether the request is accepted or rejected (a visible registration does not guarantee it), and the parent runs it only if it accepts, in its own scope and under its own approval, and may decline. Otherwise report this exact call as a pending item. A later parent build must use the parent-owned observation. No child policy was changed.'
+}
+
 function escalationGate(
   binding: ProjectBinding,
   action: string,
@@ -275,15 +296,12 @@ function escalationGate(
     return { ok: true }
   }
   const delegated = gateOf(exec)?.delegated
-  const handoff = delegated
-    ? ' Use satellite_parent_request for parent-owned discover-build of this project; a later parent build must use the parent-owned observation and its own approval. No child policy was changed.'
-    : ''
   if (binding.mode === 'read-only') {
-    return { ok: false, outcome: blocked(action, 'PATH_DENIED', `Gradle writes project metadata; a read-only child/session cannot execute it.${handoff}`) }
+    return { ok: false, outcome: blocked(action, 'PATH_DENIED', READ_ONLY_EXECUTION_MESSAGE) }
   }
   // A call permit is not authority to exceed the existing call-gate root cap.
   if (delegated && !(binding.additionalWritableRoots ?? []).includes(binding.root)) {
-    return { ok: false, outcome: blocked(action, 'PATH_DENIED', `the external project exceeds the delegated child writable roots.${handoff}`) }
+    return { ok: false, outcome: blocked(action, 'PATH_DENIED', `the external project exceeds the delegated child writable roots.${delegatedHandback(action)}`) }
   }
   if (request.sandboxPermissions !== undefined
     && !['workspace-write', 'danger-full-access'].includes(request.sandboxPermissions)) {

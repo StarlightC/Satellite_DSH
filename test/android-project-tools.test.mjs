@@ -941,27 +941,179 @@ test('static inspection recognises gradlew.bat without a host implementation', a
 })
 
 
-test('真实委派 broker 下 child readonly/额外根上限不变，交回父精确调用而非伪造 child policy', async () => {
-  for (const mode of ['read-only', 'workspace-write']) {
-    const broker = createDelegatedApprovalBroker()
-    const consumer = broker.consumer()
-    const h = externalHarness({ mode, consumerOf: () => consumer })
-    h.exec.agent.ctx = { get: name => h.services[name] }
-    let parentAsks = 0
-    const parent = { id: 'parent', session: {}, ctx: { get: name => name === 'approval' ? parentApproval : undefined } }
-    const parentApproval = { overrideOf: () => 'ask', request: async () => { parentAsks++; return 'allowed-once' } }
-    const release = broker.issuer.bind({ child: h.exec.agent, childSession: h.exec.agent.session,
-      parent, parentSession: parent.session, runId: 'node-run', parentCallId: 'node-call',
-      signal: h.exec.signal, live: () => true, toolOf: name => h.tools[name] })
+// A read-only child has no handback tool at all, so its message must not name one.
+test('真实委派 broker 下只读 child 无法执行，只报告证据缺口且不提示不存在的父请求', async () => {
+  const broker = createDelegatedApprovalBroker()
+  const consumer = broker.consumer()
+  const h = externalHarness({ mode: 'read-only', consumerOf: () => consumer })
+  h.exec.agent.ctx = { get: name => h.services[name] }
+  let parentAsks = 0
+  const parentApproval = { overrideOf: () => 'ask', request: async () => { parentAsks++; return 'allowed-once' } }
+  const parent = { id: 'parent', session: {}, ctx: { get: name => name === 'approval' ? parentApproval : undefined } }
+  const release = broker.issuer.bind({ child: h.exec.agent, childSession: h.exec.agent.session,
+    parent, parentSession: parent.session, runId: 'node-run', parentCallId: 'node-call',
+    signal: h.exec.signal, live: () => true, toolOf: name => h.tools[name] })
+  try {
     const result = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
     assert.equal(result.status, 'blocked', JSON.stringify(result))
     assert.equal(result.error.code, 'PATH_DENIED')
-    assert.match(result.error.message, /satellite_parent_request/)
+    assert.doesNotMatch(result.error.message, /satellite_parent_request/)
+    assert.match(result.error.message, /cannot execute/)
+    assert.match(result.error.message, /evidence gap/)
     assert.equal(parentAsks, 0)
     assert.equal(h.calls.spawn.length, 0)
-    assert.deepEqual(h.services.sandboxPolicy.resolve(), { mode, workspaceRoot: ROOT, sessionId: 's1' })
+    assert.deepEqual(h.services.sandboxPolicy.resolve(), { mode: 'read-only', workspaceRoot: ROOT, sessionId: 's1' })
+  } finally {
     release(); consumer.dispose(); broker.issuer.release()
   }
+})
+
+// Delegated child bound to its exact parent through the real approval broker; the
+// external root cap stops the call before any approval or spawn.
+function delegatedExternalHarness({ mode = 'workspace-write' } = {}) {
+  const broker = createDelegatedApprovalBroker()
+  const consumer = broker.consumer()
+  const h = externalHarness({ mode, consumerOf: () => consumer })
+  h.exec.agent.ctx = { get: name => h.services[name] }
+  let parentAsks = 0
+  const parentApproval = { overrideOf: () => 'ask', request: async () => { parentAsks++; return 'allowed-once' } }
+  const parent = { id: 'parent', session: {}, ctx: { get: name => name === 'approval' ? parentApproval : undefined } }
+  const release = broker.issuer.bind({ child: h.exec.agent, childSession: h.exec.agent.session,
+    parent, parentSession: parent.session, runId: 'node-run', parentCallId: 'node-call',
+    signal: h.exec.signal, live: () => true, toolOf: name => h.tools[name] })
+  return { h, broker, consumer, parent, release, parentAsks: () => parentAsks }
+}
+
+test('委派 child 的 discover-build 交回只给条件式尝试，并以子工具实际返回为准', async () => {
+  const { h, broker, consumer, release, parentAsks } = delegatedExternalHarness()
+  try {
+    const result = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
+    assert.equal(result.status, 'blocked', JSON.stringify(result))
+    assert.equal(result.error.code, 'PATH_DENIED')
+    assert.match(result.error.message, /exceeds the delegated child writable roots/)
+    assert.match(result.error.message, /Only discover-build can be handed back unchanged/)
+    assert.match(result.error.message, /may try staging exactly one satellite_android_project discover-build call with this call's identical arguments/)
+    assert.match(result.error.message, /actual return decides whether the request is accepted or rejected/)
+    assert.match(result.error.message, /parent runs it only if it accepts, in its own scope and under its own approval, and may decline/)
+    assert.match(result.error.message, /report this exact call as a pending item/)
+    assert.match(result.error.message, /later parent build must use the parent-owned observation/)
+    assert.doesNotMatch(result.error.message, /satellite_parent_request is available/)
+    assert.doesNotMatch(result.error.message, /will be staged|will stage\b|\bguaranteed\b/)
+    assert.equal(parentAsks(), 0)
+    assert.equal(h.calls.approvals.length, 0)
+    assert.equal(h.calls.spawn.length, 0)
+    assert.deepEqual(h.services.sandboxPolicy.resolve(), { mode: 'workspace-write', workspaceRoot: ROOT, sessionId: 's1' })
+  } finally {
+    release(); consumer.dispose(); broker.issuer.release()
+  }
+})
+
+test('委派 child 的 build/test 不携子 observation 原样交回，引导父自行 discover-build', async () => {
+  const { h, broker, consumer, release, parentAsks } = delegatedExternalHarness()
+  try {
+    for (const action of ['build', 'test']) {
+      const result = await h.tools[BUILD_TOOL].execute({
+        action, project: EXTERNAL, observationId: 'child-owned-observation', module: ':app', variant: 'debug',
+      }, h.exec)
+      assert.equal(result.status, 'blocked', JSON.stringify(result))
+      assert.equal(result.error.code, 'PATH_DENIED')
+      assert.match(result.error.message, /This build\/test call cannot be handed back unchanged/)
+      assert.match(result.error.message, /belongs to the caller that discovered it/)
+      assert.match(result.error.message, /cannot use this call's observationId/)
+      assert.match(result.error.message, /own satellite_android_project discover-build as a new operation/)
+      assert.match(result.error.message, /not a replay of this build/)
+      assert.match(result.error.message, /parent-owned observation/)
+      assert.match(result.error.message, /Only a discover-build may be requested as-is/)
+      assert.match(result.error.message, /actual return decides whether anything is staged/)
+      assert.match(result.error.message, /report this exact call as a pending item/)
+      assert.doesNotMatch(result.error.message, /with this call's identical arguments/)
+      assert.doesNotMatch(result.error.message, /satellite_parent_request is available/)
+      assert.doesNotMatch(result.error.message, /will be staged/)
+    }
+    assert.equal(parentAsks(), 0)
+    assert.equal(h.calls.approvals.length, 0)
+    assert.equal(h.calls.spawn.length, 0)
+  } finally {
+    release(); consumer.dispose(); broker.issuer.release()
+  }
+})
+
+test('父请求注册可见不等于 guard/admission 通过：已用一次被拒时交回消息仍不承诺暂存', async () => {
+  const approvalBroker = createDelegatedApprovalBroker()
+  const consumer = approvalBroker.consumer()
+  const h = externalHarness({ consumerOf: () => consumer })
+  const childTools = new Map()
+  const scopedTools = {
+    register(tool) { childTools.set(tool.name, tool); return () => childTools.delete(tool.name) },
+    guard() { return () => {} },
+    get(name, agent) { return agent === parent ? h.tools[name] : childTools.get(name) ?? h.tools[name] },
+    executable(name, agent) { return this.get(name, agent) },
+  }
+  let parentAsks = 0
+  const parentApproval = { overrideOf: () => 'ask', request: async () => { parentAsks++; return 'allowed-once' } }
+  const parent = { id: 'parent', session: {}, ctx: { get: name => name === 'tools' ? scopedTools : name === 'approval' ? parentApproval : undefined } }
+  h.exec.agent.ctx = { get: name => name === 'tools' ? scopedTools : h.services[name] }
+  const releaseApproval = approvalBroker.issuer.bind({ child: h.exec.agent, childSession: h.exec.agent.session,
+    parent, parentSession: parent.session, runId: 'node-run', parentCallId: 'node-call',
+    signal: h.exec.signal, live: () => true, toolOf: name => h.tools[name] })
+  const grantBroker = createParentGrantBroker({ defineTool, root: { get(name) {
+    if (name === 'tools') return scopedTools
+    if (name === 'agents') return { get: id => id === 'parent' ? parent : undefined }
+  } } })
+  const releaseRequest = grantBroker.issuer.bind({
+    child: h.exec.agent, parent, parentSession: parent.session, nodeId: 'implement',
+    runId: 'node-run', callToken: 'node-token', parentCallId: 'node-call', signal: h.exec.signal,
+    live: () => true, childMode: 'workspace-write', parentMode: () => 'workspace-write',
+  })
+  try {
+    assert.ok(childTools.has(PARENT_REQUEST_TOOL), '注册在子作用域可见')
+    const blocked = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, h.exec)
+    assert.equal(blocked.status, 'blocked', JSON.stringify(blocked))
+    assert.match(blocked.error.message, /actual return decides whether the request is accepted or rejected/)
+    assert.doesNotMatch(blocked.error.message, /satellite_parent_request is available|will be staged/)
+    const args = { action: 'discover-build', project: EXTERNAL }
+    const first = await childTools.get(PARENT_REQUEST_TOOL).execute({ tool: PROJECT_TOOL, arguments: args }, h.exec)
+    assert.equal(first.status, 'proposed', JSON.stringify(first))
+    const second = await childTools.get(PARENT_REQUEST_TOOL).execute({ tool: PROJECT_TOOL, arguments: args }, h.exec)
+    assert.equal(second.status, 'rejected')
+    assert.match(second.note, /已使用过唯一一次父请求/)
+    assert.equal(parentAsks, 0)
+    assert.equal(h.calls.approvals.length, 0)
+    assert.equal(h.calls.spawn.length, 0)
+  } finally {
+    releaseRequest(); grantBroker.release(); releaseApproval(); consumer.dispose(); approvalBroker.issuer.release()
+  }
+})
+
+test('子 observation 不能由父消费：父被拒后自行 discover-build，再用父 observation 构建成功', async () => {
+  // fixture 的 subprocess.spawn 是 seam：这里不运行真实 Gradle，只验证所有权与执行入口。
+  const h = externalHarness()
+  const child = h.exec
+  const parent = {
+    agent: { id: 'parent', session: { header: { id: 'parent', cwd: ROOT } } },
+    callId: 'parent-call-1',
+    signal: child.signal,
+  }
+  const childDiscovery = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, child)
+  assert.equal(childDiscovery.status, 'succeeded', JSON.stringify(childDiscovery))
+  const approvalsBefore = h.calls.approvals.length
+  const spawnBefore = h.calls.spawn.length
+  const replay = await h.tools[BUILD_TOOL].execute({
+    action: 'build', project: EXTERNAL, observationId: childDiscovery.observationId, module: ':app', variant: 'debug',
+  }, parent)
+  assert.equal(replay.status, 'blocked', JSON.stringify(replay))
+  assert.equal(replay.error.code, 'TARGET_CHANGED')
+  assert.match(replay.error.message, /belongs to another caller/)
+  assert.equal(h.calls.approvals.length, approvalsBefore, '父原样重放被拒时不再请求批准')
+  assert.equal(h.calls.spawn.length, spawnBefore, '父原样重放被拒时零进程')
+  const parentDiscovery = await h.tools[PROJECT_TOOL].execute({ action: 'discover-build', project: EXTERNAL }, parent)
+  assert.equal(parentDiscovery.status, 'succeeded', JSON.stringify(parentDiscovery))
+  assert.notEqual(parentDiscovery.observationId, childDiscovery.observationId)
+  const built = await h.tools[BUILD_TOOL].execute({
+    action: 'build', project: EXTERNAL, observationId: parentDiscovery.observationId, module: ':app', variant: 'debug',
+  }, parent)
+  assert.equal(built.status, 'succeeded', JSON.stringify(built))
+  assert.ok(h.calls.spawn.some(spec => spec.argv[0] === `${EXTERNAL}/gradlew`), 'Gradle 入口只到 fixture seam，未运行真实 Gradle')
 })
 
 
