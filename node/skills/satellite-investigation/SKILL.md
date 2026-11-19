@@ -39,16 +39,18 @@ bounded `terms`/`limit`; inspect candidates and freshness, then read original co
 Missing tools or indexes mean ordinary search, not initialization or rebuilding in
 this read-only task. Not every investigation needs an index.
 
-## Declared project parsers
+## Project skill scripts
 
-Only when a loaded project skill requires a parser, first read
-[the parser contract](references/project-parsers.md), then its machine manifest.
-Use `satellite_skill_script_run` with the declared id and named parameters;
-prose alone is not authorization. Do not substitute shell calls or ad-hoc parsers
-for a declared entry.
+Only when a loaded project skill requires a script, first read
+[the script contract](references/project-parsers.md). A declared entry uses
+`satellite_skill_script_run` with the manifest id and named parameters; an
+existing script without a manifest uses its skill-relative path (for example
+`scripts/parse.py`), so no manifest or script rewrite is needed. Prose alone is
+not authorization. Do not substitute shell calls or ad-hoc parsers for the
+approval-gated tool.
 
 A read-only investigation child has no `satellite_parent_request`, and that does
-not block a declared parser. `satellite_skill_script_run` carries an internal
+not block an approval-gated script. `satellite_skill_script_run` carries an internal
 delegated-approval broker: it asks the exact delegating parent for one real
 approval per child call, then runs with the child's own read-only services. The
 child's own approval stays pinned to never. A rejected, cancelled, or unanswered

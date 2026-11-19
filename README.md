@@ -282,7 +282,7 @@ Android CLI 与 Gradle 的用户目录定向到会话工作区内的 `.satellite
 
 - **复用查询**（`satellite_reuse_query`）：查找已有代码候选并报告来源与新鲜度；没有索引时回到普通搜索，不会自动建立索引。使用候选前仍需核对源码。
 - **复用维护**（`satellite_reuse_maintain`，需启用 Android 组件）：经批准为明确的文件集合初始化、更新或重建索引，不代表已扫描整个项目；不会覆盖用户自己的排除设置。
-- **项目技能脚本**（`satellite_skill_script_run`）：仅运行已加载项目技能中明确声明的脚本，需批准，受只读文件沙箱、时间与输出限额约束；当前仅支持 Apple (macOS) 宿主执行环境，不能用于提交任意 shell 命令。
+- **项目技能脚本**（`satellite_skill_script_run`）：运行已加载项目技能声明的脚本 id，或按技能相对路径原位运行现有 `.mjs`/`.py` 脚本（无需 manifest 或改写脚本）；需批准，受只读文件沙箱、时间与输出限额约束；当前仅支持 Apple (macOS) 宿主执行环境，不能用于提交任意 shell 命令。
 
 ## 权限与限制
 
