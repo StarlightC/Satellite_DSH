@@ -8,12 +8,14 @@
 
 export type HostPlatformId = 'apple' | 'linux' | 'windows' | 'unknown'
 
-/** 解析器 stdin-v1 的组装输入：可执行文件必须已经解析为宿主侧绝对路径。 */
+/** 解析器命令的组装输入：可执行文件必须已经解析为宿主侧绝对路径。 */
 export interface SkillScriptInvocation {
   readonly environmentExecutable?: string
   readonly runtimeExecutable: string
   readonly runtime: 'node' | 'python'
   readonly args: readonly string[]
+  /** path-entry 模式：原位执行这个已批准的宿主侧绝对脚本路径。 */
+  readonly entryPath?: string
 }
 
 /** 消费者只依赖能力契约；增加平台无需将调用链中的 Apple 类型逐个替换。 */

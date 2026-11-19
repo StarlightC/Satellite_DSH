@@ -599,6 +599,36 @@ test('delegated approval (execution recorder): skill script asks the parent once
   } finally { rmSync(join(world.repo, '.dsh'), { recursive: true, force: true }) }
 })
 
+test('delegated approval (execution recorder): no-manifest path entry runs the existing file in place', async () => {
+  // Real Loader wiring + real approval; only the shell seam is a recorder. The
+  // fixture deliberately has no scripts/manifest.json: the request is a path.
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  const skillName = 'path-entry-skill'
+  const dir = join(world.repo, '.dsh', 'skills', skillName)
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  writeFileSync(join(dir, 'SKILL.md'), `---\nname: ${skillName}\ndescription: path entry without manifest\n---\nRun the existing script.\n`)
+  writeFileSync(join(dir, 'scripts', 'parse.mjs'), 'console.log("path-entry")\n')
+  assert.equal(existsSync(join(dir, 'scripts', 'manifest.json')), false)
+  const args = { skill: skillName, script: 'scripts/parse.mjs', parameters: { 'dry-run': true, label: 'weekly' } }
+  try {
+    await withFakeExecution(async (effects) => {
+      const rejected = await delegatedChildCall('satellite_skill_script_run', args, 'rejected')
+      assert.equal(effects.filter((effect) => effect.startsWith('shell')).length, 0, `rejected: ${rejected[0]}`)
+      assert.match(rejected[0] ?? '', /approval rejected/, rejected[0])
+      const allowed = await delegatedChildCall('satellite_skill_script_run', args, 'allowed-once')
+      assert.equal(state.approvals.length, 1)
+      assert.match(state.approvals[0].reason, /Delegated child approval/)
+      const shells = effects.filter((effect) => effect.startsWith('shell'))
+      assert.equal(shells.length, 1, JSON.stringify(effects))
+      assert.match(shells[0], /scripts\/parse\.mjs/, shells[0])
+      assert.match(shells[0], /--dry-run/, shells[0])
+      assert.match(shells[0], /--label' 'weekly/, shells[0])
+      assert.doesNotMatch(shells[0], /--input-type=module/, 'path entry must not use the stdin ABI')
+      assert.match(allowed[0] ?? '', /PARSED/, allowed[0])
+    })
+  } finally { rmSync(join(world.repo, '.dsh'), { recursive: true, force: true }) }
+})
+
 test('delegated approval (native): read-only context runs an isolated declared parser with the real interpreter and sandbox; rejection zero, write denied, next call re-asks', async () => {
   // Real chain: no shell/fs/subprocess replacement. The only deterministic input
   // is the scripted model and the approval answerer (test input, NOT human
@@ -671,6 +701,80 @@ console.log('WROTE')
     assert.equal(firstOutput.payload, payload)
     assert.equal(realpathSync(firstOutput.cwd), realpathSync(dir), 'real parser cwd is the winning skill directory')
     assert.deepEqual(firstOutput.args, [])
+
+    const denied = JSON.parse(allowed.texts[1])
+    assert.equal(denied.success, false, allowed.texts[1])
+    assert.notEqual(denied.exitCode, 0)
+    assert.match(denied.stderr.text, /EPERM|EACCES|EROFS|Operation not permitted|Read-only file system/i)
+    assert.equal(existsSync(probe), false, 'the read-only sandbox left no write behind')
+
+    const third = JSON.parse(allowed.texts[2])
+    assert.equal(third.success, true, allowed.texts[2])
+    assert.equal(JSON.parse(third.stdout.text).payload, payload, 'the next allowed call ran again after re-approval')
+  } finally {
+    off?.()
+    rmSync(join(world.repo, '.dsh'), { recursive: true, force: true })
+  }
+})
+
+test('delegated approval (native): no-manifest path entry runs the existing script in place with the real interpreter and sandbox', async () => {
+  // Same real chain as the declared-parser test, but the skill has no manifest:
+  // the request names the existing script's skill-relative path. This is the
+  // end-to-end form of the reported block.
+  const { mkdirSync, writeFileSync } = await import('node:fs')
+  const skillName = 'loader-path-entry-native'
+  const dir = join(world.repo, '.dsh', 'skills', skillName)
+  const payload = 'SATELLITE_PATH_ENTRY_NATIVE_4b2e'
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  writeFileSync(join(dir, 'SKILL.md'), `---\nname: ${skillName}\ndescription: path entry without manifest\n---\nRun the existing scripts.\n`)
+  writeFileSync(join(dir, 'payload.txt'), `${payload}\n`)
+  writeFileSync(join(dir, 'scripts', 'helper.mjs'), "export const value = 'relative-import-ok'\n")
+  writeFileSync(join(dir, 'scripts', 'read-known.mjs'), `import { readFileSync } from 'node:fs'
+import { value } from './helper.mjs'
+const payload = readFileSync('payload.txt', 'utf8').trim()
+console.log(JSON.stringify({ payload, value, cwd: process.cwd(), args: process.argv.slice(2) }))
+`)
+  writeFileSync(join(dir, 'scripts', 'write-probe.mjs'), `import { writeFileSync } from 'node:fs'
+writeFileSync('native-path-write-probe.txt', 'written\\n')
+console.log('WROTE')
+`)
+  assert.equal(existsSync(join(dir, 'scripts', 'manifest.json')), false)
+  const read = { skill: skillName, script: 'scripts/read-known.mjs', parameters: { 'dry-run': true, label: 'native' } }
+  const write = { skill: skillName, script: 'scripts/write-probe.mjs', parameters: {} }
+  const probe = join(dir, 'native-path-write-probe.txt')
+  const childAgents = []
+  const off = ctx.on('agent/created', ({ agent }) => { if (agent.session.header.origin === 'subagent') childAgents.push(agent) })
+  try {
+    const rejected = await delegatedNodeCalls('context', [read], 'rejected')
+    assert.equal(state.approvals.length, 1)
+    assert.match(rejected.texts[0] ?? '', /approval rejected/, rejected.texts[0])
+    assert.doesNotMatch(rejected.texts[0] ?? '', new RegExp(payload), 'rejection produced no parser evidence')
+
+    const allowed = await delegatedNodeCalls('context', [read, write, read], 'allowed-once')
+    assert.equal(allowed.texts.length, 3, JSON.stringify(allowed.texts, null, 1))
+    assert.equal(state.approvals.length, 3, JSON.stringify(state.approvals))
+    const root = await mainAgent()
+    for (const approval of state.approvals) {
+      assert.equal(approval.agentId, root.id, 'asked of the exact parent')
+      assert.equal(approval.live, true)
+      assert.match(approval.reason, /Delegated child approval/)
+    }
+    for (const child of childAgents) assert.equal(ctx.get('approval').effectivePolicy(child.session), 'never')
+    const child = allowed.child
+    assert.ok(child, 'child model request captured')
+    assert.ok(child.toolNames.includes('satellite_skill_script_run'), JSON.stringify(child.toolNames))
+    assert.match(allowed.main[0] ?? '', /沙箱：satellite_node:context=read-only/)
+    environmentBlocked(allowed.texts, 'delegated native no-manifest path entry')
+
+    const first = JSON.parse(allowed.texts[0])
+    assert.equal(first.success, true, allowed.texts[0])
+    assert.equal(first.script, 'scripts/read-known.mjs', 'production returns the requested path-entry reference string')
+    assert.match(first.scriptHash, /^[0-9a-f]{64}$/)
+    const firstOutput = JSON.parse(first.stdout.text)
+    assert.equal(firstOutput.payload, payload)
+    assert.equal(firstOutput.value, 'relative-import-ok')
+    assert.equal(realpathSync(firstOutput.cwd), realpathSync(dir), 'real path-entry cwd is the winning skill directory')
+    assert.deepEqual(firstOutput.args, ['--dry-run', '--label', 'native'])
 
     const denied = JSON.parse(allowed.texts[1])
     assert.equal(denied.success, false, allowed.texts[1])

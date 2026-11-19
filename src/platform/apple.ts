@@ -14,14 +14,20 @@ function quote(text: string): string {
   return `'${text.replaceAll("'", "'\\''")}'`
 }
 
-/** 组装受约束的解析器命令：`env -i <runtime> … - <argv>`。 */
+/** 组装受约束的解析器命令：stdin-v1 为 `env -i <runtime> … - <argv>`，path-entry 为 `env -i <runtime> … <script> <argv>`。 */
 function skillScriptCommand(input: SkillScriptInvocation): string {
   if (!input.environmentExecutable) throw new Error('Apple parser invocation requires an environment executable')
+  // Path-entry scripts are opened by path so their relative imports and file
+  // identity survive. Python omits -I/-P here: isolated/no-safe-path mode would
+  // drop the script directory from sys.path and break sibling imports.
+  const entry = input.entryPath
+    ? input.runtime === 'node' ? [input.entryPath] : ['-E', '-s', input.entryPath]
+    : input.runtime === 'node' ? ['--input-type=module', '-'] : ['-I', '-']
   const invocation = [
     input.environmentExecutable,
     '-i',
     input.runtimeExecutable,
-    ...(input.runtime === 'node' ? ['--input-type=module', '-'] : ['-I', '-']),
+    ...entry,
     ...input.args,
   ]
   return invocation.map(quote).join(' ')

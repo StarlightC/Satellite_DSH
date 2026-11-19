@@ -104,6 +104,23 @@ test('Apple 命令组装保留 env -i、单引号引用与 Node/Python stdin ABI
   assert.equal(apple.parserEnvironmentExecutableName, 'env')
 })
 
+test('Apple 命令组装 path-entry 原位执行脚本并保留普通 argv', () => {
+  const apple = createApplePlatform()
+  const nodePath = apple.skillScriptCommand({
+    environmentExecutable: '/usr/bin/env', runtimeExecutable: '/usr/bin/node', runtime: 'node',
+    entryPath: '/project/skill/scripts/parse.mjs', args: ['--count', '2'],
+  })
+  assert.equal(nodePath, "'/usr/bin/env' '-i' '/usr/bin/node' '/project/skill/scripts/parse.mjs' '--count' '2'")
+
+  // -E -s keeps credentials out without -I/-P dropping the script directory from sys.path.
+  const pythonPath = apple.skillScriptCommand({
+    environmentExecutable: '/usr/bin/env', runtimeExecutable: '/usr/bin/python3', runtime: 'python',
+    entryPath: '/project/skill/scripts/parse.py', args: ['--source', "a'b"],
+  })
+  assert.equal(pythonPath,
+    "'/usr/bin/env' '-i' '/usr/bin/python3' '-E' '-s' '/project/skill/scripts/parse.py' '--source' 'a'\\''b'")
+})
+
 for (const code of ['EACCES', 'EIO', undefined]) test(`inconclusive Linux probe (${code}) cannot authorize Apple selection`, async () => {
   const fs = fakeFs({ files: APPLE })
   const stat = fs.stat

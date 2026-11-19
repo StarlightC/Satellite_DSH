@@ -1,8 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, dirname } from 'node:path'
 import { readFile } from 'node:fs/promises'
-import { parseScriptManifest, runSkillScript, scriptArguments, registerSkillScriptTool, SKILL_SCRIPT_TOOL } from '../src/node/lib/skill-scripts.ts'
+import { parseScriptManifest, pathArguments, runSkillScript, scriptArguments, registerSkillScriptTool, SKILL_SCRIPT_TOOL } from '../src/node/lib/skill-scripts.ts'
 import { createDelegatedApprovalBroker } from '../src/lib/delegated-approval.ts'
 
 const declaration = () => ({ id: 'extract', path: 'scripts/extract.mjs', runtime: 'node', execution: 'stdin-v1',
@@ -414,3 +417,377 @@ for (const [label, options, pattern, asks] of [
     d.remove()
   }
 })
+
+/**
+ * Regression for the real profile block: an existing project skill script has no
+ * `scripts/manifest.json`, so a path-entry request must run the file in place.
+ * The pre-fix gate rejected the canonical real case before approval. These fixtures
+ * never read a manifest in path mode.
+ */
+function pathFixture(options = {}) {
+  const root = '/project/skill'
+  const state = {
+    approvals: [], specs: [], reads: [], lookup: [],
+    scriptPath: options.scriptPath ?? 'scripts/parse.py',
+    source: options.source ?? 'print("ok")',
+    skill: { name: 'project-parser', source: 'project-agents', provider: 'filesystem',
+      content: 'Run the existing parser.', invocation: { modelInvocable: true },
+      resourceBase: { kind: 'directory', path: '/host/project/skill' } },
+    policy: { mode: 'workspace-write', workspaceRoot: '/project', sessionId: 'caller' },
+    outcome: 'allowed-once',
+    result: { exitCode: 0, signal: null, timedOut: false, aborted: false, timeoutMs: 60000,
+      stdout: { text: 'evidence', truncated: false }, stderr: { text: '', truncated: false },
+      sandbox: { mode: 'read-only', denied: false, enforcement: 'full' } },
+  }
+  const controller = new AbortController()
+  const exec = { agent: { id: 'caller', session: {} }, signal: controller.signal, callId: 'call-2' }
+  const services = {
+    workingDirectory: { async ensure() { return '/project' } },
+    skills: { async get(name, lookup) { state.lookup.push({ name, lookup }); return state.skill } },
+    fs: {
+      processPathFromHostPath(path) { assert.equal(path, '/host/project/skill'); return root },
+      async resolve(path, resolveOptions) {
+        const resolved = path.startsWith('/') ? path : `${resolveOptions.cwd}/${path}`
+        return { targetKey: resolved, displayPath: resolved }
+      },
+      contains(parent, child) {
+        if (options.contains) return options.contains(parent, child)
+        return child.targetKey.startsWith(`${parent.targetKey}/`)
+      },
+      processPath(target) { return target.targetKey },
+      async stat(target) {
+        if (target.targetKey === root) return { type: 'directory' }
+        if (target.targetKey === '/etc/os-release' || target.targetKey === '/proc/version') return undefined
+        if (target.targetKey.endsWith('/scripts/manifest.json')) return undefined
+        if (target.targetKey === `${root}/${state.scriptPath}`) return options.missingScript ? undefined : { type: 'file' }
+        return { type: 'file' }
+      },
+      async readBytes(target, signal, cap) {
+        state.reads.push({ target, cap })
+        if (target.targetKey.endsWith('manifest.json')) {
+          const error = new Error('ENOENT'); error.code = 'ENOENT'; throw error
+        }
+        return Buffer.from(state.source)
+      },
+    },
+    sandboxPolicy: { resolve() { return state.policy } },
+    approval: { async request(request) { state.approvals.push(request); await state.onApproval?.(); return state.outcome } },
+    subprocess: {
+      async terminalEnvironment() { return { platform: 'posix' } },
+      async resolveExecutable(command) { return `/trusted/bin/${command}` },
+    },
+    shell: {
+      sandboxMode: 'read-only',
+      resolve(spec) { return spec },
+      async execute(spec) {
+        state.specs.push(spec)
+        return { result: async () => state.result, kill() { return true }, done: Promise.resolve() }
+      },
+    },
+  }
+  return { state, services, exec, controller, run: request => runSkillScript(services, request, exec) }
+}
+const pathRequest = (overrides = {}) => ({ skill: 'project-parser', script: 'scripts/parse.py',
+  parameters: { source: 'http://127.0.0.1:9/', 'allow-remote': true, 'allow-private-network': true,
+    method: 'GET', path: '/spotlight/index/category' }, ...overrides })
+
+test('no-manifest path entry runs the existing Python script in place, not via stdin', async () => {
+  const f = pathFixture()
+  const result = await f.run(pathRequest())
+  assert.equal(result.success, true)
+  assert.equal(result.script, 'scripts/parse.py', 'production result keeps the requested reference string')
+  assert.match(result.scriptHash, /^[0-9a-f]{64}$/)
+  const spec = f.state.specs[0]
+  assert.equal(spec.stdin, '', 'path entry must not receive the source on stdin')
+  assert.match(spec.command, /'\/trusted\/bin\/python3' '-E' '-s' '\/project\/skill\/scripts\/parse\.py'/)
+  assert.match(spec.command, /'--source' 'http:\/\/127\.0\.0\.1:9\/'/)
+  assert.match(spec.command, /'--allow-remote'/)
+  assert.match(spec.command, /'--allow-private-network'/)
+  assert.match(spec.command, /'--method' 'GET'/)
+  assert.match(spec.command, /'--path' '\/spotlight\/index\/category'/)
+  assert.equal(spec.workdir, '/project/skill')
+  assert.equal(spec.sandboxPolicy.mode, 'read-only')
+  assert.equal(f.state.approvals.length, 1)
+  assert.match(f.state.approvals[0].reason, /path-entry/)
+  assert.match(f.state.approvals[0].reason, /scriptHash/)
+  assert.equal(f.state.reads.some(read => read.target.targetKey.endsWith('manifest.json')), false,
+    'path entry must not require or read a manifest')
+})
+
+test('path entry uses the path runtime and named flags for a Node script', async () => {
+  const f = pathFixture({ scriptPath: 'scripts/parse.mjs', source: 'console.log("ok")' })
+  await f.run({ skill: 'project-parser', script: 'scripts/parse.mjs',
+    parameters: { count: 2, 'dry-run': true, label: 'weekly' } })
+  const spec = f.state.specs[0]
+  assert.match(spec.command, /'\/trusted\/bin\/node' '\/project\/skill\/scripts\/parse\.mjs'/)
+  assert.doesNotMatch(spec.command, /--input-type=module/)
+  assert.match(spec.command, /'--count' '2' '--dry-run' '--label' 'weekly'/)
+  assert.equal(spec.stdin, '')
+})
+
+test('path entry omits false boolean flags and keeps true flags valueless', async () => {
+  const f = pathFixture()
+  await f.run({ ...pathRequest(), parameters: { source: 'x', 'allow-remote': false, pretty: true } })
+  const command = f.state.specs[0].command
+  assert.match(command, /'--source' 'x'/)
+  assert.match(command, /'--pretty'/)
+  assert.doesNotMatch(command, /--allow-remote/)
+})
+
+test('path entry arrays repeat --name value in array order for append-style flags', async () => {
+  const f = pathFixture()
+  await f.run({ ...pathRequest(), parameters: { source: 'articles.js', group: ['Alpha', 'Beta'],
+    method: ['POST', 'GET'], 'path-prefix': ['/beta', '/alpha'] } })
+  const command = f.state.specs[0].command
+  assert.match(command, /'--group' 'Alpha' '--group' 'Beta' '--method' 'POST' '--method' 'GET' '--path-prefix' '\/beta' '--path-prefix' '\/alpha' '--source' 'articles\.js'/)
+  assert.equal(f.state.approvals.length, 1, 'the exact repeated argv is inside the approved binding')
+  assert.match(f.state.approvals[0].reason, /"argv":\["--group","Alpha","--group","Beta"/)
+})
+
+test('path entry array values are quoted as single argv elements, not shell text', async () => {
+  const f = pathFixture()
+  const injected = "x'; echo INJECTED; '"
+  await f.run({ ...pathRequest(), parameters: { group: [injected, 'Beta'] } })
+  assert.ok(f.state.specs[0].command.includes(`'x'\\''; echo INJECTED; '\\'''`), f.state.specs[0].command)
+  assert.deepEqual(pathArguments({ group: [injected, 'Beta'] }), ['--group', injected, '--group', 'Beta'])
+})
+
+test('path entry array parameters stay bounded and reject non-value elements', async () => {
+  const cases = [
+    ['empty array', { group: [] }],
+    ['more than 16 per key', { group: Array.from({ length: 17 }, (_, index) => `g${index}`) }],
+    ['more than 64 values total', Object.fromEntries(Array.from({ length: 5 },
+      (_, index) => [`g${index}`, Array.from({ length: 16 }, (_, value) => `${index}-${value}`)]))],
+    ['boolean element', { group: [true] }],
+    ['nested array', { group: [['x']] }],
+    ['object element', { group: [{ x: 1 }] }],
+    ['control character', { group: ['a\nb'] }],
+    ['fractional number', { group: [1.5] }],
+  ]
+  for (const [label, parameters] of cases) {
+    const f = pathFixture()
+    await assert.rejects(f.run({ ...pathRequest(), parameters }), /array|scalar|integer|text/, label)
+    assert.equal(f.state.approvals.length, 0, `${label} fails before approval`)
+    assert.equal(f.state.specs.length, 0, `${label} runs nothing`)
+  }
+})
+
+test('declared id still refuses array parameters before any approval or manifest binding', async () => {
+  const f = fixture()
+  await assert.rejects(f.run({ ...request(), parameters: { ...request().parameters, group: ['Alpha'] } }),
+    /array parameters are only supported for path entries/)
+  assert.equal(f.state.approvals.length, 0)
+  assert.equal(f.state.specs.length, 0)
+})
+
+for (const script of ['../outside.py', '/scripts/parse.py', 'scripts\\parse.py', 'scripts/../parse.py',
+  'scripts/data.json', 'scripts/parse.sh']) {
+  test(`path entry refuses non-contained or non-runtime reference ${script}`, async () => {
+    const f = pathFixture()
+    await assert.rejects(f.run({ ...pathRequest(), script }), /script/)
+    assert.equal(f.state.approvals.length, 0)
+    assert.equal(f.state.specs.length, 0)
+  })
+}
+
+test('path entry refuses a canonical symlink outside the skill before approval', async () => {
+  const f = pathFixture({ contains: () => false })
+  await assert.rejects(f.run(pathRequest()), /outside skill/)
+  assert.equal(f.state.approvals.length, 0)
+  assert.equal(f.state.specs.length, 0)
+})
+
+test('path entry for a missing file fails before approval', async () => {
+  const f = pathFixture({ missingScript: true })
+  await assert.rejects(f.run(pathRequest()), /outside skill or not regular/)
+  assert.equal(f.state.approvals.length, 0)
+  assert.equal(f.state.specs.length, 0)
+})
+
+test('declared id without a manifest refuses and names the path-entry alternative', async () => {
+  const f = pathFixture()
+  await assert.rejects(f.run({ ...pathRequest(), script: 'extract' }), /readable scripts\/manifest\.json/)
+  await assert.rejects(f.run({ ...pathRequest(), script: 'extract' }), /skill-relative path/)
+  assert.equal(f.state.approvals.length, 0)
+})
+
+test('path entry approval rejection runs nothing', async () => {
+  const f = pathFixture()
+  f.state.outcome = 'rejected'
+  await assert.rejects(f.run(pathRequest()), /approval/)
+  assert.equal(f.state.specs.length, 0)
+})
+
+test('path entry content change after approval is rechecked and runs nothing', async () => {
+  const f = pathFixture()
+  f.state.onApproval = () => { f.state.source += '\n# changed' }
+  await assert.rejects(f.run(pathRequest()), /changed after approval/)
+  assert.equal(f.state.specs.length, 0)
+})
+
+/**
+ * Real interpreter check for path-entry semantics: the script is opened by its
+ * approved path (not source-on-stdin), so Node/Python see `__file__`/`import.meta.url`,
+ * relative imports, and parameters in their normal argv positions.
+ */
+function realPathFixture(runtime, options = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'satellite-path-entry-'))
+  const files = options.files ?? (runtime === 'node'
+    ? [['scripts/helper.mjs', "export const value = 'relative-import-ok'\n"],
+      ['scripts/parse.mjs',
+        "import { fileURLToPath } from 'node:url'\nimport { value } from './helper.mjs'\n" +
+        "console.log(JSON.stringify({ file: fileURLToPath(import.meta.url), argv: process.argv.slice(2), value, cwd: process.cwd() }))\n"]]
+    : [['scripts/helper.py', "VALUE = 'relative-import-ok'\n"],
+      ['scripts/parse.py',
+        "import json, os, sys\nfrom helper import VALUE\n" +
+        "print(json.dumps({'file': __file__, 'argv': sys.argv[1:], 'value': VALUE, 'cwd': os.getcwd()}))\n"]])
+  for (const [path, content] of files) {
+    mkdirSync(dirname(join(dir, path)), { recursive: true })
+    writeFileSync(join(dir, path), content)
+  }
+  const state = { approvals: [], specs: [], dir }
+  const services = {
+    workingDirectory: { async ensure() { return dir } },
+    skills: { async get() {
+      return { name: 'project-parser', source: 'project-agents', provider: 'filesystem',
+        content: 'Run the existing parser.', invocation: { modelInvocable: true },
+        resourceBase: { kind: 'directory', path: dir } }
+    } },
+    fs: {
+      processPathFromHostPath(path) { assert.equal(path, dir); return dir },
+      async resolve(path, resolveOptions) {
+        return { targetKey: path.startsWith('/') ? path : join(resolveOptions.cwd, path) }
+      },
+      contains(parent, child) {
+        return child.targetKey === parent.targetKey || child.targetKey.startsWith(`${parent.targetKey}/`)
+      },
+      processPath(target) { return target.targetKey },
+      async stat(target) {
+        try {
+          const info = statSync(target.targetKey)
+          return { type: info.isDirectory() ? 'directory' : 'file' }
+        } catch (error) {
+          if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return undefined
+          throw error
+        }
+      },
+      async readBytes(target, signal, cap) {
+        const bytes = readFileSync(target.targetKey)
+        assert.ok(bytes.byteLength <= cap)
+        return bytes
+      },
+    },
+    sandboxPolicy: { resolve() { return { mode: 'workspace-write', workspaceRoot: dir, sessionId: 'caller' } } },
+    approval: { async request(request) { state.approvals.push(request); return 'allowed-once' } },
+    subprocess: {
+      async terminalEnvironment() { return { platform: 'posix' } },
+      async resolveExecutable(command) {
+        if (command === 'env') return '/usr/bin/env'
+        if (command === 'node') return process.execPath
+        return '/usr/bin/python3'
+      },
+    },
+    shell: {
+      sandboxMode: 'read-only',
+      resolve(spec) { return spec },
+      async execute(spec) {
+        state.specs.push(spec)
+        let stdout = ''
+        let stderr = ''
+        let exitCode = 0
+        try {
+          stdout = execFileSync('/bin/bash', ['--noprofile', '--norc', '-c', spec.command], {
+            cwd: spec.workdir, input: spec.stdin, encoding: 'utf8', timeout: spec.timeoutMs, env: { ...process.env },
+          })
+        } catch (error) {
+          stdout = String(error.stdout ?? '')
+          stderr = String(error.stderr ?? '')
+          exitCode = typeof error.status === 'number' ? error.status : 1
+        }
+        const result = { exitCode, signal: null, timedOut: false, aborted: false, timeoutMs: spec.timeoutMs,
+          stdout: { text: stdout, truncated: false }, stderr: { text: stderr, truncated: false },
+          sandbox: { mode: 'read-only', denied: false, enforcement: 'full' } }
+        return { result: async () => result, kill() { return true }, done: Promise.resolve() }
+      },
+    },
+  }
+  const controller = new AbortController()
+  const exec = { agent: { id: 'caller', session: {} }, signal: controller.signal, callId: 'call-3' }
+  const script = options.script ?? (runtime === 'node' ? 'scripts/parse.mjs' : 'scripts/parse.py')
+  const parameters = options.parameters ?? { source: 'alpha', 'dry-run': true, count: 2 }
+  return {
+    dir, state, exec, services,
+    run: (next = parameters) => runSkillScript(services, { skill: 'project-parser', script, parameters: next }, exec),
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  }
+}
+for (const runtime of ['node', 'python']) {
+  test(`path entry runs a real ${runtime} script with relative import, file identity, and argv`,
+    { skip: process.platform !== 'darwin' }, async () => {
+      const f = realPathFixture(runtime)
+      try {
+        const result = await f.run()
+        assert.equal(result.success, true, result.stderr.text)
+        assert.match(f.state.approvals[0].reason, /path-entry/)
+        assert.equal(f.state.specs[0].stdin, '')
+        const observed = JSON.parse(result.stdout.text)
+        assert.equal(observed.value, 'relative-import-ok')
+        assert.ok(observed.file.endsWith(`scripts/parse.${runtime === 'node' ? 'mjs' : 'py'}`), observed.file)
+        assert.equal(observed.cwd, realpathSync(f.dir))
+        assert.deepEqual(observed.argv, ['--count', '2', '--dry-run', '--source', 'alpha'])
+      } finally {
+        f.cleanup()
+      }
+    })
+}
+
+/**
+ * Regression for repeated append-style flags reaching a real interpreter
+ * through the registered tool path. `apidoc_append_compat.py` is a
+ * self-contained synthetic apiDoc-shaped fixture, not the Axon parser or any
+ * external project source (see the fixture README); the earlier real-Axon
+ * offline run is retained only in ignored local `.satellite` evidence.
+ */
+const APIDOC_FIXTURE = new URL('./fixtures/apidoc-append-compat/apidoc_append_compat.py', import.meta.url)
+const APIDOC_FIXTURE_DOC = 'var apiData={schema:"0.3.0",generator:{name:"apiDoc",version:"1.2.0"},api:[' +
+  '{id:"a1",group:"Alpha",name:"One",version:"1",type:"GET",url:"/alpha/one"},' +
+  '{id:"b1",group:"Beta",name:"Two",version:"1",type:"POST",url:"/beta/two"},' +
+  '{id:"a2",group:"Alpha",name:"Three",version:"1",type:"POST",url:"/alpha/three"}]};\n'
+test('self-contained apiDoc compat CLI: path entry runs real python with repeated append flags',
+  { skip: process.platform !== 'darwin' }, async () => {
+    const parser = readFileSync(APIDOC_FIXTURE)
+    const f = realPathFixture('python', {
+      files: [['scripts/apidoc_append_compat.py', parser], ['articles.js', APIDOC_FIXTURE_DOC]],
+      script: 'scripts/apidoc_append_compat.py',
+      parameters: { source: 'articles.js', group: ['Alpha', 'Beta'],
+        method: ['POST', 'GET'], 'path-prefix': ['/beta', '/alpha'] },
+    })
+    try {
+      // Use the registered tool definition, not just an internal helper.
+      const { tool } = registered(f.services)
+      const call = parameters => tool.execute({ skill: 'project-parser', script: 'scripts/apidoc_append_compat.py', parameters }, f.exec)
+      const result = await call({ source: 'articles.js', group: ['Alpha', 'Beta'],
+        method: ['POST', 'GET'], 'path-prefix': ['/beta', '/alpha'] })
+      assert.equal(result.success, true, result.stderr.text)
+      assert.equal(result.script, 'scripts/apidoc_append_compat.py')
+      assert.equal(f.state.specs[0].stdin, '', 'path entry must not receive source on stdin')
+      assert.match(f.state.approvals[0].reason, /"argv":\["--group","Alpha","--group","Beta","--method","POST","--method","GET"/)
+      const parsed = JSON.parse(result.stdout.text)
+      assert.equal(parsed.status, 'success')
+      assert.deepEqual(parsed.filters_applied, {
+        group: ['Alpha', 'Beta'], method: ['POST', 'GET'], path_prefix: ['/beta', '/alpha'], path: null })
+      assert.deepEqual(parsed.articles.map(article => article.id), ['a1', 'b1', 'a2'])
+
+      // The same repeated flags must really filter: one group, one method, one prefix.
+      const narrowedResult = await call({ source: 'articles.js', group: ['Beta'],
+        method: ['POST'], 'path-prefix': ['/beta'] })
+      assert.equal(narrowedResult.success, true, narrowedResult.stderr.text)
+      const narrowed = JSON.parse(narrowedResult.stdout.text)
+      assert.deepEqual(narrowed.filters_applied.group, ['Beta'])
+      assert.deepEqual(narrowed.filters_applied.method, ['POST'])
+      assert.deepEqual(narrowed.filters_applied.path_prefix, ['/beta'])
+      assert.deepEqual(narrowed.articles.map(article => article.id), ['b1'])
+    } finally {
+      f.cleanup()
+    }
+  })

@@ -1,4 +1,4 @@
-/** Project-owned parser entrypoints. No service, process launcher, or permission override. */
+/** Project-owned skill script entrypoints. No service, process launcher, or permission override. */
 import { createHash } from 'node:crypto'
 import type { defineTool } from '@deepseek-ai/dsh-tools'
 import { detectHostPlatform } from '../../platform/index.ts'
@@ -10,6 +10,17 @@ const MANIFEST = 'scripts/manifest.json'
 const MAX_MANIFEST = 32 * 1024
 const MAX_SCRIPT = 256 * 1024
 const NAME = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u
+// Path-entry scripts are existing files, so they need no declaration; the
+// path is still relative, extension-bound, and containment-checked.
+const SCRIPT_PATH = /^(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.(?:mjs|py)$/u
+const PATH_ENTRY_TIMEOUT_MS = 60_000
+const PATH_ENTRY_OUTPUT_MAX_BYTES = 256 * 1024
+// Repeated CLI flags (argparse append) need arrays, but the approval binding and
+// argv stay bounded: at most 16 values per array, 64 values and 64 KiB of text
+// per call. Manifest-declared ids keep their scalar positional ABI.
+const MAX_PATH_ARRAY_VALUES = 16
+const MAX_PATH_ARGUMENT_VALUES = 64
+const MAX_PATH_ARGUMENT_TEXT = 64 * 1024
 
 type RecordValue = Record<string, unknown>
 type Parameter = { name: string; type: 'string'; maxLength: number; choices?: string[] }
@@ -24,6 +35,15 @@ export interface ScriptDeclaration {
   timeoutMs: number
   outputMaxBytes: number
 }
+/** Existing skill file run in place; no manifest and no script rewrite. */
+export interface PathScriptDeclaration {
+  path: string
+  runtime: 'node' | 'python'
+  execution: 'path-v1'
+  timeoutMs: number
+  outputMaxBytes: number
+}
+type ScriptEntry = ScriptDeclaration | PathScriptDeclaration
 interface Target { targetKey: string; displayPath: string }
 interface Policy { mode: 'read-only' | 'workspace-write' | 'danger-full-access'; workspaceRoot: string; sessionId?: string }
 interface Skill {
@@ -154,6 +174,40 @@ export function scriptArguments(script: ScriptDeclaration, value: unknown): stri
     return text
   })
 }
+/** A declared id (manifest lookup) or an existing skill-relative script path. */
+export function scriptReference(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 240 || /[\u0000-\u001f\u007f]/u.test(value)) fail('invalid script reference')
+  if (!NAME.test(value) && !SCRIPT_PATH.test(value)) fail('script must be a declared id or a skill-relative .mjs/.py path')
+  return value
+}
+interface PathArgumentBudget { values: number; bytes: number }
+function pathArrayValue(value: unknown, budget: PathArgumentBudget): string {
+  if (typeof value === 'string') {
+    const text = safeText(value, 4096)
+    budget.bytes += Buffer.byteLength(text, 'utf8')
+    if (budget.bytes > MAX_PATH_ARGUMENT_TEXT) fail('path array text exceeds the 64 KiB bound')
+    return text
+  }
+  if (typeof value === 'number') return String(integer(value, -1_000_000_000, 1_000_000_000))
+  return fail('path array values must be bounded strings or integers; boolean flags are top-level only')
+}
+function pathArgument(key: string, value: unknown, budget: PathArgumentBudget): string[] {
+  if (Array.isArray(value)) {
+    if (!value.length || value.length > MAX_PATH_ARRAY_VALUES) fail('path array parameter must contain 1-16 values')
+    budget.values += value.length
+    if (budget.values > MAX_PATH_ARGUMENT_VALUES) fail('path array values exceed the 64-value bound')
+    return value.flatMap(item => [`--${key}`, pathArrayValue(item, budget)])
+  }
+  if (value === false) return []
+  if (value === true) return [`--${key}`]
+  if (typeof value === 'string') return [`--${key}`, safeText(value, 4096)]
+  return [`--${key}`, String(integer(value, -1_000_000_000, 1_000_000_000))]
+}
+/** Path-entry parameters are the script's ordinary CLI flags, not a positional ABI. */
+export function pathArguments(value: RecordValue): string[] {
+  const budget: PathArgumentBudget = { values: 0, bytes: 0 }
+  return Object.keys(value).sort().flatMap(key => pathArgument(key, value[key], budget))
+}
 const sha256 = (bytes: Uint8Array | string): string => createHash('sha256').update(bytes).digest('hex')
 const decode = (bytes: Uint8Array): string => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
 function policyOf(services: SkillScriptServices, exec: Exec): Policy {
@@ -163,7 +217,7 @@ function policyOf(services: SkillScriptServices, exec: Exec): Policy {
     || !policy.workspaceRoot || policy.sessionId !== exec.agent.id) fail('invalid session sandbox policy')
   return { ...policy }
 }
-async function prepare(services: SkillScriptServices, exec: Exec, skillName: string, scriptId: string, parameters: unknown) {
+async function prepare(services: SkillScriptServices, exec: Exec, skillName: string, scriptRef: string, parametersInput: unknown) {
   exec.signal.throwIfAborted()
   // ShellExecutor.sandboxMode is the native capability flag; bare bash-local is undefined.
   if (!['read-only', 'workspace-write', 'danger-full-access'].includes(services.shell?.sandboxMode ?? '')) fail('confining shell backend unavailable')
@@ -180,24 +234,45 @@ async function prepare(services: SkillScriptServices, exec: Exec, skillName: str
   const root = await fs.resolve(mapped, { signal: exec.signal })
   if ((await fs.stat(root, exec.signal))?.type !== 'directory') fail('skill root is not a directory')
   const rootPath = fs.processPath(root)
-  const read = async (path: string, cap: number) => {
+  const readBytes = async (path: string, cap: number) => {
     const target = await fs.resolve(path, { cwd: rootPath, signal: exec.signal })
     if (!fs.contains(root, target) || target.targetKey === root.targetKey || (await fs.stat(target, exec.signal))?.type !== 'file') fail('file outside skill or not regular')
     const bytes = await fs.readBytes(target, exec.signal, cap)
     if (bytes.byteLength > cap) fail('filesystem violated read bound')
-    return { path: fs.processPath(target), hash: sha256(bytes), text: decode(bytes) }
+    return { path: safeText(fs.processPath(target), 4096), hash: sha256(bytes), bytes }
   }
-  let manifest
-  try { manifest = await read(MANIFEST, MAX_MANIFEST) } catch (error) {
-    exec.signal.throwIfAborted()
-    throw new Error('SATELLITE_SKILL_SCRIPT: requires readable scripts/manifest.json schemaVersion 1; prose alone is not authorization', { cause: error })
+  const readText = async (path: string, cap: number) => {
+    const entry = await readBytes(path, cap)
+    return { ...entry, text: decode(entry.bytes) }
   }
-  const script = parseScriptManifest(JSON.parse(manifest.text)).find(script => script.id === scriptId)
-  if (!script) fail('script id not declared')
-  const argv = scriptArguments(script, parameters)
-  const source = await read(script.path, MAX_SCRIPT)
-  // Execute the exact approved bytes, not a mutable pathname after the last hash check.
-  // Narrow ABI: node ESM stdin / isolated Python stdin, positional scalar arguments.
+  const parameters = record(parametersInput)
+  let manifest: { path: string; hash: string; text: string } | undefined
+  let script: ScriptEntry
+  let argv: string[]
+  let source: { path: string; hash: string; text?: string }
+  if (SCRIPT_PATH.test(scriptRef)) {
+    // Existing script: run the approved file in place. No manifest and no stdin source.
+    const entry = await readBytes(scriptRef, MAX_SCRIPT)
+    script = { path: entry.path, runtime: scriptRef.endsWith('.py') ? 'python' : 'node',
+      execution: 'path-v1', timeoutMs: PATH_ENTRY_TIMEOUT_MS, outputMaxBytes: PATH_ENTRY_OUTPUT_MAX_BYTES }
+    argv = pathArguments(parameters)
+    source = { path: entry.path, hash: entry.hash }
+  } else {
+    // Declared id: the strict manifest remains the only authorization for stdin-v1.
+    try { manifest = await readText(MANIFEST, MAX_MANIFEST) } catch (error) {
+      exec.signal.throwIfAborted()
+      throw new Error('SATELLITE_SKILL_SCRIPT: script id requires a readable scripts/manifest.json schemaVersion 1; pass an existing script\'s skill-relative path (for example scripts/parse.py) to run it in place; prose alone is not authorization', { cause: error })
+    }
+    const declared = parseScriptManifest(JSON.parse(manifest.text)).find(candidate => candidate.id === scriptRef)
+    if (!declared) fail('script id not declared; pass a skill-relative script path to run an existing script in place')
+    script = declared
+    argv = scriptArguments(declared, parameters)
+    const entry = await readText(declared.path, MAX_SCRIPT)
+    source = { path: entry.path, hash: entry.hash, text: entry.text }
+  }
+  // stdin-v1 executes the approved bytes; path-v1 re-opens the approved canonical
+  // path so relative imports, __file__, and argv keep their ordinary meaning.
+  // Both modes hash the entry before and after approval.
   if (!services.subprocess?.terminalEnvironment || !services.subprocess.resolveExecutable) fail('execution-world executable discovery unavailable')
   const platform = await detectHostPlatform({
     fs: {
@@ -207,7 +282,8 @@ async function prepare(services: SkillScriptServices, exec: Exec, skillName: str
     terminalEnvironment: (signal) => services.subprocess.terminalEnvironment(signal),
     signal: exec.signal,
   })
-  if (!platform.supported) fail(`stdin-v1 requires a supported execution platform: ${platform.unsupportedReason}`)
+  if (!platform.supported) fail(`${script.execution} requires a supported execution platform: ${platform.unsupportedReason}`)
+  if (script.execution === 'path-v1' && !platform.isAbsoluteHostPath(script.path)) fail('script path is not absolute in the execution world')
   const executable = async (command: string) => {
     const path = safeText(await services.subprocess.resolveExecutable(command, undefined, exec.signal), 4096)
     if (!platform.isAbsoluteHostPath(path)) fail('executable discovery did not return an absolute path for the selected platform')
@@ -216,13 +292,14 @@ async function prepare(services: SkillScriptServices, exec: Exec, skillName: str
   const environmentExecutable = platform.parserEnvironmentExecutableName
     ? await executable(platform.parserEnvironmentExecutableName) : undefined
   const runtimeExecutable = await executable(platform.parserRuntimeName(script.runtime))
-  const command = platform.skillScriptCommand({ environmentExecutable, runtimeExecutable, runtime: script.runtime, args: argv })
+  const command = platform.skillScriptCommand({ environmentExecutable, runtimeExecutable, runtime: script.runtime, args: argv,
+    ...(script.execution === 'path-v1' ? { entryPath: script.path } : {}) })
   const effectiveSessionPolicy = policyOf(services, exec)
-  // Parsers need no writes; neither caller arguments nor host approval widen this.
+  // Scripts need no writes; neither caller arguments nor host approval widen this.
   const policy: Policy = { ...effectiveSessionPolicy, mode: 'read-only' }
   const binding = JSON.stringify({ skill: skill.name, provider: skill.provider, source: skill.source,
     execution: script.execution, hostPlatform: platform.id, environmentExecutable, runtimeExecutable, targetEnvironment: platform.parserEnvironmentDescription, environment: platform.parserEnvironment, effectiveSessionPolicy,
-    skillHash: sha256(skill.content), root: rootPath, manifest: manifest.path, manifestHash: manifest.hash,
+    skillHash: sha256(skill.content), root: rootPath, manifest: manifest?.path ?? null, manifestHash: manifest?.hash ?? null,
     script: source.path, scriptHash: source.hash, argv, command, sandboxPolicy: policy,
     timeoutMs: script.timeoutMs, outputMaxBytes: script.outputMaxBytes })
   return { source, script, command, policy, effectiveSessionPolicy, binding, rootPath, platform }
@@ -231,29 +308,40 @@ export async function runSkillScript(services: SkillScriptServices, request: unk
   const args = record(request)
   keys(args, ['skill', 'script', 'parameters'])
   const skill = name(args.skill)
-  const script = name(args.script)
+  const script = scriptReference(args.script)
   // Bound before cloning; no nested objects, getters from JSON, or unbounded argv.
   const input = record(args.parameters)
   if (Object.keys(input).length > 16) fail('too many parameters')
+  const pathMode = SCRIPT_PATH.test(script)
+  const arrayBudget: PathArgumentBudget = { values: 0, bytes: 0 }
   for (const [key, value] of Object.entries(input)) {
     name(key)
-    if (typeof value === 'string') safeText(value, 4096)
+    if (Array.isArray(value)) {
+      if (!pathMode) fail('array parameters are only supported for path entries; a declared id takes bounded scalar parameters')
+      pathArgument(key, value, arrayBudget)
+    } else if (typeof value === 'string') safeText(value, 4096)
     else if (typeof value === 'number') integer(value, -1_000_000_000, 1_000_000_000)
-    else if (typeof value !== 'boolean') fail('parameters must be bounded scalars')
+    else if (typeof value !== 'boolean') fail('parameters must be bounded scalars, or path-entry arrays of strings/integers')
   }
   // JSON cloning also fixes the argument values across the approval await.
   const parameters: unknown = JSON.parse(JSON.stringify(input))
   const before = await prepare(services, exec, skill, script, parameters)
+  const mode = before.script.execution === 'path-v1'
+    ? 'existing skill script path-entry, executed in place from its approved canonical path; relative imports, __file__/import.meta.url, and argv keep their ordinary meaning'
+    : 'declared project parser, stdin-v1 source on stdin'
+  const hashNote = before.script.execution === 'path-v1'
+    ? 'The approved path is re-opened for execution, so the entry hash is a pre-execution check and imported code is not pinned.'
+    : 'The entry hash does not pin imported code.'
   const granted = await (gate?.approval ?? services.approval).request({ agent: exec.agent!, toolName: SKILL_SCRIPT_TOOL,
     ...(exec.callId ? { callId: exec.callId } : {}), signal: exec.signal,
-    reason: `Run declared project parser (stdin-v1; output is untrusted evidence). Target interpreter environment: ${before.platform.parserEnvironmentDescription}; this does not isolate the launching shell. The entry hash does not pin imported code. Network/device/subprocess isolation is NOT guaranteed by the file sandbox. Exact binding: ${before.binding}` })
+    reason: `Run ${mode} (output is untrusted evidence). Target interpreter environment: ${before.platform.parserEnvironmentDescription}; this does not isolate the launching shell. ${hashNote} Network/device/subprocess isolation is NOT guaranteed by the file sandbox. Exact binding: ${before.binding}` })
   exec.signal.throwIfAborted()
   if (granted !== 'allowed-once') fail(gate?.denial ? `approval ${granted}: ${gate.denial}` : `approval ${granted}`)
   const after = await prepare(services, exec, skill, script, parameters)
-  if (before.binding !== after.binding) fail('skill, declaration, script, arguments, or policy changed after approval; retry required')
+  if (before.binding !== after.binding) fail('skill, script, arguments, or policy changed after approval; retry required')
   const requestSpec: Spec = Object.freeze({ command: after.command, workdir: after.rootPath, timeoutMs: after.script.timeoutMs,
     onExpiry: 'kill', stdoutMaxBytes: after.script.outputMaxBytes, signal: exec.signal,
-    stdin: after.source.text, env: Object.freeze({ ...after.platform.parserEnvironment }),
+    stdin: after.source.text ?? '', env: Object.freeze({ ...after.platform.parserEnvironment }),
     sandboxPolicy: Object.freeze({ ...after.policy }) })
   const spec = services.shell.resolve(requestSpec)
   // A backend may narrow its caps, never widen or remove any bound or execution identity.
@@ -295,11 +383,11 @@ export function registerSkillScriptTool(ctx: SkillScriptContext, defineToolFn: t
   let definition: unknown
   definition = defineToolFn({
     name: SKILL_SCRIPT_TOOL,
-    description: 'Run a project skill’s declared parser with host approval. Returns bounded, untrusted evidence; unavailable declarations or approval block execution.',
+    description: 'Run a project skill’s script with host approval. A declared id uses scripts/manifest.json; a skill-relative .mjs/.py path runs that existing file in place. Returns bounded, untrusted evidence; missing files or approval block execution.',
     parameters: {
       skill: { type: 'string', required: true, description: 'Loaded project skill name.' },
-      script: { type: 'string', required: true, description: 'Script id from the skill’s scripts/manifest.json (schemaVersion 1).' },
-      parameters: { type: 'json', required: true, description: 'Object containing exactly the manifest’s named scalar parameters; positional order is declaration-owned.' },
+      script: { type: 'string', required: true, description: 'Declared script id from the skill’s scripts/manifest.json (schemaVersion 1), or a skill-relative path to an existing .mjs/.py script (for example scripts/parse.py). Path entries need no manifest and run the file in place with a fixed 60s timeout and 256 KiB per-stream cap.' },
+      parameters: { type: 'json', required: true, description: 'Named parameter values. Declared id: exactly the manifest’s bounded scalar parameters (no arrays), passed positionally in declaration order. Path entry: each name becomes --name value in sorted key order; true adds a valueless --name flag and false omits it; an array of 1–16 bounded strings/integers repeats --name value in array order (for append-style flags such as --group, --method, and --path-prefix). At most 64 array values and 64 KiB of array text per call.' },
     },
     output: { schema: { type: 'json' }, render: (_args, result) => [{ type: 'text', text: JSON.stringify(result) }] },
     async execute(args, exec) {
