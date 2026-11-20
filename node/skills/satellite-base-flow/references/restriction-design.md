@@ -20,6 +20,35 @@ proceed. A closed operation protocol or executable instruction set can justify a
 allowlist: state why membership defines that boundary and why targeted denial is
 insufficient. The default is not arbitrary execution of unknown commands.
 
+## File access and command execution scope
+
+This applies to every node and role, not only the read-only ones. A read-only sandbox
+is not privacy-safe: reading a file still reads its content.
+
+- **State the scope and the stop condition first.** Before reading or running
+  anything, name what the task actually needs and what you will not touch. Prefer
+  the exact files and the subdirectories the task has already confirmed.
+- **`cwd` is an execution directory, not a path restriction.** Check what a command
+  actually targets and what it triggers indirectly — helper scripts, wrappers, child
+  processes, build tools — not only where it starts.
+- **Review a coarse search before running it.** A whole-project scan or any coarse
+  recursive search states its necessity, the narrower alternative and why it is
+  insufficient, the evidence expected, and the stop condition. If that necessity
+  cannot be shown, narrow the search or stop; do not scan first and justify after.
+- **Filesystem root and user home directory.** Broad operations there run only when
+  clearly task-related, demonstrably necessary, and covered by the user's
+  authorization and host approval. Without that complete necessity they do not run.
+- **No going around the scope.** `../` traversal, absolute paths, symlinks, helper
+  scripts, and delegating the read or command to another agent are not a way to reach
+  what the task scope excludes.
+- **Keep the access the task really needs.** An exact external file the task names,
+  and the toolchain or dependency resources a normal build requires, stay available.
+  This is not a mechanical ban on normal builds.
+
+These are model-behavior constraints on how a node works. They add no hard read
+isolation and do not replace the host file sandbox, host approval, or the user's
+authorization.
+
 ## Evidence for each added restriction
 
 Before proposing or adding a restriction, give a short, source-backed account of:

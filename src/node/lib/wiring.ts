@@ -434,6 +434,7 @@ function textOf(result: SubagentResult | undefined): string {
 function buildPrompt({ task, skill, objective, versionControl }: { task: string; skill?: string; objective?: string; versionControl?: boolean }): string {
   return [
     `本次节点任务：${task}`,
+    '文件/执行范围（先于方法技能；共享权威规则见 satellite-base-flow 技能的 references/restriction-design.md「File access and command execution scope」）：文件访问与命令执行先定任务关联范围与停止条件，优先精确文件与已确认子目录；cwd 不是路径限制，检查命令实际目标与间接脚本/副作用；全库或粗范围递归搜索先审阅必要性、更窄替代、预期证据与停止条件，无法证明就收窄或暂停；文件系统根与用户主目录的广泛操作无完全必要性不执行；不得经 ../、绝对路径、symlink、脚本或委派绕过；只读不等于隐私安全；保留任务相关外部精确文件与工具链/依赖的必要访问。',
     `方法技能：${skill}（若该技能不可用，请明确报告不可用，不要编造方法）`,
     `本节点目标：${objective}`,
     versionControl

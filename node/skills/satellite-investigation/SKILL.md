@@ -23,6 +23,28 @@ For the scope statement, how to record a fact with its owner and revision, and h
 to keep unread material as a stated gap, read
 [the scope and sources reference](references/scope-and-sources.md).
 
+## File and command scope
+
+Reading is scoped by the task, not by what the tools happen to allow, and read-only
+does not make it privacy-safe:
+
+- prefer the exact files and the subdirectories the task already confirms;
+- `cwd` is an execution directory, not a path restriction: a command's real target
+  and its indirect effects — helper scripts, wrappers, build tools — count, not just
+  where it starts;
+- a whole-project or coarse recursive search first states its necessity, the
+  narrower alternative, the evidence expected, and the stop condition; if that
+  cannot be shown, narrow it or stop instead of scanning and justifying afterwards;
+- broad operations on a filesystem root or the user's home directory need complete,
+  task-related necessity plus the user's authorization and host approval;
+- `../`, absolute paths, symlinks, helper scripts, or delegating the read to another
+  agent do not get around that scope;
+- keep an exact external file the task names and the toolchain or dependency
+  resources an ordinary build needs; this is not a ban on normal builds.
+
+Read [the shared restriction-design principles](../satellite-base-flow/references/restriction-design.md)
+for the authority these boundaries come from.
+
 ## While reading
 
 - Read the deciding sources themselves, not descriptions of them.
