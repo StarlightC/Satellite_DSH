@@ -33,6 +33,18 @@ When the change spans several kinds of surface — code, configuration or schema
 skills and public assets, tests — or when it is unclear what a surface has to prove,
 read [the review scopes reference](references/review-scopes.md).
 
+## Scope discipline
+
+Review does not widen the search. The same file and command scope as the reviewed
+work applies: prefer exact files and confirmed subdirectories, check what a command
+actually touches rather than its `cwd`, and pre-review a whole-project or coarse
+recursive search for necessity, narrower alternative, expected evidence, and stop
+condition. Filesystem-root or home-directory reads, and reaching targets through
+`../`, absolute paths, symlinks, helper scripts, or another agent, stay outside the
+review unless complete task-related necessity is shown. Read-only review is not
+privacy-safe, and the task's exact external files and ordinary toolchain access stay
+available.
+
 ## Minimum sufficient verification budget
 
 A sufficient case names a real production path or reproduction and the unique

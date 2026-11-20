@@ -17,6 +17,18 @@ Three lines, before reading widely:
 A plan that grows while reading has no stop condition. Cut it back rather than
 following every interesting lead.
 
+The sources line is also the file and command boundary: name exact files or the
+confirmed subdirectories, and what each command actually touches. `cwd` is an
+execution directory, not a path restriction — indirect effects such as helper
+scripts, wrappers, and build tools count.
+
+When only a whole-project scan or a coarse recursive search can answer, extend the
+plan with four lines before running it: the necessity, the narrower alternative that
+was insufficient, the evidence expected, and the stop condition. Without them, narrow
+the search or stop; scanning first and justifying later is not a scope statement.
+The exact external files the task names and the ordinary toolchain or dependency
+resources stay in scope: the rule narrows breadth, not the task's necessary access.
+
 ## Record a fact so it can be rechecked
 
 For each fact, capture:
